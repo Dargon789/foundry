@@ -795,7 +795,7 @@ impl Backend {
 
     /// Returns true if op-stack deposits are active
     pub fn is_optimism(&self) -> bool {
-        self.env.read().networks.optimism
+        self.env.read().networks.is_optimism()
     }
 
     /// Returns the precompiles for the current spec.
@@ -1203,7 +1203,7 @@ impl Backend {
         let mut env = self.next_env();
         env.tx = tx.pending_transaction.to_revm_tx_env();
 
-        if env.networks.optimism {
+        if env.networks.is_optimism() {
             env.tx.enveloped_tx =
                 Some(alloy_rlp::encode(&tx.pending_transaction.transaction.transaction).into());
         }
@@ -2093,7 +2093,7 @@ impl Backend {
         hash: B256,
     ) -> Result<Vec<Log>, BlockchainError> {
         if let Some(block) = self.blockchain.get_block_by_hash(&hash) {
-            return Ok(self.mined_logs_for_block(filter, block));
+            return Ok(self.mined_logs_for_block(filter, block, hash));
         }
 
         if let Some(fork) = self.get_fork() {
@@ -2104,9 +2104,8 @@ impl Backend {
     }
 
     /// Returns all `Log`s mined by the node that were emitted in the `block` and match the `Filter`
-    fn mined_logs_for_block(&self, filter: Filter, block: Block) -> Vec<Log> {
+    fn mined_logs_for_block(&self, filter: Filter, block: Block, block_hash: B256) -> Vec<Log> {
         let mut all_logs = Vec::new();
-        let block_hash = block.header.hash_slow();
         let mut block_log_index = 0u32;
 
         let storage = self.blockchain.storage.read();
@@ -2167,8 +2166,8 @@ impl Backend {
         }
 
         for number in from..=to {
-            if let Some(block) = self.get_block(number) {
-                all_logs.extend(self.mined_logs_for_block(filter.clone(), block));
+            if let Some((block, hash)) = self.get_block_with_hash(number) {
+                all_logs.extend(self.mined_logs_for_block(filter.clone(), block, hash));
             }
         }
 
@@ -2226,7 +2225,7 @@ impl Backend {
 
     fn mined_block_by_hash(&self, hash: B256) -> Option<AnyRpcBlock> {
         let block = self.blockchain.get_block_by_hash(&hash)?;
-        Some(self.convert_block(block))
+        Some(self.convert_block_with_hash(block, Some(hash)))
     }
 
     pub(crate) async fn mined_transactions_by_block_number(
@@ -2295,7 +2294,8 @@ impl Backend {
         Ok(None)
     }
 
-    pub fn get_block(&self, id: impl Into<BlockId>) -> Option<Block> {
+    /// Returns the block and its hash for the given id
+    fn get_block_with_hash(&self, id: impl Into<BlockId>) -> Option<(Block, B256)> {
         let hash = match id.into() {
             BlockId::Hash(hash) => hash.block_hash,
             BlockId::Number(number) => {
@@ -2323,7 +2323,12 @@ impl Backend {
                 }
             }
         };
-        self.get_block_by_hash(hash)
+        let block = self.get_block_by_hash(hash)?;
+        Some((block, hash))
+    }
+
+    pub fn get_block(&self, id: impl Into<BlockId>) -> Option<Block> {
+        self.get_block_with_hash(id).map(|(block, _)| block)
     }
 
     pub fn get_block_by_hash(&self, hash: B256) -> Option<Block> {
@@ -2331,28 +2336,33 @@ impl Backend {
     }
 
     pub fn mined_block_by_number(&self, number: BlockNumber) -> Option<AnyRpcBlock> {
-        let block = self.get_block(number)?;
-        let mut block = self.convert_block(block);
+        let (block, hash) = self.get_block_with_hash(number)?;
+        let mut block = self.convert_block_with_hash(block, Some(hash));
         block.transactions.convert_to_hashes();
         Some(block)
     }
 
     pub fn get_full_block(&self, id: impl Into<BlockId>) -> Option<AnyRpcBlock> {
-        let block = self.get_block(id)?;
+        let (block, hash) = self.get_block_with_hash(id)?;
         let transactions = self.mined_transactions_in_block(&block)?;
-        let mut block = self.convert_block(block);
+        let mut block = self.convert_block_with_hash(block, Some(hash));
         block.inner.transactions = BlockTransactions::Full(transactions);
-
         Some(block)
     }
 
     /// Takes a block as it's stored internally and returns the eth api conform block format.
     pub fn convert_block(&self, block: Block) -> AnyRpcBlock {
+        self.convert_block_with_hash(block, None)
+    }
+
+    /// Takes a block as it's stored internally and returns the eth api conform block format.
+    /// If `known_hash` is provided, it will be used instead of computing `hash_slow()`.
+    pub fn convert_block_with_hash(&self, block: Block, known_hash: Option<B256>) -> AnyRpcBlock {
         let size = U256::from(alloy_rlp::encode(&block).len() as u32);
 
         let Block { header, transactions, .. } = block;
 
-        let hash = header.hash_slow();
+        let hash = known_hash.unwrap_or_else(|| header.hash_slow());
         let Header { number, withdrawals_root, .. } = header;
 
         let block = AlloyBlock {
