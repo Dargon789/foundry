@@ -66,7 +66,7 @@ jobs:
           merge-multiple: true
           # Download all foundry artifacts from the triggering release run
           pattern: "foundry_*"
-          path: foundry_artifacts
+          path: ${{ runner.temp }}/foundry_artifacts
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
 
@@ -103,11 +103,11 @@ jobs:
           set -euo pipefail
 
           echo "Artifacts in foundry_artifacts:"
-          ls -la ../foundry_artifacts || true
+          ls -la ${{ runner.temp }}/foundry_artifacts || true
 
           # Derive RELEASE_VERSION from any foundry artifact we downloaded
           # Expected names: foundry_<VERSION>_<platform>_<arch>.{tar.gz,zip}
-          first_file=$(ls ../foundry_artifacts/foundry_* 2>/dev/null | head -n1 || true)
+          first_file=$(ls "${{ runner.temp }}/foundry_artifacts/foundry_"* 2>/dev/null | head -n1 || true)
           if [[ -z "${first_file}" ]]; then
             echo "No foundry artifacts found to publish" >&2
             exit 1
