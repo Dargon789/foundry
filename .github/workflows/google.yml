@@ -36,7 +36,6 @@ on:
   push:
     branches:
       - '"master"'
-
 env:
   PROJECT_ID: "my-project" # TODO: update to your Google Cloud project ID
   GAR_LOCATION: "us-central1" # TODO: update to your region
