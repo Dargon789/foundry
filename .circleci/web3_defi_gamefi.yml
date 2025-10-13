@@ -4,15 +4,17 @@
 version: 2.1
 executors:
   my-custom-executor:
+  
     docker:
       - image: cimg/base:stable
         auth:
           # ensure you have first added these secrets
           # visit app.circleci.com/settings/project/github/Dargon789/foundry/master/environment-variables
+          
           username: $DOCKER_HUB_USER
           password: $DOCKER_HUB_PASSWORD
 jobs:
-  web3-defi-gamefi-project:
+  web3-defi-gamefi:
 
     executor: my-custom-executor
     steps:
@@ -23,4 +25,4 @@ jobs:
 workflows:
   my-custom-workflow:
     jobs:
-      - web3-defi-gamefi-project
+      - web3-defi-gamefi
