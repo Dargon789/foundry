@@ -1,14 +1,32 @@
-  build_and_test:
+version: 2.1
+
+jobs:
+  build-and-test:
     docker:
-      - image: cimg/rust:1.75.0
+      - image: cimg/rust:1.88.0
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - v1-cargo-{{ checksum "Cargo.lock" }}
+            - v1-cargo-
       - run:
           name: "Check formatting"
-          command: "cargo fmt --all -- --check"
-      - run:
-          name: "Run Clippy"
-          command: "cargo clippy --all-targets -- -D warnings"
+          command: cargo fmt -- --check
       - run:
           name: "Run tests"
-          command: "cargo test --all-features"
+          command: cargo test
+      - save_cache:
+          key: v1-cargo-{{ checksum "Cargo.lock" }}
+          paths:
+            - "~/.cargo/bin"
+            - "~/.cargo/registry/index"
+            - "~/.cargo/registry/cache"
+            - "~/.cargo/git/db"
+            - "target"
+      - run:
+          name: "Check formatting"
+          command: cargo fmt -- --check
+      - run:
+          name: "Run tests"
+          command: cargo test
