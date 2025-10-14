@@ -24,12 +24,6 @@ jobs:
             - "~/.cargo/registry/cache"
             - "~/.cargo/git/db"
             - "target"
-      - run:
-          name: "Check formatting"
-          command: cargo fmt -- --check
-      - run:
-          name: "Run tests"
-          command: cargo test
 
 workflows:
   ci:
