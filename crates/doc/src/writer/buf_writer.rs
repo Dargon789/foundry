@@ -213,7 +213,7 @@ impl BufWriter {
             });
 
             let row = [
-                Markdown::Code(&param_name.unwrap_or("<none>".to_string())).as_doc()?,
+                Markdown::Code(param_name.as_deref().unwrap_or("<none>")).as_doc()?,
                 comment.unwrap_or_default().replace('\n', " "),
             ];
             self.write_piped(&row.join("|"))?;
