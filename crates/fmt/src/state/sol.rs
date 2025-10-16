@@ -288,14 +288,6 @@ impl<'ast> State<'_, 'ast> {
         self.print_ident(name);
         self.nbsp();
 
-        if let Some(layout) = layout
-            && !self.handle_span(layout.span, false)
-        {
-            self.word("layout at ");
-            self.print_expr(layout.slot);
-            self.print_sep(Separator::Space);
-        }
-
         if let Some(first) = bases.first().map(|base| base.span())
             && let Some(last) = bases.last().map(|base| base.span())
             && self.inline_config.is_disabled(first.to(last))
@@ -304,30 +296,26 @@ impl<'ast> State<'_, 'ast> {
         } else if !bases.is_empty() {
             self.word("is");
             self.space();
-            let last = bases.len() - 1;
-            for (i, base) in bases.iter().enumerate() {
+            for (pos, base) in bases.iter().delimited() {
                 if !self.handle_span(base.span(), false) {
                     self.print_modifier_call(base, false);
-                    if i != last {
+                    if !pos.is_last {
                         self.word(",");
-                        if self
-                            .print_comments(
-                                bases[i + 1].span().lo(),
-                                CommentConfig::skip_ws().mixed_prev_space().mixed_post_nbsp(),
-                            )
-                            .is_none()
-                        {
-                            self.space();
-                        }
+                        self.space();
                     }
                 }
             }
-            if !self.print_trailing_comment(bases.last().unwrap().span().hi(), None) {
-                self.space();
-            }
+            self.space();
             self.s.offset(-self.ind);
         }
         self.end();
+        if let Some(layout) = layout
+            && !self.handle_span(layout.span, false)
+        {
+            self.word("layout at ");
+            self.print_expr(layout.slot);
+            self.print_sep(Separator::Space);
+        }
 
         self.print_word("{");
         self.end();
