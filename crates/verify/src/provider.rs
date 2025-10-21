@@ -181,7 +181,7 @@ impl VerificationProviderType {
 
         // 2. If `--verifier etherscan` is explicitly set, enforce the API key requirement.
         if matches!(self, Self::Etherscan) {
-            if key.as_ref().is_none_or(|key| key.is_empty()) {
+            if key.map_or(true, str::is_empty) {
                 eyre::bail!("ETHERSCAN_API_KEY must be set to use Etherscan as a verifier")
             }
             return Ok(Box::<EtherscanVerificationProvider>::default());
