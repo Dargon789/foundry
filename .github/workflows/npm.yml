@@ -98,6 +98,17 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Validate npm directory for artifact poisoning
+        run: |
+          set -euo pipefail
+          # Disallow dangerous files likely to be poisoned by artifacts
+          for f in "package.json" "bun.lockb" "package-lock.json" "yarn.lock" ".npmrc"; do
+            if [ -f "./npm/$f" ]; then
+              echo "ERROR: Untrusted '$f' present in ./npm – aborting to prevent artifact poisoning."
+              exit 1
+            fi
+          done
+
       - name: Install Dependencies
         working-directory: ./npm
         run: bun install --frozen-lockfile
