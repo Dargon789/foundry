@@ -1,13 +1,36 @@
 import type * as Process from 'node:process'
 
+
+// Allow-list of recognized/approved registry hostnames
+export const ALLOWED_REGISTRY_HOSTS = [
+  'registry.npmjs.org',
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  // Add any additional trusted registry hosts below as needed
+]
+
 export function getRegistryUrl() {
   // Prefer npm's configured registry (works with Verdaccio and custom registries)
   // Fallback to REGISTRY_URL for tests/dev, then npmjs
-  return (
+  const rawUrl = (
     process.env.npm_config_registry
     || process.env.REGISTRY_URL
     || 'https://registry.npmjs.org'
   )
+  let hostname
+  try {
+    hostname = new URL(rawUrl).hostname
+  } catch {
+    throw new Error(`Invalid registry URL: ${rawUrl}`)
+  }
+  if (!ALLOWED_REGISTRY_HOSTS.includes(hostname)) {
+    throw new Error(
+      `Registry URL host "${hostname}" is not in the allow-list (${ALLOWED_REGISTRY_HOSTS.join(', ')}). `
+      + 'Set your registry to a trusted host.'
+    )
+  }
+  return rawUrl
 }
 
 export type Architecture = Extract<(typeof Process)['arch'], 'arm64' | 'x64'>

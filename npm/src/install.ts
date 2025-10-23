@@ -1,4 +1,4 @@
-import { BINARY_NAME, colors, getRegistryUrl, PLATFORM_SPECIFIC_PACKAGE_NAME } from '#const.ts'
+import { BINARY_NAME, colors, getRegistryUrl, PLATFORM_SPECIFIC_PACKAGE_NAME, ALLOWED_REGISTRY_HOSTS } from '#const.ts'
 import * as NodeCrypto from 'node:crypto'
 import * as NodeFS from 'node:fs'
 import * as NodeHttp from 'node:http'
