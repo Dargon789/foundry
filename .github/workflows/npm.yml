@@ -87,6 +87,37 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
 
+      - name: Validate and Copy Artifacts
+        env:
+          ARTIFACT_DIR: ${{ steps.paths.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+          # List expected artifacts and their paths
+          EXPECTED_PATHS=(
+            "@foundry-rs/forge-linux-amd64"
+            "@foundry-rs/forge-linux-arm64"
+            "@foundry-rs/forge-darwin-amd64"
+            "@foundry-rs/forge-darwin-arm64"
+            "@foundry-rs/forge-win32-amd64"
+          )
+          DEST_DIR="./npm"
+          mkdir -p "$DEST_DIR"
+          for PKG in "${EXPECTED_PATHS[@]}"; do
+            SRC="$ARTIFACT_DIR/$PKG"
+            if [ -d "$SRC" ]; then
+              echo "Validating and copying $SRC to $DEST_DIR"
+              # Optionally: validate files inside $SRC (e.g., hashes, signatures, expected file names)
+              # Basic check: ensure correct file structure
+              find "$SRC" -type f | grep -E '/bin/(forge|forge.exe)$' || {
+                echo "ERROR: Expected binary not found in $SRC" >&2
+                exit 1
+              }
+              cp -a "$SRC" "$DEST_DIR/"
+            else
+              echo "WARNING: Expected package $SRC not found in artifacts."
+            fi
+          done
+          ls -l "$DEST_DIR"
       - name: Setup Bun
         uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
@@ -196,6 +227,7 @@ jobs:
           fi
 
       - name: Publish ${{ matrix.os }}-${{ matrix.arch }} Binary
+        # Only use ./npm, which now contains validated/copies of artifact files
         working-directory: ./npm
         env:
           PROVENANCE: true
