@@ -1,13 +1,34 @@
 import type * as Process from 'node:process'
 
+const ALLOWED_REGISTRY_HOSTS = [
+  'registry.npmjs.org',
+  'registry.yarnpkg.com',
+  // Add any additional trusted registry domains here
+]
+
+function isAllowedRegistryHostname(urlString: string): boolean {
+  try {
+    const url = new URL(urlString)
+    // Compare against allow-list. Consider only exact domain match for safety.
+    return ALLOWED_REGISTRY_HOSTS.includes(url.hostname)
+  } catch {
+    return false
+  }
+}
+
 export function getRegistryUrl() {
   // Prefer npm's configured registry (works with Verdaccio and custom registries)
   // Fallback to REGISTRY_URL for tests/dev, then npmjs
-  return (
+  const candidate =
     process.env.npm_config_registry
     || process.env.REGISTRY_URL
     || 'https://registry.npmjs.org'
-  )
+  if (!isAllowedRegistryHostname(candidate)) {
+    throw new Error(
+      `Refusing to use registry URL '${candidate}' not in allowed list: ${ALLOWED_REGISTRY_HOSTS.join(', ')}`
+    )
+  }
+  return candidate
 }
 
 export type Architecture = Extract<(typeof Process)['arch'], 'arm64' | 'x64'>
