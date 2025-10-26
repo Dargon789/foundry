@@ -162,10 +162,11 @@ jobs:
           PLATFORM_NAME=${{ matrix.os }} ARCH=${{ matrix.arch }} FORGE_BIN_PATH="$BIN" bun ./scripts/prepublish.ts
 
       - name: Sanity Check Binary
-        working-directory: ./npm
+        env:
+          ARTIFACT_DIR: ${{ steps.paths.outputs.artifact_dir }}
         run: |
           set -euo pipefail
-          PKG_DIR="./@foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}"
+          PKG_DIR="$ARTIFACT_DIR/@foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}"
           BIN="$PKG_DIR/bin/forge"
           if [[ "${{ matrix.os }}" == "win32" ]]; then
             BIN="$PKG_DIR/bin/forge.exe"
@@ -185,7 +186,7 @@ jobs:
           fi
 
       - name: Publish ${{ matrix.os }}-${{ matrix.arch }} Binary
-        working-directory: ./npm
+          ARTIFACT_DIR: ${{ steps.paths.outputs.artifact_dir }}
         env:
           PROVENANCE: true
           VERSION_NAME: ${{ steps.release-version.outputs.RELEASE_VERSION }}
@@ -195,9 +196,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          ls -la ./@foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}
+          ls -la "$ARTIFACT_DIR/@foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}"
 
-          bun ./scripts/publish.ts ./@foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}
+          bun ./scripts/publish.ts "$ARTIFACT_DIR/@foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}"
 
           echo "Published @foundry-rs/forge-${{ matrix.os }}-${{ matrix.arch }}"
 
