@@ -1,5 +1,4 @@
 # Reusable workflow for running tests via `cargo nextest`
-
 name: nextest
 
 permissions: {}
@@ -85,6 +84,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install Vyper
+      
         # Also update vyper version in .devcontainer/Dockerfile.dev
         run: pip --version && pip install vyper==0.4.3
 
