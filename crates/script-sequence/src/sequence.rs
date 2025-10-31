@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
+#
 pub const DRY_RUN_DIR: &str = "dry-run";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct NestedValue {
     pub internal_type: String,
     pub value: String,
 }
-
+#
 /// Helper that saves the transactions sequence and its state on which transactions have been
 /// broadcasted
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -148,7 +148,7 @@ impl ScriptSequence {
     pub fn add_receipt(&mut self, receipt: AnyTransactionReceipt) {
         self.receipts.push(receipt);
     }
-
+    #
     /// Sorts all receipts with ascending transaction index
     pub fn sort_receipts(&mut self) {
         self.receipts.sort_by_key(|r| (r.block_number, r.transaction_index));
@@ -164,7 +164,7 @@ impl ScriptSequence {
     pub fn remove_pending(&mut self, tx_hash: TxHash) {
         self.pending.retain(|element| element != &tx_hash);
     }
-
+    #
     /// Gets paths in the formats
     /// `./broadcast/[contract_filename]/[chain_id]/[sig]-[timestamp].json` and
     /// `./cache/[contract_filename]/[chain_id]/[sig]-[timestamp].json`.
@@ -218,7 +218,7 @@ impl ScriptSequence {
             .for_each(|(i, tx)| tx.rpc.clone_from(&sensitive.transactions[i].rpc));
     }
 }
-
+#
 /// Converts the `sig` argument into the corresponding file path.
 ///
 /// This accepts either the signature of the function or the raw calldata.
