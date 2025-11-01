@@ -1,5 +1,4 @@
 import type * as Process from 'node:process'
-
 const ALLOWED_REGISTRY_HOSTS = [
   'registry.npmjs.org',
   'registry.yarnpkg.com',
