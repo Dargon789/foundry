@@ -143,7 +143,6 @@ impl AsDoc for Document {
 
                             // we need this to find the _relative_ paths
                             let src_target_dir = self.target_src_dir();
-
                             let mut bases = vec![];
                             let linked =
                                 read_context!(self, CONTRACT_INHERITANCE_ID, ContractInheritance);
@@ -175,7 +174,6 @@ impl AsDoc for Document {
                         }
 
                         writer.writeln_doc(&item.comments)?;
-
                         if let Some(state_vars) = item.variables() {
                             writer.write_subtitle("State Variables")?;
                             state_vars.into_iter().try_for_each(|(item, comments, code)| {
