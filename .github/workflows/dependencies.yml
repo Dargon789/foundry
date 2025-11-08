@@ -1,5 +1,4 @@
 # Runs `cargo update` periodically.
-
 name: dependencies
 
 on:
