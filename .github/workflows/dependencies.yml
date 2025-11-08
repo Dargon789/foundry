@@ -1,10 +1,12 @@
 # Runs `cargo update` periodically.
+
 name: dependencies
 
 on:
   schedule:
     # Run weekly
     - cron: "0 0 * * SUN"
+    
   workflow_dispatch:
     # Needed so we can run it manually
 
