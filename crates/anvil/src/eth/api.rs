@@ -291,6 +291,7 @@ impl EthApi {
             EthRequest::GetBlobSidecarsByBlockId(block_id) => {
                 self.anvil_get_blob_sidecars_by_block_id(block_id).to_rpc_result()
             }
+            EthRequest::GetGenesisTime(()) => self.anvil_get_genesis_time().to_rpc_result(),
             EthRequest::EthGetRawTransactionByBlockHashAndIndex(hash, index) => {
                 self.raw_transaction_by_block_hash_and_index(hash, index).await.to_rpc_result()
             }
@@ -919,7 +920,7 @@ impl EthApi {
         let block_request = self.block_request(Some(block_number.into())).await?;
         if let BlockRequest::Pending(txs) = block_request {
             let block = self.backend.pending_block(txs).await;
-            return Ok(Some(U256::from(block.transactions.len())));
+            return Ok(Some(U256::from(block.block.body.transactions.len())));
         }
         let block = self.backend.block_by_number(block_number).await?;
         let txs = block.map(|b| match b.transactions() {
@@ -1125,7 +1126,7 @@ impl EthApi {
         }
         while let Some(notification) = stream.next().await {
             if let Some(block) = self.backend.get_block_by_hash(notification.hash)
-                && block.transactions.iter().any(|tx| tx.hash() == hash)
+                && block.body.transactions.iter().any(|tx| tx.hash() == hash)
                 && let Some(receipt) = self.backend.transaction_receipt(hash).await?
             {
                 return Ok(receipt);
@@ -1392,6 +1393,14 @@ impl EthApi {
     ) -> Result<Option<BlobTransactionSidecar>> {
         node_info!("anvil_getBlobSidecarsByBlockId");
         Ok(self.backend.get_blob_sidecars_by_block_id(block_id)?)
+    }
+
+    /// Returns the genesis time for the Beacon chain
+    ///
+    /// Handler for Beacon API call: `GET /eth/v1/beacon/genesis`
+    pub fn anvil_get_genesis_time(&self) -> Result<u64> {
+        node_info!("anvil_getGenesisTime");
+        Ok(self.backend.genesis_time())
     }
 
     /// Get transaction by its hash.
@@ -3290,11 +3299,11 @@ impl EthApi {
 
         let mut partial_block = self.backend.convert_block(block.clone());
 
-        let mut block_transactions = Vec::with_capacity(block.transactions.len());
+        let mut block_transactions = Vec::with_capacity(block.body.transactions.len());
         let base_fee = self.backend.base_fee();
 
         for info in transactions {
-            let tx = block.transactions.get(info.transaction_index as usize)?.clone();
+            let tx = block.body.transactions.get(info.transaction_index as usize)?.clone();
 
             let tx = transaction_build(
                 Some(info.transaction_hash),
