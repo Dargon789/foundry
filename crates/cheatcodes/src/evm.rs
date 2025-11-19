@@ -256,8 +256,12 @@ impl Cheatcode for loadCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { target, slot } = *self;
         ccx.ensure_not_precompile(&target)?;
-        ccx.ecx.journaled_state.load_account(target)?;
-        let mut val = ccx.ecx.journaled_state.sload(target, slot.into())?;
+
+        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+        journal.load_account(db, target)?;
+        let mut val = journal
+            .sload(db, target, slot.into(), false)
+            .map_err(|e| fmt_err!("failed to load storage slot: {:?}", e))?;
 
         if val.is_cold && val.data.is_zero() {
             if ccx.state.has_arbitrary_storage(&target) {
@@ -611,10 +615,11 @@ impl Cheatcode for etchCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { target, newRuntimeBytecode } = self;
         ccx.ensure_not_precompile(target)?;
-        ccx.ecx.journaled_state.load_account(*target)?;
+        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+        journal.load_account(db, *target)?;
         let bytecode = Bytecode::new_raw_checked(newRuntimeBytecode.clone())
             .map_err(|e| fmt_err!("failed to create bytecode: {e}"))?;
-        ccx.ecx.journaled_state.set_code(*target, bytecode);
+        journal.set_code(*target, bytecode);
         Ok(Default::default())
     }
 }
@@ -664,7 +669,10 @@ impl Cheatcode for storeCall {
         let Self { target, slot, value } = *self;
         ccx.ensure_not_precompile(&target)?;
         ensure_loaded_account(ccx.ecx, target)?;
-        ccx.ecx.journaled_state.sstore(target, slot.into(), value.into())?;
+        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+        journal
+            .sstore(db, target, slot.into(), value.into(), false)
+            .map_err(|e| fmt_err!("failed to store storage slot: {:?}", e))?;
         Ok(Default::default())
     }
 }
@@ -970,7 +978,8 @@ impl Cheatcode for getStorageSlotsCall {
         if storage_type.encoding == ENCODING_BYTES {
             // Try to check if it's a long bytes/string by reading the current storage
             // value
-            if let Ok(value) = ccx.ecx.journaled_state.sload(*target, slot) {
+            let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+            if let Ok(value) = journal.sload(db, *target, slot, false) {
                 let value_bytes = value.data.to_be_bytes::<32>();
                 let length_byte = value_bytes[31];
                 // Check if it's a long bytes/string (LSB is 1)
@@ -1124,7 +1133,8 @@ impl Cheatcode for getEvmVersionCall {
 }
 
 pub(super) fn get_nonce(ccx: &mut CheatsCtxt, address: &Address) -> Result {
-    let account = ccx.ecx.journaled_state.load_account(*address)?;
+    let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+    let account = journal.load_account(db, *address)?;
     Ok(account.info.nonce.abi_encode())
 }
 
@@ -1204,8 +1214,7 @@ fn inner_start_gas_snapshot(
     name: Option<String>,
 ) -> Result {
     // Revert if there is an active gas snapshot as we can only have one active snapshot at a time.
-    if ccx.state.gas_metering.active_gas_snapshot.is_some() {
-        let (group, name) = ccx.state.gas_metering.active_gas_snapshot.as_ref().unwrap().clone();
+    if let Some((group, name)) = &ccx.state.gas_metering.active_gas_snapshot {
         bail!("gas snapshot was already started with group: {group} and name: {name}");
     }
 
@@ -1231,10 +1240,9 @@ fn inner_stop_gas_snapshot(
     name: Option<String>,
 ) -> Result {
     // If group and name are not provided, use the last snapshot group and name.
-    let (group, name) = group.zip(name).unwrap_or_else(|| {
-        let (group, name) = ccx.state.gas_metering.active_gas_snapshot.as_ref().unwrap().clone();
-        (group, name)
-    });
+    let (group, name) = group
+        .zip(name)
+        .unwrap_or_else(|| ccx.state.gas_metering.active_gas_snapshot.clone().unwrap());
 
     if let Some(record) = ccx
         .state
@@ -1345,8 +1353,9 @@ pub(super) fn journaled_account<'a>(
 }
 
 pub(super) fn ensure_loaded_account(ecx: Ecx, addr: Address) -> Result<()> {
-    ecx.journaled_state.load_account(addr)?;
-    ecx.journaled_state.touch(addr);
+    let (db, journal, _) = ecx.as_db_env_and_journal();
+    journal.load_account(db, addr)?;
+    journal.touch(addr);
     Ok(())
 }
 
@@ -1573,7 +1582,8 @@ fn get_contract_data<'a>(
     let artifacts = ccx.state.config.available_artifacts.as_ref()?;
 
     // Try to load the account and get its code
-    let account = ccx.ecx.journaled_state.load_account(address).ok()?;
+    let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
+    let account = journal.load_account(db, address).ok()?;
     let code = account.info.code.as_ref()?;
 
     // Skip if code is empty
