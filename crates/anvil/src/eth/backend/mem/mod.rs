@@ -35,7 +35,7 @@ use crate::{
 use alloy_chains::NamedChain;
 use alloy_consensus::{
     Account, Blob, BlockHeader, EnvKzgSettings, Header, Receipt, ReceiptWithBloom, Signed,
-    Transaction as TransactionTrait, TxEnvelope,
+    Transaction as TransactionTrait, TxEnvelope, Typed2718,
     proofs::{calculate_receipt_root, calculate_transaction_root},
     transaction::Recovered,
 };
@@ -131,7 +131,7 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     io::{Read, Write},
-    ops::Not,
+    ops::{Mul, Not},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -1218,13 +1218,13 @@ impl Backend {
     > {
         let mut env = self.next_env();
         env.tx = FromRecoveredTx::from_recovered_tx(
-            &tx.pending_transaction.transaction.transaction,
+            tx.pending_transaction.transaction.as_ref(),
             *tx.pending_transaction.sender(),
         );
 
         if env.networks.is_optimism() {
             env.tx.enveloped_tx =
-                Some(alloy_rlp::encode(&tx.pending_transaction.transaction.transaction).into());
+                Some(alloy_rlp::encode(tx.pending_transaction.transaction.as_ref()).into());
         }
 
         let db = self.db.read().await;
@@ -2786,11 +2786,11 @@ impl Backend {
             let target_tx = block.body.transactions[index].clone();
             let target_tx = PendingTransaction::from_maybe_impersonated(target_tx)?;
             let mut tx_env: OpTransaction<TxEnv> = FromRecoveredTx::from_recovered_tx(
-                &target_tx.transaction.transaction,
+                target_tx.transaction.as_ref(),
                 *target_tx.sender(),
             );
             if env.networks.is_optimism() {
-                tx_env.enveloped_tx = Some(target_tx.transaction.transaction.encoded_2718().into());
+                tx_env.enveloped_tx = Some(target_tx.transaction.encoded_2718().into());
             }
 
             let mut evm = self.new_evm_with_inspector_ref(&cache_db, &env, &mut inspector);
@@ -3118,28 +3118,9 @@ impl Backend {
         let excess_blob_gas = block.header.excess_blob_gas;
         let blob_gas_price =
             alloy_eips::eip4844::calc_blob_gasprice(excess_blob_gas.unwrap_or_default());
-        let blob_gas_used = transaction.blob_gas();
+        let blob_gas_used = transaction.blob_gas_used();
 
-        let effective_gas_price = match transaction.transaction {
-            TypedTransaction::Legacy(t) => t.tx().gas_price,
-            TypedTransaction::EIP2930(t) => t.tx().gas_price,
-            TypedTransaction::EIP1559(t) => block
-                .header
-                .base_fee_per_gas
-                .map_or(self.base_fee() as u128, |g| g as u128)
-                .saturating_add(t.tx().max_priority_fee_per_gas),
-            TypedTransaction::EIP4844(t) => block
-                .header
-                .base_fee_per_gas
-                .map_or(self.base_fee() as u128, |g| g as u128)
-                .saturating_add(t.tx().tx().max_priority_fee_per_gas),
-            TypedTransaction::EIP7702(t) => block
-                .header
-                .base_fee_per_gas
-                .map_or(self.base_fee() as u128, |g| g as u128)
-                .saturating_add(t.tx().max_priority_fee_per_gas),
-            TypedTransaction::Deposit(_) => 0_u128,
-        };
+        let effective_gas_price = transaction.effective_gas_price(block.header.base_fee_per_gas);
 
         let receipts = self.get_receipts(block.body.transactions.iter().map(|tx| tx.hash()));
         let next_log_index = receipts[..index].iter().map(|r| r.logs().len()).sum::<usize>();
@@ -3664,10 +3645,10 @@ impl TransactionValidator for Backend {
         if let Some(tx_chain_id) = tx.chain_id() {
             let chain_id = self.chain_id();
             if chain_id.to::<u64>() != tx_chain_id {
-                if let Some(legacy) = tx.as_legacy() {
+                if let TypedTransaction::Legacy(tx) = tx.as_ref() {
                     // <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-155.md>
                     if env.evm_env.cfg_env.spec >= SpecId::SPURIOUS_DRAGON
-                        && legacy.tx().chain_id.is_none()
+                        && tx.chain_id().is_none()
                     {
                         warn!(target: "backend", ?chain_id, ?tx_chain_id, "incompatible EIP155-based V");
                         return Err(InvalidTransactionError::IncompatibleEIP155);
@@ -3680,8 +3661,7 @@ impl TransactionValidator for Backend {
         }
 
         // Nonce validation
-        let is_deposit_tx =
-            matches!(&pending.transaction.transaction, TypedTransaction::Deposit(_));
+        let is_deposit_tx = matches!(pending.transaction.as_ref(), TypedTransaction::Deposit(_));
         let nonce = tx.nonce();
         if nonce < account.nonce && !is_deposit_tx {
             warn!(target: "backend", "[{:?}] nonce too low", tx.hash());
@@ -3689,9 +3669,9 @@ impl TransactionValidator for Backend {
         }
 
         // EIP-4844 structural validation
-        if env.evm_env.cfg_env.spec >= SpecId::CANCUN && tx.transaction.is_eip4844() {
+        if env.evm_env.cfg_env.spec >= SpecId::CANCUN && tx.is_eip4844() {
             // Heavy (blob validation) checks
-            let blob_tx = match &tx.transaction {
+            let blob_tx = match tx.as_ref() {
                 TypedTransaction::EIP4844(tx) => tx.tx(),
                 _ => unreachable!(),
             };
@@ -3747,13 +3727,13 @@ impl TransactionValidator for Backend {
 
             // EIP-1559 fee validation (London hard fork and later).
             if env.evm_env.cfg_env.spec >= SpecId::LONDON {
-                if tx.gas_price() < env.evm_env.block_env.basefee.into() && !is_deposit_tx {
-                    warn!(target: "backend", "max fee per gas={}, too low, block basefee={}",tx.gas_price(),  env.evm_env.block_env.basefee);
+                if tx.max_fee_per_gas() < env.evm_env.block_env.basefee.into() && !is_deposit_tx {
+                    warn!(target: "backend", "max fee per gas={}, too low, block basefee={}", tx.max_fee_per_gas(), env.evm_env.block_env.basefee);
                     return Err(InvalidTransactionError::FeeCapTooLow);
                 }
 
-                if let (Some(max_priority_fee_per_gas), Some(max_fee_per_gas)) =
-                    (tx.essentials().max_priority_fee_per_gas, tx.essentials().max_fee_per_gas)
+                if let (Some(max_priority_fee_per_gas), max_fee_per_gas) =
+                    (tx.as_ref().max_priority_fee_per_gas(), tx.as_ref().max_fee_per_gas())
                     && max_priority_fee_per_gas > max_fee_per_gas
                 {
                     warn!(target: "backend", "max priority fee per gas={}, too high, max fee per gas={}", max_priority_fee_per_gas, max_fee_per_gas);
@@ -3763,8 +3743,8 @@ impl TransactionValidator for Backend {
 
             // EIP-4844 blob fee validation
             if env.evm_env.cfg_env.spec >= SpecId::CANCUN
-                && tx.transaction.is_eip4844()
-                && let Some(max_fee_per_blob_gas) = tx.essentials().max_fee_per_blob_gas
+                && tx.is_eip4844()
+                && let Some(max_fee_per_blob_gas) = tx.max_fee_per_blob_gas()
                 && let Some(blob_gas_and_price) = &env.evm_env.block_env.blob_excess_gas_and_price
                 && max_fee_per_blob_gas < blob_gas_and_price.blob_gasprice
             {
@@ -3775,9 +3755,15 @@ impl TransactionValidator for Backend {
                 ));
             }
 
-            let max_cost = tx.max_cost();
+            let max_cost =
+                (tx.gas_limit() as u128).saturating_mul(tx.max_fee_per_gas()).saturating_add(
+                    tx.blob_gas_used()
+                        .map(|g| g as u128)
+                        .unwrap_or(0)
+                        .mul(tx.max_fee_per_blob_gas().unwrap_or(0)),
+                );
             let value = tx.value();
-            match &tx.transaction {
+            match tx.as_ref() {
                 TypedTransaction::Deposit(deposit_tx) => {
                     // Deposit transactions
                     // https://specs.optimism.io/protocol/deposits.html#execution
@@ -3828,7 +3814,7 @@ pub fn transaction_build(
     info: Option<TransactionInfo>,
     base_fee: Option<u64>,
 ) -> AnyRpcTransaction {
-    if let TypedTransaction::Deposit(ref deposit_tx) = eth_transaction.transaction {
+    if let TypedTransaction::Deposit(deposit_tx) = eth_transaction.as_ref() {
         let dep_tx = deposit_tx;
 
         let ser = serde_json::to_value(dep_tx).expect("could not serialize TxDeposit");
