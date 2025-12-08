@@ -87,8 +87,7 @@ use anvil_core::eth::{
     block::{Block, BlockInfo},
     transaction::{
         MaybeImpersonatedTransaction, PendingTransaction, ReceiptResponse, TransactionInfo,
-        TypedReceipt, TypedReceiptRpc, TypedTransaction, has_optimism_fields,
-        transaction_request_to_typed,
+        TypedReceiptRpc, has_optimism_fields, transaction_request_to_typed,
     },
     wallet::WalletCapabilities,
 };
@@ -108,6 +107,7 @@ use foundry_evm::{
     },
     utils::{get_blob_base_fee_update_fraction, get_blob_base_fee_update_fraction_by_spec_id},
 };
+use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use op_alloy_consensus::DEPOSIT_TX_TYPE_ID;
 use op_revm::{
@@ -2093,7 +2093,10 @@ impl Backend {
     }
 
     /// returns all receipts for the given transactions
-    fn get_receipts(&self, tx_hashes: impl IntoIterator<Item = TxHash>) -> Vec<TypedReceipt> {
+    fn get_receipts(
+        &self,
+        tx_hashes: impl IntoIterator<Item = TxHash>,
+    ) -> Vec<FoundryReceiptEnvelope> {
         let storage = self.blockchain.storage.read();
         let mut receipts = vec![];
 
@@ -3081,7 +3084,7 @@ impl Backend {
     }
 
     /// Returns all receipts of the block
-    pub fn mined_receipts(&self, hash: B256) -> Option<Vec<TypedReceipt>> {
+    pub fn mined_receipts(&self, hash: B256) -> Option<Vec<FoundryReceiptEnvelope>> {
         let block = self.mined_block_by_hash(hash)?;
         let mut receipts = Vec::new();
         let storage = self.blockchain.storage.read();
@@ -3125,30 +3128,14 @@ impl Backend {
         let receipts = self.get_receipts(block.body.transactions.iter().map(|tx| tx.hash()));
         let next_log_index = receipts[..index].iter().map(|r| r.logs().len()).sum::<usize>();
 
-        // Build a ReceiptWithBloom<rpc_types::Log> from the typed receipt, handling Deposit
-        // specially
-        let (status, cumulative_gas_used, logs_source, logs_bloom) = match &tx_receipt {
-            TypedReceipt::Deposit(r) => (
-                r.receipt.inner.status,
-                r.receipt.inner.cumulative_gas_used,
-                r.receipt.inner.logs.to_vec(),
-                r.logs_bloom,
-            ),
-            _ => {
-                let receipt_ref = tx_receipt.as_receipt_with_bloom();
-                (
-                    receipt_ref.receipt.status,
-                    receipt_ref.receipt.cumulative_gas_used,
-                    receipt_ref.receipt.logs.to_vec(),
-                    receipt_ref.logs_bloom,
-                )
-            }
-        };
-
+        // TODO: refactor MinedTransactionReceipt building
+        // Build a ReceiptWithBloom<rpc_types::Log> from the FoundryReceiptEnvelope
         let receipt: alloy_consensus::Receipt<alloy_rpc_types::Log> = Receipt {
-            status,
-            cumulative_gas_used,
-            logs: logs_source
+            status: tx_receipt.as_receipt().status,
+            cumulative_gas_used: tx_receipt.cumulative_gas_used(),
+            logs: tx_receipt
+                .logs()
+                .to_vec()
                 .into_iter()
                 .enumerate()
                 .map(|(index, log)| alloy_rpc_types::Log {
@@ -3163,15 +3150,16 @@ impl Backend {
                 })
                 .collect(),
         };
+        let logs_bloom = tx_receipt.logs_bloom().to_owned();
         let receipt_with_bloom = ReceiptWithBloom { receipt, logs_bloom };
 
         let inner = match tx_receipt {
-            TypedReceipt::EIP1559(_) => TypedReceiptRpc::EIP1559(receipt_with_bloom),
-            TypedReceipt::Legacy(_) => TypedReceiptRpc::Legacy(receipt_with_bloom),
-            TypedReceipt::EIP2930(_) => TypedReceiptRpc::EIP2930(receipt_with_bloom),
-            TypedReceipt::EIP4844(_) => TypedReceiptRpc::EIP4844(receipt_with_bloom),
-            TypedReceipt::EIP7702(_) => TypedReceiptRpc::EIP7702(receipt_with_bloom),
-            TypedReceipt::Deposit(r) => {
+            FoundryReceiptEnvelope::Legacy(_) => TypedReceiptRpc::Legacy(receipt_with_bloom),
+            FoundryReceiptEnvelope::Eip2930(_) => TypedReceiptRpc::Eip2930(receipt_with_bloom),
+            FoundryReceiptEnvelope::Eip1559(_) => TypedReceiptRpc::Eip1559(receipt_with_bloom),
+            FoundryReceiptEnvelope::Eip4844(_) => TypedReceiptRpc::Eip4844(receipt_with_bloom),
+            FoundryReceiptEnvelope::Eip7702(_) => TypedReceiptRpc::Eip7702(receipt_with_bloom),
+            FoundryReceiptEnvelope::Deposit(r) => {
                 TypedReceiptRpc::Deposit(op_alloy_consensus::OpDepositReceiptWithBloom {
                     receipt: op_alloy_consensus::OpDepositReceipt {
                         inner: Receipt {
@@ -3337,7 +3325,7 @@ impl Backend {
     pub fn get_blob_by_tx_hash(&self, hash: B256) -> Result<Option<Vec<alloy_consensus::Blob>>> {
         // Try to get the mined transaction by hash
         if let Some(tx) = self.mined_transaction_by_hash(hash)
-            && let Ok(typed_tx) = TypedTransaction::try_from(tx)
+            && let Ok(typed_tx) = FoundryTxEnvelope::try_from(tx)
             && let Some(sidecar) = typed_tx.sidecar()
         {
             return Ok(Some(sidecar.sidecar.blobs.clone()));
@@ -3377,7 +3365,7 @@ impl Backend {
         if let Some(full_block) = self.get_full_block(block_id) {
             let sidecar = full_block
                 .into_transactions_iter()
-                .map(TypedTransaction::try_from)
+                .map(FoundryTxEnvelope::try_from)
                 .filter_map(|typed_tx_result| {
                     typed_tx_result.ok()?.sidecar().map(|sidecar| sidecar.sidecar().clone())
                 })
@@ -3645,7 +3633,7 @@ impl TransactionValidator for Backend {
         if let Some(tx_chain_id) = tx.chain_id() {
             let chain_id = self.chain_id();
             if chain_id.to::<u64>() != tx_chain_id {
-                if let TypedTransaction::Legacy(tx) = tx.as_ref() {
+                if let FoundryTxEnvelope::Legacy(tx) = tx.as_ref() {
                     // <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-155.md>
                     if env.evm_env.cfg_env.spec >= SpecId::SPURIOUS_DRAGON
                         && tx.chain_id().is_none()
@@ -3661,7 +3649,7 @@ impl TransactionValidator for Backend {
         }
 
         // Nonce validation
-        let is_deposit_tx = matches!(pending.transaction.as_ref(), TypedTransaction::Deposit(_));
+        let is_deposit_tx = matches!(pending.transaction.as_ref(), FoundryTxEnvelope::Deposit(_));
         let nonce = tx.nonce();
         if nonce < account.nonce && !is_deposit_tx {
             warn!(target: "backend", "[{:?}] nonce too low", tx.hash());
@@ -3672,7 +3660,7 @@ impl TransactionValidator for Backend {
         if env.evm_env.cfg_env.spec >= SpecId::CANCUN && tx.is_eip4844() {
             // Heavy (blob validation) checks
             let blob_tx = match tx.as_ref() {
-                TypedTransaction::EIP4844(tx) => tx.tx(),
+                FoundryTxEnvelope::Eip4844(tx) => tx.tx(),
                 _ => unreachable!(),
             };
 
@@ -3764,7 +3752,7 @@ impl TransactionValidator for Backend {
                 );
             let value = tx.value();
             match tx.as_ref() {
-                TypedTransaction::Deposit(deposit_tx) => {
+                FoundryTxEnvelope::Deposit(deposit_tx) => {
                     // Deposit transactions
                     // https://specs.optimism.io/protocol/deposits.html#execution
                     // 1. no gas cost check required since already have prepaid gas from L1
@@ -3814,7 +3802,7 @@ pub fn transaction_build(
     info: Option<TransactionInfo>,
     base_fee: Option<u64>,
 ) -> AnyRpcTransaction {
-    if let TypedTransaction::Deposit(deposit_tx) = eth_transaction.as_ref() {
+    if let FoundryTxEnvelope::Deposit(deposit_tx) = eth_transaction.as_ref() {
         let dep_tx = deposit_tx;
 
         let ser = serde_json::to_value(dep_tx).expect("could not serialize TxDeposit");
