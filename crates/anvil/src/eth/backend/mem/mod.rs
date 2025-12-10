@@ -1,7 +1,7 @@
 //! In-memory blockchain backend.
 
 use self::state::trie_storage;
-use super::executor::new_evm_with_inspector_ref;
+use super::executor::new_evm_with_inspector;
 use crate::{
     ForkChoice, NodeConfig, PrecompileFactory,
     config::PruneStateHistoryConfig,
@@ -1187,7 +1187,7 @@ impl Backend {
             + Inspector<OpContext<WrapDatabaseRef<&'db DB>>>,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
-        let mut evm = new_evm_with_inspector_ref(db, env, inspector);
+        let mut evm = new_evm_with_inspector(WrapDatabaseRef(db), env, inspector);
         self.env.read().networks.inject_precompiles(evm.precompiles_mut());
 
         if let Some(factory) = &self.precompile_factory {
@@ -1283,8 +1283,7 @@ impl Backend {
             db: &mut cache_db,
             validator: self,
             pending: pool_transactions.into_iter(),
-            block_env: env.evm_env.block_env.clone(),
-            cfg_env: env.evm_env.cfg_env,
+            evm_env: env.evm_env,
             parent_hash: storage.best_hash,
             gas_used: 0,
             blob_gas_used: 0,
@@ -1372,8 +1371,7 @@ impl Backend {
                     db: &mut **db,
                     validator: self,
                     pending: pool_transactions.into_iter(),
-                    block_env: env.evm_env.block_env.clone(),
-                    cfg_env: env.evm_env.cfg_env.clone(),
+                    evm_env: env.evm_env.clone(),
                     parent_hash: best_hash,
                     gas_used: 0,
                     blob_gas_used: 0,
@@ -2769,8 +2767,7 @@ impl Backend {
                 db: &mut cache_db,
                 validator: self,
                 pending: pool_txs.into_iter(),
-                block_env: env.evm_env.block_env.clone(),
-                cfg_env: env.evm_env.cfg_env.clone(),
+                evm_env: env.evm_env.clone(),
                 parent_hash: block.header.parent_hash,
                 gas_used: 0,
                 blob_gas_used: 0,
