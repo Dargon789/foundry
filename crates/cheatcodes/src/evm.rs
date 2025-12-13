@@ -191,9 +191,8 @@ impl Display for AccountStateDiffs {
             for (slot, slot_changes) in &self.state_diff {
                 match &slot_changes.slot_info {
                     Some(slot_info) => {
-                        if slot_info.decoded.is_some() {
+                        if let Some(decoded) = &slot_info.decoded {
                             // Have slot info with decoded values - show decoded values
-                            let decoded = slot_info.decoded.as_ref().unwrap();
                             writeln!(
                                 f,
                                 "@ {slot} ({}, {}): {} → {}",
@@ -1419,15 +1418,13 @@ fn get_recorded_state_diffs(ccx: &mut CheatsCtxt) -> BTreeMap<Address, AccountSt
     let mut contract_names = HashMap::new();
     let mut storage_layouts = HashMap::new();
     for address in addresses_to_lookup {
-        if let Some((artifact_id, _)) = get_contract_data(ccx, address) {
+        if let Some((artifact_id, contract_data)) = get_contract_data(ccx, address) {
             contract_names.insert(address, artifact_id.identifier());
-        }
 
-        // Also get storage layout if available
-        if let Some((_artifact_id, contract_data)) = get_contract_data(ccx, address)
-            && let Some(storage_layout) = &contract_data.storage_layout
-        {
-            storage_layouts.insert(address, storage_layout.clone());
+            // Also get storage layout if available
+            if let Some(storage_layout) = &contract_data.storage_layout {
+                storage_layouts.insert(address, storage_layout.clone());
+            }
         }
     }
 
