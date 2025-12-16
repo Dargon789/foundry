@@ -9,7 +9,6 @@ use crate::{
     execute::{ExecutionArtifacts, ExecutionData},
     sequence::get_commit_hash,
 };
-use alloy_chains::NamedChain;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, TxKind, U256, map::HashMap, utils::format_units};
 use dialoguer::Confirm;
@@ -351,12 +350,6 @@ impl FilledTransactionsState {
             for (rpc, total_gas) in total_gas_per_rpc {
                 let provider_info = manager.get(&rpc).expect("provider is set.");
 
-                // Get the native token symbol for the chain using NamedChain
-                let token_symbol = NamedChain::try_from(provider_info.chain)
-                    .unwrap_or_default()
-                    .native_currency_symbol()
-                    .unwrap_or("ETH");
-
                 // We don't store it in the transactions, since we want the most updated value.
                 // Right before broadcasting.
                 let per_gas = if let Some(gas_price) = self.args.with_gas_price {
@@ -380,7 +373,7 @@ impl FilledTransactionsState {
 
                     sh_println!("\nEstimated gas price: {} gwei", estimated_gas_price)?;
                     sh_println!("\nEstimated total gas used for script: {total_gas}")?;
-                    sh_println!("\nEstimated amount required: {estimated_amount} {token_symbol}")?;
+                    sh_println!("\nEstimated amount required: {estimated_amount} ETH",)?;
                     sh_println!("\n==========================")?;
                 } else {
                     sh_println!(
@@ -390,7 +383,6 @@ impl FilledTransactionsState {
                             "estimated_gas_price": estimated_gas_price,
                             "estimated_total_gas_used": total_gas,
                             "estimated_amount_required": estimated_amount,
-                            "token_symbol": token_symbol,
                         })
                     )?;
                 }
