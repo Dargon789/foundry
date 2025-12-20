@@ -8,6 +8,12 @@ use foundry_config::Config;
 use std::path::{Path, PathBuf};
 use yansi::Paint;
 
+/// Supported networks for `forge init --network <NETWORK>`
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum Networks {
+    Tempo,
+}
+
 /// CLI arguments for `forge init`.
 #[derive(Clone, Debug, Default, Parser)]
 pub struct InitArgs {
@@ -37,14 +43,45 @@ pub struct InitArgs {
     #[arg(long, conflicts_with = "template")]
     pub vscode: bool,
 
+    /// Initialize a Vyper project template.
+    #[arg(long, conflicts_with = "template")]
+    pub vyper: bool,
+
+    /// Initialize a project template for the specified network in Foundry.
+    #[arg(long, short, conflicts_with_all = &["vyper", "template"])]
+    pub network: Option<Networks>,
+
+    /// Use the parent git repository instead of initializing a new one.
+    /// Only valid if the target is in a git repository.
+    #[arg(long, conflicts_with = "template")]
+    pub use_parent_git: bool,
+
+    /// Do not create example contracts (Counter.sol, Counter.t.sol, Counter.s.sol).
+    #[arg(long, conflicts_with = "template")]
+    pub empty: bool,
+
     #[command(flatten)]
     pub install: DependencyInstallOpts,
 }
 
 impl InitArgs {
-    pub fn run(self) -> Result<()> {
-        let Self { root, template, branch, install, offline, force, vscode } = self;
+    pub async fn run(self) -> Result<()> {
+        let Self {
+            root,
+            template,
+            branch,
+            install,
+            offline,
+            force,
+            vscode,
+            use_parent_git,
+            vyper,
+            network,
+            empty,
+        } = self;
         let DependencyInstallOpts { shallow, no_git, commit } = install;
+
+        let tempo = matches!(network, Some(Networks::Tempo));
 
         // create the root dir if it does not exist
         if !root.exists() {
@@ -118,18 +155,83 @@ impl InitArgs {
             let script = root.join("script");
             fs::create_dir_all(&script)?;
 
-            // write the contract file
-            let contract_path = src.join("Counter.sol");
-            fs::write(contract_path, include_str!("../../assets/CounterTemplate.sol"))?;
-            // write the tests
-            let contract_path = test.join("Counter.t.sol");
-            fs::write(contract_path, include_str!("../../assets/CounterTemplate.t.sol"))?;
-            // write the script
-            let contract_path = script.join("Counter.s.sol");
-            fs::write(contract_path, include_str!("../../assets/CounterTemplate.s.sol"))?;
-            // Write the default README file
+            // Only create example contracts if not disabled
+            if !empty {
+                if vyper {
+                    // write the contract file
+                    let contract_path = src.join("Counter.vy");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/vyper/CounterTemplate.vy"),
+                    )?;
+                    let interface_path = src.join("ICounter.sol");
+                    fs::write(
+                        interface_path,
+                        include_str!("../../assets/vyper/ICounterTemplate.sol"),
+                    )?;
+
+                    // write the tests
+                    let contract_path = test.join("Counter.t.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/vyper/CounterTemplate.t.sol"),
+                    )?;
+
+                    // write the script
+                    let contract_path = script.join("Counter.s.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/vyper/CounterTemplate.s.sol"),
+                    )?;
+                } else if tempo {
+                    // write the contract file
+                    let contract_path = src.join("Mail.sol");
+                    fs::write(contract_path, include_str!("../../assets/tempo/MailTemplate.sol"))?;
+
+                    // write the tests
+                    let contract_path = test.join("Mail.t.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/tempo/MailTemplate.t.sol"),
+                    )?;
+
+                    // write the script
+                    let contract_path = script.join("Mail.s.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/tempo/MailTemplate.s.sol"),
+                    )?;
+                } else {
+                    // write the contract file
+                    let contract_path = src.join("Counter.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/solidity/CounterTemplate.sol"),
+                    )?;
+
+                    // write the tests
+                    let contract_path = test.join("Counter.t.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/solidity/CounterTemplate.t.sol"),
+                    )?;
+
+                    // write the script
+                    let contract_path = script.join("Counter.s.sol");
+                    fs::write(
+                        contract_path,
+                        include_str!("../../assets/solidity/CounterTemplate.s.sol"),
+                    )?;
+                }
+            }
+
+            // Write the README file
             let readme_path = root.join("README.md");
-            fs::write(readme_path, include_str!("../../assets/README.md"))?;
+            if tempo {
+                fs::write(readme_path, include_str!("../../assets/tempo/README.md"))?;
+            } else {
+                fs::write(readme_path, include_str!("../../assets/README.md"))?;
+            }
 
             // write foundry.toml, if it doesn't exist already
             let dest = root.join(Config::FILE_NAME);
@@ -141,17 +243,28 @@ impl InitArgs {
 
             // set up the repo
             if !no_git {
-                init_git_repo(git, commit)?;
+                init_git_repo(git, commit, use_parent_git, vyper, tempo)?;
             }
 
             // install forge-std
             if !offline {
                 if root.join("lib/forge-std").exists() {
                     sh_warn!("\"lib/forge-std\" already exists, skipping install...")?;
-                    self.install.install(&mut config, vec![])?;
+                    self.install.install(&mut config, vec![]).await?;
                 } else {
                     let dep = "https://github.com/foundry-rs/forge-std".parse()?;
-                    self.install.install(&mut config, vec![dep])?;
+                    self.install.install(&mut config, vec![dep]).await?;
+                }
+
+                // install tempo-std
+                if tempo {
+                    if root.join("lib/tempo-std").exists() {
+                        sh_warn!("\"lib/tempo-std\" already exists, skipping install...")?;
+                        self.install.install(&mut config, vec![]).await?;
+                    } else {
+                        let dep = "https://github.com/tempoxyz/tempo-std".parse()?;
+                        self.install.install(&mut config, vec![dep]).await?;
+                    }
                 }
             }
 
@@ -166,14 +279,21 @@ impl InitArgs {
     }
 }
 
-/// Initialises `root` as a git repository, if it isn't one already.
+/// Initialises `root` as a git repository, if it isn't one already, unless 'use_parent_git' is
+/// true.
 ///
 /// Creates `.gitignore` and `.github/workflows/test.yml`, if they don't exist already.
 ///
 /// Commits everything in `root` if `commit` is true.
-fn init_git_repo(git: Git<'_>, commit: bool) -> Result<()> {
-    // git init
-    if !git.is_in_repo()? {
+fn init_git_repo(
+    git: Git<'_>,
+    commit: bool,
+    use_parent_git: bool,
+    vyper: bool,
+    tempo: bool,
+) -> Result<()> {
+    // `git init`
+    if !git.is_in_repo()? || (!use_parent_git && !git.is_repo_root()?) {
         git.init()?;
     }
 
@@ -187,7 +307,14 @@ fn init_git_repo(git: Git<'_>, commit: bool) -> Result<()> {
     let workflow = git.root.join(".github/workflows/test.yml");
     if !workflow.exists() {
         fs::create_dir_all(workflow.parent().unwrap())?;
-        fs::write(workflow, include_str!("../../assets/workflowTemplate.yml"))?;
+
+        if vyper {
+            fs::write(workflow, include_str!("../../assets/vyper/workflowTemplate.yml"))?;
+        } else if tempo {
+            fs::write(workflow, include_str!("../../assets/tempo/workflowTemplate.yml"))?;
+        } else {
+            fs::write(workflow, include_str!("../../assets/solidity/workflowTemplate.yml"))?;
+        }
     }
 
     // commit everything

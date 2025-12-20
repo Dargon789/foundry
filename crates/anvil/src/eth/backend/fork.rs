@@ -5,30 +5,30 @@ use alloy_consensus::Account;
 use alloy_eips::eip2930::AccessListResult;
 use alloy_network::{AnyRpcBlock, AnyRpcTransaction, BlockResponse, TransactionResponse};
 use alloy_primitives::{
+    Address, B256, Bytes, StorageValue, U256,
     map::{FbHashMap, HashMap},
-    Address, Bytes, StorageValue, B256, U256,
 };
 use alloy_provider::{
-    ext::{DebugApi, TraceApi},
     Provider,
+    ext::{DebugApi, TraceApi},
 };
 use alloy_rpc_types::{
+    BlockId, BlockNumberOrTag as BlockNumber, BlockTransactions, EIP1186AccountProofResponse,
+    FeeHistory, Filter, Log,
     request::TransactionRequest,
     simulate::{SimulatePayload, SimulatedBlock},
     trace::{
         geth::{GethDebugTracingOptions, GethTrace},
         parity::LocalizedTransactionTrace as Trace,
     },
-    BlockId, BlockNumberOrTag as BlockNumber, BlockTransactions, EIP1186AccountProofResponse,
-    FeeHistory, Filter, Log,
 };
 use alloy_serde::WithOtherFields;
 use alloy_transport::TransportError;
-use anvil_core::eth::transaction::{convert_to_anvil_receipt, ReceiptResponse};
 use foundry_common::provider::{ProviderBuilder, RetryProvider};
+use foundry_primitives::FoundryTxReceipt;
 use parking_lot::{
-    lock_api::{RwLockReadGuard, RwLockWriteGuard},
     RawRwLock, RwLock,
+    lock_api::{RwLockReadGuard, RwLockWriteGuard},
 };
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use std::{sync::Arc, time::Duration};
@@ -274,7 +274,7 @@ impl ClientFork {
         let code = self.provider().get_code_at(address).block_id(block_id).await?;
 
         let mut storage = self.storage_write();
-        storage.code_at.insert((address, blocknumber), code.clone().0.into());
+        storage.code_at.insert((address, blocknumber), code.clone());
 
         Ok(code)
     }
@@ -397,6 +397,14 @@ impl ClientFork {
         Ok(trace)
     }
 
+    pub async fn debug_code_by_hash(
+        &self,
+        code_hash: B256,
+        block_id: Option<BlockId>,
+    ) -> Result<Option<Bytes>, TransportError> {
+        self.provider().debug_code_by_hash(code_hash, block_id).await
+    }
+
     pub async fn trace_block(&self, number: u64) -> Result<Vec<Trace>, TransportError> {
         if let Some(traces) = self.storage_read().block_traces.get(&number).cloned() {
             return Ok(traces);
@@ -414,14 +422,14 @@ impl ClientFork {
     pub async fn transaction_receipt(
         &self,
         hash: B256,
-    ) -> Result<Option<ReceiptResponse>, BlockchainError> {
+    ) -> Result<Option<FoundryTxReceipt>, BlockchainError> {
         if let Some(receipt) = self.storage_read().transaction_receipts.get(&hash).cloned() {
             return Ok(Some(receipt));
         }
 
         if let Some(receipt) = self.provider().get_transaction_receipt(hash).await? {
-            let receipt =
-                convert_to_anvil_receipt(receipt).ok_or(BlockchainError::FailedToDecodeReceipt)?;
+            let receipt = FoundryTxReceipt::try_from(receipt)
+                .map_err(|_| BlockchainError::FailedToDecodeReceipt)?;
             let mut storage = self.storage_write();
             storage.transaction_receipts.insert(hash, receipt.clone());
             return Ok(Some(receipt));
@@ -433,7 +441,7 @@ impl ClientFork {
     pub async fn block_receipts(
         &self,
         number: u64,
-    ) -> Result<Option<Vec<ReceiptResponse>>, BlockchainError> {
+    ) -> Result<Option<Vec<FoundryTxReceipt>>, BlockchainError> {
         if let receipts @ Some(_) = self.storage_read().block_receipts.get(&number).cloned() {
             return Ok(receipts);
         }
@@ -447,8 +455,8 @@ impl ClientFork {
                 .map(|r| {
                     r.into_iter()
                         .map(|r| {
-                            convert_to_anvil_receipt(r)
-                                .ok_or(BlockchainError::FailedToDecodeReceipt)
+                            FoundryTxReceipt::try_from(r)
+                                .map_err(|_| BlockchainError::FailedToDecodeReceipt)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -700,12 +708,12 @@ pub struct ForkedStorage {
     pub blocks: FbHashMap<32, AnyRpcBlock>,
     pub hashes: HashMap<u64, B256>,
     pub transactions: FbHashMap<32, AnyRpcTransaction>,
-    pub transaction_receipts: FbHashMap<32, ReceiptResponse>,
+    pub transaction_receipts: FbHashMap<32, FoundryTxReceipt>,
     pub transaction_traces: FbHashMap<32, Vec<Trace>>,
     pub logs: HashMap<Filter, Vec<Log>>,
     pub geth_transaction_traces: FbHashMap<32, GethTrace>,
     pub block_traces: HashMap<u64, Vec<Trace>>,
-    pub block_receipts: HashMap<u64, Vec<ReceiptResponse>>,
+    pub block_receipts: HashMap<u64, Vec<FoundryTxReceipt>>,
     pub code_at: HashMap<(Address, u64), Bytes>,
 }
 

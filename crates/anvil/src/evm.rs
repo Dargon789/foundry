@@ -1,60 +1,40 @@
+use alloy_evm::precompiles::DynPrecompile;
+use alloy_primitives::Address;
 use std::fmt::Debug;
-
-use alloy_evm::{
-    eth::EthEvmContext,
-    precompiles::{DynPrecompile, PrecompilesMap},
-    Database, Evm,
-};
-use foundry_evm_core::either_evm::EitherEvm;
-use op_revm::OpContext;
-use revm::{precompile::PrecompileWithAddress, Inspector};
 
 /// Object-safe trait that enables injecting extra precompiles when using
 /// `anvil` as a library.
 pub trait PrecompileFactory: Send + Sync + Unpin + Debug {
     /// Returns a set of precompiles to extend the EVM with.
-    fn precompiles(&self) -> Vec<PrecompileWithAddress>;
-}
-
-/// Inject precompiles into the EVM dynamically.
-pub fn inject_precompiles<DB, I>(
-    evm: &mut EitherEvm<DB, I, PrecompilesMap>,
-    precompiles: Vec<PrecompileWithAddress>,
-) where
-    DB: Database,
-    I: Inspector<EthEvmContext<DB>> + Inspector<OpContext<DB>>,
-{
-    for p in precompiles {
-        evm.precompiles_mut()
-            .apply_precompile(p.address(), |_| Some(DynPrecompile::from(*p.precompile())));
-    }
+    fn precompiles(&self) -> Vec<(Address, DynPrecompile)>;
 }
 
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
 
-    use alloy_evm::{eth::EthEvmContext, precompiles::PrecompilesMap, EthEvm, Evm, EvmEnv};
+    use crate::PrecompileFactory;
+    use alloy_evm::{
+        EthEvm, Evm, EvmEnv,
+        eth::EthEvmContext,
+        precompiles::{DynPrecompile, PrecompilesMap},
+    };
     use alloy_op_evm::OpEvm;
-    use alloy_primitives::{address, Address, Bytes, TxKind, U256};
-    use foundry_evm_core::either_evm::EitherEvm;
+    use alloy_primitives::{Address, Bytes, TxKind, U256, address};
+    use foundry_evm::core::either_evm::EitherEvm;
+    use foundry_evm_networks::NetworkConfigs;
     use itertools::Itertools;
-    use op_revm::{precompiles::OpPrecompiles, L1BlockInfo, OpContext, OpSpecId, OpTransaction};
+    use op_revm::{L1BlockInfo, OpContext, OpSpecId, OpTransaction, precompiles::OpPrecompiles};
     use revm::{
+        Journal,
         context::{CfgEnv, Evm as RevmEvm, JournalTr, LocalContext, TxEnv},
         database::{EmptyDB, EmptyDBTyped},
-        handler::{instructions::EthInstructions, EthPrecompiles},
+        handler::{EthPrecompiles, instructions::EthInstructions},
         inspector::NoOpInspector,
         interpreter::interpreter::EthInterpreter,
-        precompile::{
-            PrecompileOutput, PrecompileResult, PrecompileSpecId, PrecompileWithAddress,
-            Precompiles,
-        },
+        precompile::{PrecompileOutput, PrecompileSpecId, Precompiles},
         primitives::hardfork::SpecId,
-        Journal,
     };
-
-    use crate::{inject_precompiles, PrecompileFactory};
 
     // A precompile activated in the `Prague` spec.
     const ETH_PRAGUE_PRECOMPILE: Address = address!("0x0000000000000000000000000000000000000011");
@@ -70,18 +50,20 @@ mod tests {
     struct CustomPrecompileFactory;
 
     impl PrecompileFactory for CustomPrecompileFactory {
-        fn precompiles(&self) -> Vec<PrecompileWithAddress> {
-            vec![PrecompileWithAddress::from((
+        fn precompiles(&self) -> Vec<(Address, DynPrecompile)> {
+            use alloy_evm::precompiles::PrecompileInput;
+            vec![(
                 PRECOMPILE_ADDR,
-                custom_echo_precompile as fn(&[u8], u64) -> PrecompileResult,
-            ))]
+                DynPrecompile::from(|input: PrecompileInput<'_>| {
+                    Ok(PrecompileOutput {
+                        bytes: Bytes::copy_from_slice(input.data),
+                        gas_used: 0,
+                        gas_refunded: 0,
+                        reverted: false,
+                    })
+                }),
+            )]
         }
-    }
-
-    /// Custom precompile that echoes the input data.
-    /// In this example it uses `0xdeadbeef` as the input data, returning it as output.
-    fn custom_echo_precompile(input: &[u8], _gas_limit: u64) -> PrecompileResult {
-        Ok(PrecompileOutput { bytes: Bytes::copy_from_slice(input), gas_used: 0 })
     }
 
     /// Creates a new EVM instance with the custom precompile factory.
@@ -144,7 +126,7 @@ mod tests {
                 },
                 ..Default::default()
             },
-            is_optimism: true,
+            networks: NetworkConfigs::with_optimism(),
         };
 
         let mut chain = L1BlockInfo::default();
@@ -193,7 +175,7 @@ mod tests {
 
         assert!(!evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
-        inject_precompiles(&mut evm, CustomPrecompileFactory.precompiles());
+        evm.precompiles_mut().extend_precompiles(CustomPrecompileFactory.precompiles());
 
         assert!(evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
@@ -215,7 +197,7 @@ mod tests {
 
         assert!(!evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
-        inject_precompiles(&mut evm, CustomPrecompileFactory.precompiles());
+        evm.precompiles_mut().extend_precompiles(CustomPrecompileFactory.precompiles());
 
         assert!(evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
@@ -240,7 +222,7 @@ mod tests {
 
         assert!(!evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
-        inject_precompiles(&mut evm, CustomPrecompileFactory.precompiles());
+        evm.precompiles_mut().extend_precompiles(CustomPrecompileFactory.precompiles());
 
         assert!(evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
@@ -265,7 +247,7 @@ mod tests {
 
         assert!(!evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 
-        inject_precompiles(&mut evm, CustomPrecompileFactory.precompiles());
+        evm.precompiles_mut().extend_precompiles(CustomPrecompileFactory.precompiles());
 
         assert!(evm.precompiles().addresses().contains(&PRECOMPILE_ADDR));
 

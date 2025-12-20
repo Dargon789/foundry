@@ -1,15 +1,16 @@
 use crate::{
-    tx::{CastTxBuilder, SenderKind},
     Cast,
+    tx::{CastTxBuilder, SenderKind},
 };
 use alloy_ens::NameOrAddress;
 use alloy_rpc_types::BlockId;
 use clap::Parser;
 use eyre::Result;
 use foundry_cli::{
-    opts::{EthereumOpts, TransactionOpts},
+    opts::{RpcOpts, TransactionOpts},
     utils::{self, LoadConfig},
 };
+use foundry_wallets::WalletOpts;
 use std::str::FromStr;
 
 /// CLI arguments for `cast access-list`.
@@ -27,7 +28,7 @@ pub struct AccessListArgs {
     sig: Option<String>,
 
     /// The arguments of the function to call.
-    #[arg(value_name = "ARGS")]
+    #[arg(value_name = "ARGS", allow_negative_numbers = true)]
     args: Vec<String>,
 
     /// The block height to query at.
@@ -40,16 +41,19 @@ pub struct AccessListArgs {
     tx: TransactionOpts,
 
     #[command(flatten)]
-    eth: EthereumOpts,
+    rpc: RpcOpts,
+
+    #[command(flatten)]
+    wallet: WalletOpts,
 }
 
 impl AccessListArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { to, sig, args, tx, eth, block } = self;
+        let Self { to, sig, args, tx, rpc, wallet, block } = self;
 
-        let config = eth.load_config()?;
+        let config = rpc.load_config()?;
         let provider = utils::get_provider(&config)?;
-        let sender = SenderKind::from_wallet_opts(eth.wallet).await?;
+        let sender = SenderKind::from_wallet_opts(wallet).await?;
 
         let (tx, _) = CastTxBuilder::new(&provider, tx, &config)
             .await?
