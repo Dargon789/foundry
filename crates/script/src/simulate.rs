@@ -3,26 +3,26 @@ use super::{
     sequence::ScriptSequenceKind, transaction::ScriptTransactionBuilder,
 };
 use crate::{
-    broadcast::{estimate_gas, BundledState},
+    ScriptArgs, ScriptConfig, ScriptResult,
+    broadcast::{BundledState, estimate_gas},
     build::LinkedBuildData,
     execute::{ExecutionArtifacts, ExecutionData},
     sequence::get_commit_hash,
-    ScriptArgs, ScriptConfig, ScriptResult,
 };
-use alloy_chains::NamedChain;
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{map::HashMap, utils::format_units, Address, Bytes, TxKind};
+use alloy_primitives::{Address, TxKind, U256, map::HashMap, utils::format_units};
 use dialoguer::Confirm;
 use eyre::{Context, Result};
 use forge_script_sequence::{ScriptSequence, TransactionWithMetadata};
 use foundry_cheatcodes::Wallets;
 use foundry_cli::utils::{has_different_gas_calc, now};
-use foundry_common::{shell, ContractData};
+use foundry_common::{ContractData, shell};
 use foundry_evm::traces::{decode_trace_arena, render_trace_arena};
 use futures::future::{join_all, try_join_all};
 use parking_lot::RwLock;
 use std::{
     collections::{BTreeMap, VecDeque},
+    mem,
     sync::Arc,
 };
 
@@ -127,7 +127,7 @@ impl PreSimulationState {
                         tx.from()
                             .expect("transaction doesn't have a `from` address at execution time"),
                         to,
-                        tx.input().map(Bytes::copy_from_slice),
+                        tx.input().cloned(),
                         tx.value(),
                         tx.authorization_list(),
                     )
@@ -139,7 +139,7 @@ impl PreSimulationState {
 
                 // Simulate mining the transaction if the user passes `--slow`.
                 if self.args.slow {
-                    runner.executor.env_mut().evm_env.block_env.number += 1;
+                    runner.executor.env_mut().evm_env.block_env.number += U256::from(1);
                 }
 
                 let is_noop_tx = if let Some(to) = to {
@@ -149,7 +149,11 @@ impl PreSimulationState {
                 };
 
                 let transaction = ScriptTransactionBuilder::from(transaction)
-                    .with_execution_result(&result, self.args.gas_estimate_multiplier)
+                    .with_execution_result(
+                        &result,
+                        self.args.gas_estimate_multiplier,
+                        &self.build_data,
+                    )
                     .build();
 
                 eyre::Ok((Some(transaction), is_noop_tx, result.traces))
@@ -181,9 +185,9 @@ impl PreSimulationState {
                     )?;
 
                     // Only prompt if we're broadcasting and we've not disabled interactivity.
-                    if self.args.should_broadcast() &&
-                        !self.args.non_interactive &&
-                        !Confirm::new()
+                    if self.args.should_broadcast()
+                        && !self.args.non_interactive
+                        && !Confirm::new()
                             .with_prompt("Do you wish to continue?".to_string())
                             .interact()?
                     {
@@ -235,7 +239,7 @@ impl PreSimulationState {
             let mut script_config = self.script_config.clone();
             script_config.evm_opts.fork_url = Some(rpc.clone());
             let runner = script_config.get_runner().await?;
-            Ok((rpc.clone(), runner))
+            Ok((rpc, runner))
         });
         try_join_all(futs).await
     }
@@ -259,7 +263,7 @@ impl FilledTransactionsState {
     /// chain deployment.
     ///
     /// Each transaction will be added with the correct transaction type and gas estimation.
-    pub async fn bundle(self) -> Result<BundledState> {
+    pub async fn bundle(mut self) -> Result<BundledState> {
         let is_multi_deployment = self.execution_artifacts.rpc_data.total_rpcs.len() > 1;
 
         if is_multi_deployment && !self.build_data.libraries.is_empty() {
@@ -275,7 +279,7 @@ impl FilledTransactionsState {
 
         // Peeking is used to check if the next rpc url is different. If so, it creates a
         // [`ScriptSequence`] from all the collected transactions up to this point.
-        let mut txes_iter = self.transactions.clone().into_iter().peekable();
+        let mut txes_iter = mem::take(&mut self.transactions).into_iter().peekable();
 
         while let Some(mut tx) = txes_iter.next() {
             let tx_rpc = tx.rpc.to_owned();
@@ -328,10 +332,10 @@ impl FilledTransactionsState {
             new_sequence.push_back(tx);
             // We only create a [`ScriptSequence`] object when we collect all the rpc related
             // transactions.
-            if let Some(next_tx) = txes_iter.peek() {
-                if next_tx.rpc == tx_rpc {
-                    continue;
-                }
+            if let Some(next_tx) = txes_iter.peek()
+                && next_tx.rpc == tx_rpc
+            {
+                continue;
             }
 
             let sequence =
@@ -346,12 +350,6 @@ impl FilledTransactionsState {
             // Present gas information on a per RPC basis.
             for (rpc, total_gas) in total_gas_per_rpc {
                 let provider_info = manager.get(&rpc).expect("provider is set.");
-
-                // Get the native token symbol for the chain using NamedChain
-                let token_symbol = NamedChain::try_from(provider_info.chain)
-                    .unwrap_or_default()
-                    .native_currency_symbol()
-                    .unwrap_or("ETH");
 
                 // We don't store it in the transactions, since we want the most updated value.
                 // Right before broadcasting.
@@ -376,7 +374,7 @@ impl FilledTransactionsState {
 
                     sh_println!("\nEstimated gas price: {} gwei", estimated_gas_price)?;
                     sh_println!("\nEstimated total gas used for script: {total_gas}")?;
-                    sh_println!("\nEstimated amount required: {estimated_amount} {token_symbol}")?;
+                    sh_println!("\nEstimated amount required: {estimated_amount} ETH",)?;
                     sh_println!("\n==========================")?;
                 } else {
                     sh_println!(
@@ -386,7 +384,6 @@ impl FilledTransactionsState {
                             "estimated_gas_price": estimated_gas_price,
                             "estimated_total_gas_used": total_gas,
                             "estimated_amount_required": estimated_amount,
-                            "token_symbol": token_symbol,
                         })
                     )?;
                 }
@@ -454,7 +451,7 @@ impl FilledTransactionsState {
             receipts: vec![],
             pending: vec![],
             paths,
-            timestamp: now().as_secs(),
+            timestamp: now().as_millis(),
             libraries,
             chain,
             commit,

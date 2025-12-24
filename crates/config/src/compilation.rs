@@ -1,10 +1,10 @@
 use crate::{filter::GlobMatcher, serde_helpers};
 use foundry_compilers::{
+    RestrictionsWithVersion,
     artifacts::{BytecodeHash, EvmVersion},
     multi::{MultiCompilerRestrictions, MultiCompilerSettings},
     settings::VyperRestrictions,
     solc::{Restriction, SolcRestrictions},
-    RestrictionsWithVersion,
 };
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,7 @@ impl SettingsOverrides {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestrictionsError {
-    #[error("specified both exact and relative restrictions for {0}")]
+    #[error("invalid configuration: cannot specify both exact and relative restrictions for '{0}' - please choose only one type of restriction")]
     BothExactAndRelative(&'static str),
 }
 
