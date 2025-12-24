@@ -4,7 +4,6 @@ use foundry_test_utils::str;
 
 // https://github.com/foundry-rs/foundry/issues/3055
 forgetest_init!(issue_3055, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue3055.t.sol",
         r#"
@@ -69,7 +68,6 @@ Tip: Run `forge test --rerun` to retry only the 3 failed tests
 
 // https://github.com/foundry-rs/foundry/issues/3189
 forgetest_init!(issue_3189, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue3189.t.sol",
         r#"
@@ -124,7 +122,6 @@ Tip: Run `forge test --rerun` to retry only the 1 failed test
 
 // https://github.com/foundry-rs/foundry/issues/3596
 forgetest_init!(issue_3596, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue3596.t.sol",
         r#"
@@ -176,7 +173,6 @@ Tip: Run `forge test --rerun` to retry only the 1 failed test
 
 // https://github.com/foundry-rs/foundry/issues/2851
 forgetest_init!(issue_2851, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue2851.t.sol",
         r#"
@@ -224,7 +220,6 @@ Ran 1 test suite [ELAPSED]: 0 tests passed, 1 failed, 0 skipped (1 total tests)
 
 // https://github.com/foundry-rs/foundry/issues/6170
 forgetest_init!(issue_6170, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue6170.t.sol",
         r#"
@@ -276,7 +271,6 @@ Tip: Run `forge test --rerun` to retry only the 1 failed test
 
 // https://github.com/foundry-rs/foundry/issues/6355
 forgetest_init!(issue_6355, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue6355.t.sol",
         r#"
@@ -340,7 +334,6 @@ Tip: Run `forge test --rerun` to retry only the 2 failed tests
 
 // https://github.com/foundry-rs/foundry/issues/3347
 forgetest_init!(issue_3347, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue3347.t.sol",
         r#"
@@ -378,7 +371,6 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 // https://github.com/foundry-rs/foundry/issues/6501
 // Make sure we decode Hardhat-style `console.log`s correctly, in both logs and traces.
 forgetest_init!(issue_6501, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "Issue6501.t.sol",
         r#"
@@ -422,7 +414,6 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 // https://github.com/foundry-rs/foundry/issues/8383
 forgetest_init!(issue_8383, |prj, cmd| {
-    prj.wipe_contracts();
     prj.update_config(|config| {
         config.optimizer = Some(true);
         config.optimizer_runs = Some(200);
@@ -759,5 +750,33 @@ contract P256Verifier {
 Ran 1 test for test/Issue8383.t.sol:Issue8383Test
 [PASS] testP256VerifyOutOfBounds() (gas: 3139)
 ...
+"#]]);
+});
+
+// https://github.com/foundry-rs/foundry/issues/9272
+forgetest_init!(issue_9272, |prj, cmd| {
+    prj.update_config(|config| {
+        config.allow_paths.push("..".into());
+    });
+
+    prj.add_source(
+        "Contract.sol",
+        r#"
+pragma solidity ^0.8.0;
+import '../Missing.sol';
+contract Contract {}
+"#,
+    );
+
+    // We expect a compilation error due to the missing import
+    cmd.arg("build").assert_failure().stderr_eq(str![[r#"
+Error: Compiler run failed:
+Error (6275): Source "Missing.sol" not found: File not found. Searched the following locations: [..]
+ParserError: Source "Missing.sol" not found: File not found. Searched the following locations: [..]
+ [FILE]:4:1:
+  |
+4 | import '../Missing.sol';
+  | ^^^^^^^^^^^^^^^^^^^^^^^^
+
 "#]]);
 });

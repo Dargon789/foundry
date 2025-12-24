@@ -3,6 +3,7 @@
 use foundry_test_utils::{forgetest_init, str};
 
 forgetest_init!(should_run_table_tests, |prj, cmd| {
+    prj.initialize_default_contracts();
     prj.add_test(
         "CounterTable.t.sol",
         r#"
@@ -62,7 +63,7 @@ contract CounterTableTest is Test {
     "#,
     );
 
-    cmd.args(["test", "--mc", "CounterTable", "-vvvv"]).assert_failure().stdout_eq(str![[r#"
+    cmd.args(["test", "--mc", "CounterTable", "-vvvvv"]).assert_failure().stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
 [SOLC_VERSION] [ELAPSED]
 Compiler run successful!
@@ -82,6 +83,8 @@ Backtrace:
 Traces:
   [..] CounterTableTest::tableMultipleParamsPass(10, true)
     ├─ [..] Counter::increment()
+    │   ├─  storage changes:
+    │   │   @ 0: 0 → 1
     │   └─ ← [Stop]
     └─ ← [Stop]
 
@@ -97,6 +100,8 @@ Backtrace:
 Traces:
   [..] CounterTableTest::tableSingleParamPass(10)
     ├─ [..] Counter::increment()
+    │   ├─  storage changes:
+    │   │   @ 0: 0 → 1
     │   └─ ← [Stop]
     └─ ← [Stop]
 
@@ -125,7 +130,6 @@ Tip: Run `forge test --rerun` to retry only the 6 failed tests
 // Table tests should show logs and contribute to coverage.
 // <https://github.com/foundry-rs/foundry/issues/11066>
 forgetest_init!(should_show_logs_and_add_coverage, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_source(
         "Counter.sol",
         r#"
