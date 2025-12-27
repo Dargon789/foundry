@@ -130,8 +130,8 @@ impl ScriptTester {
                 continue;
             }
             // Optionally verify canonicalized file is in from_dir to avoid symlink traversal
-            if let Ok(canonical_file) = file.canonicalize() {
-                if !canonical_file.starts_with(&from_dir) {
+            if let (Ok(canonical_file), Ok(canonical_from_dir)) = (file.canonicalize(), from_dir.canonicalize()) {
+                if !canonical_file.starts_with(&canonical_from_dir) {
                     continue;
                 }
             }
