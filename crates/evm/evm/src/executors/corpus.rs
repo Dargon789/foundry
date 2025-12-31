@@ -209,7 +209,7 @@ impl CorpusManager {
                 })
         };
 
-        'corpus_replay: for entry in std::fs::read_dir(corpus_dir)? {
+        'corpus_replay: for entry in std::fs::read_dir(&canonical_corpus_dir)? {
             let path = entry?.path();
             // Canonicalize the candidate path, skip if it cannot be canonicalized (e.g. broken symlink)
             let canonical_path = match path.canonicalize() {
