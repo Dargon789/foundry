@@ -5,10 +5,10 @@ use forge_lint::{
     sol::{SolLint, SolLintError, SolidityLinter},
 };
 use foundry_cli::{
-    opts::BuildOpts,
+    opts::{BuildOpts, configure_pcx_from_solc, get_solar_sources_from_compile_output},
     utils::{FoundryPathExt, LoadConfig},
 };
-use foundry_common::compile::ProjectCompiler;
+use foundry_common::{compile::ProjectCompiler, shell};
 use foundry_compilers::{solc::SolcLanguage, utils::SOLC_EXTENSIONS};
 use foundry_config::{filter::expand_globs, lint::Severity};
 use std::path::PathBuf;
@@ -31,10 +31,6 @@ pub struct LintArgs {
     #[arg(long = "only-lint", value_name = "LINT_ID", num_args(1..))]
     pub(crate) lint: Option<Vec<String>>,
 
-    /// Activates the linter's JSON formatter (rustc-compatible).
-    #[arg(long)]
-    pub(crate) json: bool,
-
     #[command(flatten)]
     pub(crate) build: BuildOpts,
 }
@@ -45,7 +41,6 @@ impl LintArgs {
     pub fn run(self) -> Result<()> {
         let config = self.load_config()?;
         let project = config.solar_project()?;
-
         let path_config = config.project_paths();
 
         // Expand ignore globs and canonicalize from the get go
@@ -74,7 +69,7 @@ impl LintArgs {
                     } else if path.is_sol() {
                         inputs.push(path.to_path_buf());
                     } else {
-                        warn!("Cannot process path {}", path.display());
+                        warn!("cannot process path {}", path.display());
                     }
                 }
                 inputs
@@ -82,7 +77,7 @@ impl LintArgs {
         };
 
         if input.is_empty() {
-            sh_println!("Nothing to lint")?;
+            sh_println!("nothing to lint")?;
             return Ok(());
         }
 
@@ -91,32 +86,49 @@ impl LintArgs {
         };
 
         // Override default lint config with user-defined lints
-        let (include, exclude) = match &self.lint {
-            Some(cli_lints) => (Some(parse_lints(cli_lints)?), None),
-            None => (None, Some(parse_lints(&config.lint.exclude_lints)?)),
-        };
-
-        // Override default severity config with user-defined severity
-        let severity = match self.severity {
-            Some(target) => target,
-            None => config.lint.severity.clone(),
+        // When --only-lint is used, bypass the severity filter by setting it to None
+        let (include, exclude, severity) = match &self.lint {
+            Some(cli_lints) => (Some(parse_lints(cli_lints)?), None, vec![]),
+            None => {
+                let severity = self.severity.clone().unwrap_or(config.lint.severity.clone());
+                (None, Some(parse_lints(&config.lint.exclude_lints)?), severity)
+            }
         };
 
         if project.compiler.solc.is_none() {
-            return Err(eyre!("Linting not supported for this language"));
+            return Err(eyre!("linting not supported for this language"));
         }
 
         let linter = SolidityLinter::new(path_config)
-            .with_json_emitter(self.json)
+            .with_json_emitter(shell::is_json())
             .with_description(true)
             .with_lints(include)
             .without_lints(exclude)
             .with_severity(if severity.is_empty() { None } else { Some(severity) })
             .with_mixed_case_exceptions(&config.lint.mixed_case_exceptions);
 
-        let mut output = ProjectCompiler::new().files(input.iter().cloned()).compile(&project)?;
-        let compiler = output.parser_mut().solc_mut().compiler_mut();
-        linter.lint(&input, compiler)?;
+        let output = ProjectCompiler::new().files(input.iter().cloned()).compile(&project)?;
+        let solar_sources = get_solar_sources_from_compile_output(&config, &output, Some(&input))?;
+        if solar_sources.input.sources.is_empty() {
+            return Err(eyre!(
+                "unable to lint. Solar only supports Solidity versions prior to 0.8.0"
+            ));
+        }
+
+        // NOTE(rusowsky): Once solar can drop unsupported versions, rather than creating a new
+        // compiler, we should reuse the parser from the project output.
+        let mut compiler = solar::sema::Compiler::new(
+            solar::interface::Session::builder().with_stderr_emitter().build(),
+        );
+
+        // Load the solar-compatible sources to the pcx before linting
+        compiler.enter_mut(|compiler| {
+            let mut pcx = compiler.parse();
+            pcx.set_resolve_imports(true);
+            configure_pcx_from_solc(&mut pcx, &config.project_paths(), &solar_sources, true);
+            pcx.parse();
+        });
+        linter.lint(&input, config.deny, &mut compiler)?;
 
         Ok(())
     }

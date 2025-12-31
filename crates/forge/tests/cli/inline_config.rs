@@ -63,7 +63,7 @@ forgetest!(invalid_profile, |prj, cmd| {
     );
 
     cmd.arg("test").assert_failure().stderr_eq(str![[r#"
-Error: Inline config error at test/inline.sol:80:123:0: invalid profile `unknown.fuzz.runs = 2`; valid profiles: default
+Error: Inline config error at test/inline.sol:4:9: invalid profile `unknown.fuzz.runs = 2`; valid profiles: default
 
 "#]]);
 });
@@ -161,6 +161,8 @@ Encountered 1 failing test in test/inline.sol:Inline
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
 "#]]);
 });
 
@@ -192,6 +194,8 @@ Encountered 1 failing test in test/inline.sol:Inline
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
 "#]]);
 });
 
@@ -200,7 +204,6 @@ forgetest_init!(config_inline_isolate, |prj, cmd| {
     use serde::{Deserialize, Deserializer};
     use std::{fs, path::Path};
 
-    prj.wipe_contracts();
     prj.add_test(
         "inline.sol",
         r#"
@@ -326,7 +329,6 @@ Ran 2 test suites [ELAPSED]: 3 tests passed, 0 failed, 0 skipped (3 total tests)
 });
 
 forgetest_init!(config_inline_evm_version, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "inline.sol",
         r#"

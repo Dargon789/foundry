@@ -3,7 +3,7 @@
 //! Foundry configuration.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[macro_use]
 extern crate tracing;
@@ -37,12 +37,12 @@ use foundry_compilers::{
     },
     error::SolcError,
     multi::{MultiCompilerParser, MultiCompilerRestrictions},
-    solc::{CliSettings, SolcSettings},
+    solc::{CliSettings, SolcLanguage, SolcSettings},
 };
 use regex::Regex;
 use revm::primitives::hardfork::SpecId;
 use semver::Version;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -128,6 +128,7 @@ pub use compilation::{CompilationRestrictions, SettingsOverrides};
 pub mod extend;
 use extend::Extends;
 
+use foundry_evm_networks::NetworkConfigs;
 pub use semver;
 
 /// Foundry configuration
@@ -191,50 +192,52 @@ pub struct Config {
     #[serde(default, skip_serializing)]
     pub extends: Option<Extends>,
 
-    /// path of the source contracts dir, like `src` or `contracts`
+    /// Path of the sources directory.
+    ///
+    /// Defaults to `src`.
     pub src: PathBuf,
-    /// path of the test dir
+    /// Path of the tests directory.
     pub test: PathBuf,
-    /// path of the script dir
+    /// Path of the scripts directory.
     pub script: PathBuf,
-    /// path to where artifacts shut be written to
+    /// Path to the artifacts directory.
     pub out: PathBuf,
-    /// all library folders to include, `lib`, `node_modules`
+    /// Paths to all library folders, such as `lib`, or `node_modules`.
     pub libs: Vec<PathBuf>,
-    /// `Remappings` to use for this repo
+    /// Remappings to use for this repo
     pub remappings: Vec<RelativeRemapping>,
-    /// Whether to autodetect remappings by scanning the `libs` folders recursively
+    /// Whether to autodetect remappings.
     pub auto_detect_remappings: bool,
-    /// library addresses to link
+    /// Library addresses to link.
     pub libraries: Vec<String>,
-    /// whether to enable cache
+    /// Whether to enable the build cache.
     pub cache: bool,
-    /// whether to dynamically link tests
-    pub dynamic_test_linking: bool,
-    /// where the cache is stored if enabled
+    /// The path to the cache store.
     pub cache_path: PathBuf,
-    /// where the gas snapshots are stored
+    /// Whether to dynamically link tests.
+    pub dynamic_test_linking: bool,
+    /// Where the gas snapshots are stored.
     pub snapshots: PathBuf,
-    /// whether to check for differences against previously stored gas snapshots
+    /// Whether to check for differences against previously stored gas snapshots.
     pub gas_snapshot_check: bool,
-    /// whether to emit gas snapshots to disk
+    /// Whether to emit gas snapshots to disk.
     pub gas_snapshot_emit: bool,
-    /// where the broadcast logs are stored
+    /// The path to store broadcast logs at.
     pub broadcast: PathBuf,
-    /// additional solc allow paths for `--allow-paths`
+    /// Additional paths passed to `solc --allow-paths`.
     pub allow_paths: Vec<PathBuf>,
-    /// additional solc include paths for `--include-path`
+    /// Additional paths passed to `solc --include-path`.
     pub include_paths: Vec<PathBuf>,
-    /// glob patterns to skip
+    /// Glob patterns for file paths to skip when building and executing contracts.
     pub skip: Vec<GlobMatcher>,
-    /// whether to force a `project.clean()`
+    /// Whether to forcefully clean all project artifacts before running commands.
     pub force: bool,
-    /// evm version to use
+    /// The EVM version to use when building contracts.
     #[serde(with = "from_str_lowercase")]
     pub evm_version: EvmVersion,
-    /// list of contracts to report gas of
+    /// List of contracts to generate gas reports for.
     pub gas_reports: Vec<String>,
-    /// list of contracts to ignore for gas reports
+    /// List of contracts to ignore for gas reports.
     pub gas_reports_ignore: Vec<String>,
     /// Whether to include gas reports for tests.
     pub gas_reports_include_tests: bool,
@@ -301,12 +304,15 @@ pub struct Config {
     /// Multiple etherscan api configs and their aliases
     #[serde(default, skip_serializing_if = "EtherscanConfigs::is_empty")]
     pub etherscan: EtherscanConfigs,
-    /// list of solidity error codes to always silence in the compiler output
+    /// List of solidity error codes to always silence in the compiler output.
     pub ignored_error_codes: Vec<SolidityErrorCode>,
-    /// list of file paths to ignore
+    /// List of file paths to ignore.
     #[serde(rename = "ignored_warnings_from")]
     pub ignored_file_paths: Vec<PathBuf>,
-    /// When true, compiler warnings are treated as errors
+    /// Diagnostic level (minimum) at which the process should finish with a non-zero exit.
+    pub deny: DenyLevel,
+    /// DEPRECATED: use `deny` instead.
+    #[serde(default, skip_serializing)]
     pub deny_warnings: bool,
     /// Only run test functions matching the specified regex pattern.
     #[serde(rename = "match_test")]
@@ -527,9 +533,9 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
 
-    /// Whether to enable Odyssey features.
-    #[serde(alias = "alphanet")]
-    pub odyssey: bool,
+    /// Networks with enabled features.
+    #[serde(flatten)]
+    pub networks: NetworkConfigs,
 
     /// Timeout for transactions in seconds.
     pub transaction_timeout: u64,
@@ -562,13 +568,109 @@ pub struct Config {
     pub _non_exhaustive: (),
 }
 
+/// Diagnostic level (minimum) at which the process should finish with a non-zero exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenyLevel {
+    /// Always exit with zero code.
+    #[default]
+    Never,
+    /// Exit with a non-zero code if any warnings are found.
+    Warnings,
+    /// Exit with a non-zero code if any notes or warnings are found.
+    Notes,
+}
+
+// Custom deserialization to make `DenyLevel` parsing case-insensitive and backwards compatible with
+// booleans.
+impl<'de> Deserialize<'de> for DenyLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DenyLevelVisitor;
+
+        impl<'de> de::Visitor<'de> for DenyLevelVisitor {
+            type Value = DenyLevel;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("one of the following strings: `never`, `warnings`, `notes`")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DenyLevel::from(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                DenyLevel::from_str(value).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_any(DenyLevelVisitor)
+    }
+}
+
+impl FromStr for DenyLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "warnings" | "warning" | "w" => Ok(Self::Warnings),
+            "notes" | "note" | "n" => Ok(Self::Notes),
+            "never" | "false" | "f" => Ok(Self::Never),
+            _ => Err(format!(
+                "unknown variant: found `{s}`, expected one of `never`, `warnings`, `notes`"
+            )),
+        }
+    }
+}
+
+impl From<bool> for DenyLevel {
+    fn from(deny: bool) -> Self {
+        if deny { Self::Warnings } else { Self::Never }
+    }
+}
+
+impl DenyLevel {
+    /// Returns `true` if the deny level includes warnings.
+    pub fn warnings(&self) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Warnings | Self::Notes => true,
+        }
+    }
+
+    /// Returns `true` if the deny level includes notes.
+    pub fn notes(&self) -> bool {
+        match self {
+            Self::Never | Self::Warnings => false,
+            Self::Notes => true,
+        }
+    }
+
+    /// Returns `true` if the deny level is set to never (only errors).
+    pub fn never(&self) -> bool {
+        match self {
+            Self::Never => true,
+            Self::Warnings | Self::Notes => false,
+        }
+    }
+}
+
 /// Mapping of fallback standalone sections. See [`FallbackProfileProvider`].
 pub const STANDALONE_FALLBACK_SECTIONS: &[(&str, &str)] = &[("invariant", "fuzz")];
 
 /// Deprecated keys and their replacements.
 ///
 /// See [Warning::DeprecatedKey]
-pub const DEPRECATIONS: &[(&str, &str)] = &[("cancun", "evm_version = Cancun")];
+pub const DEPRECATIONS: &[(&str, &str)] =
+    &[("cancun", "evm_version = Cancun"), ("deny_warnings", "deny = warnings")];
 
 impl Config {
     /// The default profile: "default"
@@ -579,6 +681,9 @@ impl Config {
 
     /// TOML section for profiles
     pub const PROFILE_SECTION: &'static str = "profile";
+
+    /// External config sections, ignored from warnings.
+    pub const EXTERNAL_SECTION: &'static str = "external";
 
     /// Standalone sections in the config which get integrated into the selected profile
     pub const STANDALONE_SECTIONS: &'static [&'static str] = &[
@@ -595,6 +700,12 @@ impl Config {
         "vyper",
         "bind_json",
     ];
+
+    pub(crate) fn is_standalone_section<T: ?Sized + PartialEq<str>>(section: &T) -> bool {
+        section == Self::PROFILE_SECTION
+            || section == Self::EXTERNAL_SECTION
+            || Self::STANDALONE_SECTIONS.iter().any(|s| section == *s)
+    }
 
     /// File name of config toml file
     pub const FILE_NAME: &'static str = "foundry.toml";
@@ -816,6 +927,7 @@ impl Config {
         self.broadcast = p(&root, &self.broadcast);
         self.cache_path = p(&root, &self.cache_path);
         self.snapshots = p(&root, &self.snapshots);
+        self.test_failures_file = p(&root, &self.test_failures_file);
 
         if let Some(build_info_path) = self.build_info_path {
             self.build_info_path = Some(p(&root, &build_info_path));
@@ -963,7 +1075,9 @@ impl Config {
         let ui_testing = std::env::var_os("FOUNDRY_LINT_UI_TESTING").is_some();
         let mut project = self.create_project(self.cache && !ui_testing, false)?;
         project.update_output_selection(|selection| {
-            *selection = OutputSelection::common_output_selection([]);
+            // We have to request something to populate `contracts` in the output and thus
+            // artifacts.
+            *selection = OutputSelection::common_output_selection(["abi".into()]);
         });
         Ok(project)
     }
@@ -1048,8 +1162,16 @@ impl Config {
             .settings(settings)
             .paths(paths)
             .ignore_error_codes(self.ignored_error_codes.iter().copied().map(Into::into))
-            .ignore_paths(self.ignored_file_paths.clone())
-            .set_compiler_severity_filter(if self.deny_warnings {
+            .ignore_paths(
+                self.ignored_file_paths
+                    .iter()
+                    .map(|path| {
+                        // Strip "./" prefix for consistent path matching
+                        path.strip_prefix("./").unwrap_or(path).to_path_buf()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .set_compiler_severity_filter(if self.deny.warnings() {
                 Severity::Warning
             } else {
                 Severity::Error
@@ -1071,6 +1193,28 @@ impl Config {
         }
 
         Ok(project)
+    }
+
+    /// Disables optimizations and enables viaIR with minimum optimization if `ir_minimum` is true.
+    pub fn disable_optimizations(&self, project: &mut Project, ir_minimum: bool) {
+        if ir_minimum {
+            // Enable viaIR with minimum optimization: https://github.com/ethereum/solidity/issues/12533#issuecomment-1013073350
+            // And also in new releases of Solidity: https://github.com/ethereum/solidity/issues/13972#issuecomment-1628632202
+            project.settings.solc.settings = std::mem::take(&mut project.settings.solc.settings)
+                .with_via_ir_minimum_optimization();
+
+            // Sanitize settings for solc 0.8.4 if version cannot be detected: https://github.com/foundry-rs/foundry/issues/9322
+            // But keep the EVM version: https://github.com/ethereum/solidity/issues/15775
+            let evm_version = project.settings.solc.evm_version;
+            let version = self.solc_version().unwrap_or_else(|| Version::new(0, 8, 4));
+            project.settings.solc.settings.sanitize(&version, SolcLanguage::Solidity);
+            project.settings.solc.evm_version = evm_version;
+        } else {
+            project.settings.solc.optimizer.disable();
+            project.settings.solc.optimizer.runs = None;
+            project.settings.solc.optimizer.details = None;
+            project.settings.solc.via_ir = None;
+        }
     }
 
     /// Cleans the project.
@@ -1139,7 +1283,7 @@ impl Config {
 
     /// Returns the [SpecId] derived from the configured [EvmVersion]
     pub fn evm_spec_id(&self) -> SpecId {
-        evm_spec_id(self.evm_version, self.odyssey)
+        evm_spec_id(self.evm_version)
     }
 
     /// Returns whether the compiler version should be auto-detected
@@ -1272,7 +1416,7 @@ impl Config {
     /// # }
     /// ```
     pub fn get_rpc_url(&self) -> Option<Result<Cow<'_, str>, UnresolvedEnvVarError>> {
-        let maybe_alias = self.eth_rpc_url.as_ref().or(self.etherscan_api_key.as_ref())?;
+        let maybe_alias = self.eth_rpc_url.as_deref()?;
         if let Some(alias) = self.get_rpc_url_with_alias(maybe_alias) {
             Some(alias)
         } else {
@@ -1459,8 +1603,19 @@ impl Config {
     /// Optionally updates the config with the given `chain`.
     ///
     /// See also [Self::get_etherscan_config_with_chain]
+    #[expect(clippy::disallowed_macros)]
     pub fn get_etherscan_api_key(&self, chain: Option<Chain>) -> Option<String> {
-        self.get_etherscan_config_with_chain(chain).ok().flatten().map(|c| c.key)
+        self.get_etherscan_config_with_chain(chain)
+            .map_err(|e| {
+                // `sh_warn!` is a circular dependency, preventing us from using it here.
+                eprintln!(
+                    "{}: failed getting etherscan config: {e}",
+                    yansi::Paint::yellow("Warning"),
+                );
+            })
+            .ok()
+            .flatten()
+            .map(|c| c.key)
     }
 
     /// Returns the remapping for the project's _src_ directory
@@ -2118,7 +2273,6 @@ impl Config {
     ///
     /// See also <https://github.com/foundry-rs/foundry/issues/7014>
     fn normalize_defaults(&self, mut figment: Figment) -> Figment {
-        // TODO: add a warning if evm_version is provided but incompatible
         if figment.contains("evm_version") {
             return figment;
         }
@@ -2131,6 +2285,13 @@ impl Config {
                 .and_then(|version| self.evm_version.normalize_version_solc(&version))
         {
             figment = figment.merge(("evm_version", version));
+        }
+
+        // Normalize `deny` based on the provided `deny_warnings` version.
+        if self.deny_warnings
+            && let Ok(DenyLevel::Never) = figment.extract_inner("deny")
+        {
+            figment = figment.merge(("deny", DenyLevel::Warnings));
         }
 
         figment
@@ -2405,6 +2566,7 @@ impl Default for Config {
                 SolidityErrorCode::TransientStorageUsed,
             ],
             ignored_file_paths: vec![],
+            deny: DenyLevel::Never,
             deny_warnings: false,
             via_ir: false,
             ast: false,
@@ -2435,7 +2597,7 @@ impl Default for Config {
             legacy_assertions: false,
             warnings: vec![],
             extra_args: vec![],
-            odyssey: false,
+            networks: Default::default(),
             transaction_timeout: 120,
             additional_compiler_profiles: Default::default(),
             compilation_restrictions: Default::default(),
@@ -3203,6 +3365,27 @@ mod tests {
         });
     }
 
+    // any invalid entry invalidates whole [etherscan] sections
+    #[test]
+    fn test_resolve_etherscan_with_invalid_name() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [etherscan]
+                mainnet = { key = "FX42Z3BBJJEWXWGYV2X1CIPRSCN" }
+                an_invalid_name = { key = "FX42Z3BBJJEWXWGYV2X1CIPRSCN" }
+            "#,
+            )?;
+
+            let config = Config::load().unwrap();
+            let etherscan_config = config.get_etherscan_config();
+            assert!(etherscan_config.is_none());
+
+            Ok(())
+        });
+    }
+
     #[test]
     fn test_resolve_rpc_url() {
         figment::Jail::expect_with(|jail| {
@@ -3261,19 +3444,19 @@ mod tests {
                 r#"
                 [profile.default]
                 [rpc_endpoints]
-                polygonMumbai = "https://polygon-mumbai.g.alchemy.com/v2/${_RESOLVE_RPC_ALIAS}"
+                polygonAmoy = "https://polygon-amoy.g.alchemy.com/v2/${_RESOLVE_RPC_ALIAS}"
             "#,
             )?;
             let mut config = Config::load().unwrap();
-            config.eth_rpc_url = Some("polygonMumbai".to_string());
+            config.eth_rpc_url = Some("polygonAmoy".to_string());
             assert!(config.get_rpc_url().unwrap().is_err());
 
             jail.set_env("_RESOLVE_RPC_ALIAS", "123455");
 
             let mut config = Config::load().unwrap();
-            config.eth_rpc_url = Some("polygonMumbai".to_string());
+            config.eth_rpc_url = Some("polygonAmoy".to_string());
             assert_eq!(
-                "https://polygon-mumbai.g.alchemy.com/v2/123455",
+                "https://polygon-amoy.g.alchemy.com/v2/123455",
                 config.get_rpc_url().unwrap().unwrap()
             );
 
@@ -3523,7 +3706,7 @@ mod tests {
 
                 [etherscan]
                 optimism = { key = "https://etherscan-optimism.com/" }
-                mumbai = { key = "https://etherscan-mumbai.com/" }
+                amoy = { key = "https://etherscan-amoy.com/" }
             "#,
             )?;
 
@@ -3532,10 +3715,10 @@ mod tests {
             let optimism = config.get_etherscan_api_key(Some(NamedChain::Optimism.into()));
             assert_eq!(optimism, Some("https://etherscan-optimism.com/".to_string()));
 
-            config.etherscan_api_key = Some("mumbai".to_string());
+            config.etherscan_api_key = Some("amoy".to_string());
 
-            let mumbai = config.get_etherscan_api_key(Some(NamedChain::PolygonMumbai.into()));
-            assert_eq!(mumbai, Some("https://etherscan-mumbai.com/".to_string()));
+            let amoy = config.get_etherscan_api_key(Some(NamedChain::PolygonAmoy.into()));
+            assert_eq!(amoy, Some("https://etherscan-amoy.com/".to_string()));
 
             Ok(())
         });
@@ -3550,17 +3733,17 @@ mod tests {
                 [profile.default]
 
                 [etherscan]
-                mumbai = { key = "https://etherscan-mumbai.com/", chain = 80001 }
+                amoy = { key = "https://etherscan-amoy.com/", chain = 80002 }
             "#,
             )?;
 
             let config = Config::load().unwrap();
 
-            let mumbai = config
-                .get_etherscan_config_with_chain(Some(NamedChain::PolygonMumbai.into()))
+            let amoy = config
+                .get_etherscan_config_with_chain(Some(NamedChain::PolygonAmoy.into()))
                 .unwrap()
                 .unwrap();
-            assert_eq!(mumbai.key, "https://etherscan-mumbai.com/".to_string());
+            assert_eq!(amoy.key, "https://etherscan-amoy.com/".to_string());
 
             Ok(())
         });
@@ -3575,18 +3758,18 @@ mod tests {
                 [profile.default]
 
                 [etherscan]
-                mumbai = { key = "https://etherscan-mumbai.com/", chain = 80001 , url =  "https://verifier-url.com/"}
+                amoy = { key = "https://etherscan-amoy.com/", chain = 80002 , url =  "https://verifier-url.com/"}
             "#,
             )?;
 
             let config = Config::load().unwrap();
 
-            let mumbai = config
-                .get_etherscan_config_with_chain(Some(NamedChain::PolygonMumbai.into()))
+            let amoy = config
+                .get_etherscan_config_with_chain(Some(NamedChain::PolygonAmoy.into()))
                 .unwrap()
                 .unwrap();
-            assert_eq!(mumbai.key, "https://etherscan-mumbai.com/".to_string());
-            assert_eq!(mumbai.api_url, "https://verifier-url.com/".to_string());
+            assert_eq!(amoy.key, "https://etherscan-amoy.com/".to_string());
+            assert_eq!(amoy.api_url, "https://verifier-url.com/".to_string());
 
             Ok(())
         });
@@ -3599,23 +3782,23 @@ mod tests {
                 "foundry.toml",
                 r#"
                 [profile.default]
-                eth_rpc_url = "mumbai"
+                eth_rpc_url = "amoy"
 
                 [etherscan]
-                mumbai = { key = "https://etherscan-mumbai.com/" }
+                amoy = { key = "https://etherscan-amoy.com/" }
 
                 [rpc_endpoints]
-                mumbai = "https://polygon-mumbai.g.alchemy.com/v2/mumbai"
+                amoy = "https://polygon-amoy.g.alchemy.com/v2/amoy"
             "#,
             )?;
 
             let config = Config::load().unwrap();
 
-            let mumbai = config.get_etherscan_config_with_chain(None).unwrap().unwrap();
-            assert_eq!(mumbai.key, "https://etherscan-mumbai.com/".to_string());
+            let amoy = config.get_etherscan_config_with_chain(None).unwrap().unwrap();
+            assert_eq!(amoy.key, "https://etherscan-amoy.com/".to_string());
 
-            let mumbai_rpc = config.get_rpc_url().unwrap().unwrap();
-            assert_eq!(mumbai_rpc, "https://polygon-mumbai.g.alchemy.com/v2/mumbai");
+            let amoy_rpc = config.get_rpc_url().unwrap().unwrap();
+            assert_eq!(amoy_rpc, "https://polygon-amoy.g.alchemy.com/v2/amoy");
             Ok(())
         });
     }
@@ -3753,7 +3936,7 @@ mod tests {
                 gas_reports = ['*']
                 ignored_error_codes = [1878]
                 ignored_warnings_from = ["something"]
-                deny_warnings = false
+                deny = "never"
                 initial_balance = '0xffffffffffffffffffffffff'
                 libraries = []
                 libs = ['lib']
@@ -6189,6 +6372,96 @@ mod tests {
 
             // Non-array values should be replaced
             assert_eq!(config.optimizer, Some(false));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_deprecated_deny_warnings_is_handled() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                deny_warnings = true
+                "#,
+            )?;
+            let config = Config::load().unwrap();
+
+            // Assert that the deprecated flag is correctly interpreted
+            assert_eq!(config.deny, DenyLevel::Warnings);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn warns_on_unknown_keys_in_profile() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                unknown_key_xyz = 123
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            assert!(cfg.warnings.iter().any(
+                |w| matches!(w, crate::Warning::UnknownKey { key, .. } if key == "unknown_key_xyz")
+            ));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn fails_on_ambiguous_version_in_compilation_restrictions() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                src = "src"
+
+                [[profile.default.compilation_restrictions]]
+                paths = "src/*.sol"
+                version = "0.8.11"
+                "#,
+            )?;
+
+            let err = Config::load().expect_err("expected bare version to fail");
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("Invalid version format '0.8.11'")
+                    && err_msg.contains("Bare version numbers are ambiguous"),
+                "Expected error about ambiguous version, got: {err_msg}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn accepts_explicit_version_requirements() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                src = "src"
+
+                [[profile.default.compilation_restrictions]]
+                paths = "src/*.sol"
+                version = "=0.8.11"
+
+                [[profile.default.compilation_restrictions]]
+                paths = "test/*.sol"
+                version = ">=0.8.11"
+                "#,
+            )?;
+
+            let config = Config::load().expect("should accept explicit version requirements");
+            assert_eq!(config.compilation_restrictions.len(), 2);
 
             Ok(())
         });
