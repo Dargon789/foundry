@@ -190,6 +190,15 @@ impl CorpusManager {
             foundry_common::fs::create_dir_all(corpus_dir)?;
         }
 
+        // Canonicalize the corpus_dir to a trusted absolute path
+        let canonical_corpus_dir = match corpus_dir.canonicalize() {
+            Ok(dir) => dir,
+            Err(e) => {
+                trace!(target: "corpus", "failed to canonicalize corpus_dir {}: {e}", corpus_dir.display());
+                return Err(e.into());
+            }
+        };
+
         let can_replay_tx = |tx: &BasicTxDetails| -> bool {
             fuzzed_contracts.is_some_and(|contracts| contracts.targets.lock().can_replay(tx))
                 || fuzzed_function.is_some_and(|function| {
@@ -200,23 +209,33 @@ impl CorpusManager {
                 })
         };
 
-        'corpus_replay: for entry in std::fs::read_dir(corpus_dir)? {
+        'corpus_replay: for entry in std::fs::read_dir(&canonical_corpus_dir)? {
             let path = entry?.path();
-            if path.is_file()
-                && let Some(name) = path.file_name().and_then(|s| s.to_str())
+            // Canonicalize the candidate path, skip if it cannot be canonicalized (e.g. broken symlink)
+            let canonical_path = match path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // Ensure file is inside the corpus directory (prevents path traversal/symlink escape)
+            if !canonical_path.starts_with(&canonical_corpus_dir) {
+                trace!(target: "corpus", "Skipping file outside corpus_dir: {}", path.display());
+                continue;
+            }
+            if canonical_path.is_file()
+                && let Some(name) = canonical_path.file_name().and_then(|s| s.to_str())
                 && name.contains(METADATA_SUFFIX)
             {
                 // Ignore metadata files
                 continue;
             }
 
-            let read_corpus_result = match path.extension().and_then(|ext| ext.to_str()) {
-                Some("gz") => foundry_common::fs::read_json_gzip_file::<Vec<BasicTxDetails>>(&path),
-                _ => foundry_common::fs::read_json_file::<Vec<BasicTxDetails>>(&path),
+            let read_corpus_result = match canonical_path.extension().and_then(|ext| ext.to_str()) {
+                Some("gz") => foundry_common::fs::read_json_gzip_file::<Vec<BasicTxDetails>>(&canonical_path),
+                _ => foundry_common::fs::read_json_file::<Vec<BasicTxDetails>>(&canonical_path),
             };
 
             let Ok(tx_seq) = read_corpus_result else {
-                trace!(target: "corpus", "failed to load corpus from {}", path.display());
+                trace!(target: "corpus", "failed to load corpus from {}", canonical_path.display());
                 continue;
             };
 
@@ -257,7 +276,7 @@ impl CorpusManager {
                 );
 
                 // Populate in memory corpus with the sequence from corpus file.
-                in_memory_corpus.push(CorpusEntry::new(tx_seq, path)?);
+                in_memory_corpus.push(CorpusEntry::new(tx_seq, canonical_path.clone())?);
             }
         }
 
