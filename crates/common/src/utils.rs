@@ -1,9 +1,14 @@
 //! Uncategorised utilities.
 
 use alloy_primitives::{B256, Bytes, U256, hex, keccak256};
-use foundry_compilers::artifacts::BytecodeObject;
+use foundry_compilers::{
+    Project,
+    artifacts::{BytecodeObject, SolcLanguage},
+    error::SolcError,
+    flatten::{Flattener, FlattenerError},
+};
 use regex::Regex;
-use std::sync::LazyLock;
+use std::{path::Path, sync::LazyLock};
 
 static BYTECODE_PLACEHOLDER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"__\$.{34}\$__").expect("invalid regex"));
@@ -77,10 +82,28 @@ pub fn strip_bytecode_placeholders(bytecode: &BytecodeObject) -> Option<Bytes> {
     match &bytecode {
         BytecodeObject::Bytecode(bytes) => Some(bytes.clone()),
         BytecodeObject::Unlinked(s) => {
-            // Replace all __$xxx$__ placeholders with 32 zero bytes
-            let s = (*BYTECODE_PLACEHOLDER_RE).replace_all(s, "00".repeat(40));
+            // Replace all __$xxx$__ placeholders with 20 zero bytes (40 hex chars)
+            let s = (*BYTECODE_PLACEHOLDER_RE).replace_all(s, "00".repeat(20));
             let bytes = hex::decode(s.as_bytes());
             Some(bytes.ok()?.into())
         }
     }
+}
+
+/// Flattens the given target of the project. Falls back to the old flattening implementation
+/// if the target cannot be compiled successfully. This would be the case if the target has invalid
+/// syntax. (e.g. Solang)
+pub fn flatten(project: Project, target_path: &Path) -> eyre::Result<String> {
+    // Save paths for fallback before Flattener::new takes ownership
+    let paths = project.paths.clone();
+    let flattened = match Flattener::new(project, target_path) {
+        Ok(flattener) => Ok(flattener.flatten()),
+        Err(FlattenerError::Compilation(_)) => {
+            paths.with_language::<SolcLanguage>().flatten(target_path)
+        }
+        Err(FlattenerError::Other(err)) => Err(err),
+    }
+    .map_err(|err: SolcError| eyre::eyre!("Failed to flatten: {err}"))?;
+
+    Ok(flattened)
 }

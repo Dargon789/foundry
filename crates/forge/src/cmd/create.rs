@@ -14,7 +14,7 @@ use eyre::{Context, Result};
 use forge_verify::{RetryArgs, VerifierArgs, VerifyArgs};
 use foundry_cli::{
     opts::{BuildOpts, EthereumOpts, EtherscanOpts, TransactionOpts},
-    utils::{self, LoadConfig, read_constructor_args_file, remove_contract},
+    utils::{self, LoadConfig, find_contract_artifacts, read_constructor_args_file},
 };
 use foundry_common::{
     compile::{self},
@@ -106,7 +106,8 @@ impl CreateArgs {
         let mut config = self.load_config()?;
 
         // Install missing dependencies.
-        if install::install_missing_dependencies(&mut config) && config.auto_detect_remappings {
+        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+        {
             // need to re-configure here to also catch additional remappings
             config = self.load_config()?;
         }
@@ -122,7 +123,7 @@ impl CreateArgs {
 
         let output = compile::compile_target(&target_path, &project, shell::is_json())?;
 
-        let (abi, bin, id) = remove_contract(output, &target_path, &self.contract.name)?;
+        let (abi, bin, id) = find_contract_artifacts(output, &target_path, &self.contract.name)?;
 
         let bin = match bin.object {
             BytecodeObject::Bytecode(_) => bin.object,
@@ -228,6 +229,8 @@ impl CreateArgs {
             compiler_version: Some(id.version.to_string()),
             constructor_args,
             constructor_args_path: None,
+            no_auto_detect: false,
+            use_solc: None,
             num_of_optimizations: None,
             etherscan: EtherscanOpts {
                 key: self.eth.etherscan.key.clone(),
@@ -418,6 +421,8 @@ impl CreateArgs {
             compiler_version: Some(id.version.to_string()),
             constructor_args,
             constructor_args_path: None,
+            no_auto_detect: false,
+            use_solc: None,
             num_of_optimizations,
             etherscan: EtherscanOpts { key: self.eth.etherscan.key(), chain: Some(chain.into()) },
             rpc: Default::default(),

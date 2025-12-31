@@ -1,19 +1,19 @@
 use crate::cmd::{
-    access_list::AccessListArgs, artifact::ArtifactArgs, bind::BindArgs, call::CallArgs,
-    constructor_args::ConstructorArgsArgs, create2::Create2Args, creation_code::CreationCodeArgs,
-    da_estimate::DAEstimateArgs, estimate::EstimateArgs, find_block::FindBlockArgs,
-    interface::InterfaceArgs, logs::LogsArgs, mktx::MakeTxArgs, rpc::RpcArgs, run::RunArgs,
-    send::SendTxArgs, storage::StorageArgs, txpool::TxPoolSubcommands, wallet::WalletSubcommands,
+    access_list::AccessListArgs, artifact::ArtifactArgs, b2e_payload::B2EPayloadArgs,
+    bind::BindArgs, call::CallArgs, constructor_args::ConstructorArgsArgs, create2::Create2Args,
+    creation_code::CreationCodeArgs, da_estimate::DAEstimateArgs, erc20::Erc20Subcommand,
+    estimate::EstimateArgs, find_block::FindBlockArgs, interface::InterfaceArgs, logs::LogsArgs,
+    mktx::MakeTxArgs, rpc::RpcArgs, run::RunArgs, send::SendTxArgs, storage::StorageArgs,
+    txpool::TxPoolSubcommands, wallet::WalletSubcommands,
 };
 use alloy_ens::NameOrAddress;
 use alloy_primitives::{Address, B256, Selector, U256};
 use alloy_rpc_types::BlockId;
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{ArgAction, Parser, Subcommand, ValueHint};
 use eyre::Result;
 use foundry_cli::opts::{EtherscanOpts, GlobalArgs, RpcOpts};
 use foundry_common::version::{LONG_VERSION, SHORT_VERSION};
 use std::{path::PathBuf, str::FromStr};
-
 /// A Swiss Army knife for interacting with Ethereum applications from the command line.
 #[derive(Parser)]
 #[command(
@@ -378,11 +378,11 @@ pub enum CastSubcommand {
         block: Option<BlockId>,
 
         /// If specified, only get the given field of the block.
-        #[arg(long, short)]
-        field: Option<String>,
+        #[arg(short, long = "field", aliases = ["fields"], num_args = 0.., action = ArgAction::Append, value_delimiter = ',')]
+        fields: Vec<String>,
 
         /// Print the raw RLP encoded block header.
-        #[arg(long, conflicts_with = "field")]
+        #[arg(long, conflicts_with = "fields")]
         raw: bool,
 
         #[arg(long, env = "CAST_FULL_BLOCK")]
@@ -640,6 +640,17 @@ pub enum CastSubcommand {
         packed: bool,
 
         /// The arguments of the function.
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// ABI encode an event and its arguments to generate topics and data.
+    #[command(visible_alias = "aee")]
+    AbiEncodeEvent {
+        /// The event signature.
+        sig: String,
+
+        /// The arguments of the event.
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1043,6 +1054,10 @@ pub enum CastSubcommand {
     #[command(visible_alias = "bi")]
     Bind(BindArgs),
 
+    /// Convert Beacon payload to execution payload.
+    #[command(visible_alias = "b2e")]
+    B2EPayload(B2EPayloadArgs),
+
     /// Get the selector for a function.
     #[command(visible_alias = "si")]
     Sig {
@@ -1065,12 +1080,8 @@ pub enum CastSubcommand {
     #[command(visible_alias = "com")]
     Completions {
         #[arg(value_enum)]
-        shell: foundry_common::clap::Shell,
+        shell: foundry_cli::clap::Shell,
     },
-
-    /// Generate Fig autocompletion spec.
-    #[command(visible_alias = "fig")]
-    GenerateFigSpec,
 
     /// Runs a published transaction in a local environment and prints the trace.
     #[command(visible_alias = "r")]
@@ -1128,6 +1139,13 @@ pub enum CastSubcommand {
     /// Estimates the data availability size of a given opstack block.
     #[command(name = "da-estimate")]
     DAEstimate(DAEstimateArgs),
+
+    /// ERC20 token operations.
+    #[command(visible_alias = "erc20")]
+    Erc20Token {
+        #[command(subcommand)]
+        command: Erc20Subcommand,
+    },
 }
 
 /// CLI arguments for `cast --to-base`.
