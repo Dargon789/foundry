@@ -172,10 +172,12 @@ end_of_record
 }
 
 forgetest_init!(basic, |prj, cmd| {
+    prj.initialize_default_contracts();
     basic_base(prj, cmd);
 });
 
 forgetest_init!(basic_crlf, |prj, cmd| {
+    prj.initialize_default_contracts();
     // Manually replace `\n` with `\r\n` in the source file.
     let make_crlf = |path: &Path| {
         fs::write(path, fs::read_to_string(path).unwrap().replace('\n', "\r\n")).unwrap()
@@ -2133,4 +2135,134 @@ end_of_record
 
 "#]],
     );
+});
+
+// Test that functions of abstract contracts and interfaces should not count in coverage report.
+forgetest!(abstract_contract_and_interface, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "Counter.sol",
+        r#"
+interface ContractIf {
+    function setNumber(uint256 newNumber) external;
+}
+
+abstract contract AbstractCounter {
+    function _setNumber(uint256 newNumber) internal virtual;
+
+    function _incrementNumber(uint256 newNumber) internal virtual returns (uint256 inc) {
+        inc = newNumber + 1;
+    }
+}
+
+contract Counter is AbstractCounter, ContractIf {
+    uint256 public number;
+
+    function setNumber(uint256 newNumber) public {
+        _setNumber(newNumber);
+    }
+
+    function _setNumber(uint256 newNumber) internal override {
+        number = _incrementNumber(newNumber);
+    }
+
+    function _incrementNumber(uint256 newNumber) internal override returns (uint256 inc) {
+        inc = super._incrementNumber(newNumber);
+    }
+}
+    "#,
+    );
+    prj.add_source(
+        "CounterTest.sol",
+        r#"
+import "./test.sol";
+import {Counter} from "./Counter.sol";
+
+contract CounterTest is DSTest {
+    function testCounter() public {
+        Counter counter = new Counter();
+        counter.setNumber(0);
+    }
+}
+    "#,
+    );
+
+    // Test there are 4 functions reported:
+    // - `setNumber`, `_setNumber` and `_incrementNumber` from `Counter` contract
+    // - `_incrementNumber` from `AbstractCounter` (virtual with implementation). `_setNumber` is
+    // excluded as it is not implemented.
+    cmd.arg("coverage").assert_success().stdout_eq(str![[r#"
+...
+╭-----------------+---------------+---------------+---------------+---------------╮
+| File            | % Lines       | % Statements  | % Branches    | % Funcs       |
++=================================================================================+
+| src/Counter.sol | 100.00% (8/8) | 100.00% (4/4) | 100.00% (0/0) | 100.00% (4/4) |
+|-----------------+---------------+---------------+---------------+---------------|
+| Total           | 100.00% (8/8) | 100.00% (4/4) | 100.00% (0/0) | 100.00% (4/4) |
+╰-----------------+---------------+---------------+---------------+---------------╯
+...
+"#]]);
+});
+
+// Test that coverage files are written even when tests fail.
+forgetest!(coverage_with_failing_tests, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "Counter.sol",
+        r#"
+contract Counter {
+    uint256 public number;
+
+    function setNumber(uint256 newNumber) public {
+        number = newNumber;
+    }
+
+    function increment() public {
+        number++;
+    }
+}
+    "#,
+    );
+
+    prj.add_source(
+        "CounterTest.sol",
+        r#"
+import "./test.sol";
+import {Counter} from "./Counter.sol";
+
+contract CounterTest is DSTest {
+    Counter public counter;
+
+    function setUp() public {
+        counter = new Counter();
+        counter.setNumber(0);
+    }
+
+    function test_Increment() public {
+        counter.increment();
+        assertEq(counter.number(), 1);
+    }
+
+    function test_FailingTest() public {
+        counter.increment();
+        // This assertion will fail
+        assertEq(counter.number(), 999);
+    }
+}
+    "#,
+    );
+
+    // Run coverage - this should exit with error code 1 due to failing test,
+    // but the lcov file should still be written.
+    cmd.arg("coverage").args(["--report=lcov"]).assert_failure();
+
+    // Verify that the lcov.info file was created despite test failure
+    let lcov = prj.root().join("lcov.info");
+    assert!(lcov.exists(), "lcov.info should be created even when tests fail");
+
+    // Verify the coverage data is valid and includes the counter contract
+    let lcov_content = std::fs::read_to_string(&lcov).unwrap();
+    assert!(lcov_content.contains("SF:src/Counter.sol"), "Coverage should include Counter.sol");
+    assert!(lcov_content.contains("FN:"), "Coverage should include function data");
+    assert!(lcov_content.contains("DA:"), "Coverage should include line hit data");
 });

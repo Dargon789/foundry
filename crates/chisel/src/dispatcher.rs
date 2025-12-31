@@ -132,8 +132,6 @@ impl ChiselDispatcher {
         // Create new source with exact input appended and parse
         let (new_source, do_execute) = source.clone_with_new_line(input.to_string())?;
 
-        // TODO: Cloning / parsing the session source twice on non-inspected inputs kinda sucks.
-        // Should change up how this works.
         let (cf, res) = source.inspect(input).await?;
         if let Some(res) = &res {
             let _ = sh_println!("{res}");
@@ -167,7 +165,7 @@ impl ChiselDispatcher {
             )?)
             .build();
 
-        let mut identifier = TraceIdentifiers::new().with_etherscan(
+        let mut identifier = TraceIdentifiers::new().with_external(
             &session_config.foundry_config,
             session_config.evm_opts.get_remote_chain_id().await,
         )?;

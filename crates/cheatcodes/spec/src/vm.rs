@@ -1925,11 +1925,13 @@ interface Vm {
 
     /// Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     #[cheatcode(group = Filesystem)]
     function deployCode(string calldata artifactPath) external returns (address deployedAddress);
 
     /// Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     ///
     /// Additionally accepts abi-encoded constructor arguments.
     #[cheatcode(group = Filesystem)]
@@ -1937,6 +1939,7 @@ interface Vm {
 
     /// Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     ///
     /// Additionally accepts `msg.value`.
     #[cheatcode(group = Filesystem)]
@@ -1944,6 +1947,7 @@ interface Vm {
 
     /// Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     ///
     /// Additionally accepts abi-encoded constructor arguments and `msg.value`.
     #[cheatcode(group = Filesystem)]
@@ -1951,11 +1955,13 @@ interface Vm {
 
     /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     #[cheatcode(group = Filesystem)]
     function deployCode(string calldata artifactPath, bytes32 salt) external returns (address deployedAddress);
 
     /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     ///
     /// Additionally accepts abi-encoded constructor arguments.
     #[cheatcode(group = Filesystem)]
@@ -1963,6 +1969,7 @@ interface Vm {
 
     /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     ///
     /// Additionally accepts `msg.value`.
     #[cheatcode(group = Filesystem)]
@@ -1970,6 +1977,7 @@ interface Vm {
 
     /// Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the
     /// artifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.
+    /// Reverts if the target artifact contains unlinked library placeholders.
     ///
     /// Additionally accepts abi-encoded constructor arguments and `msg.value`.
     #[cheatcode(group = Filesystem)]
@@ -2696,7 +2704,7 @@ interface Vm {
 
     /// Signs data with a `Wallet`.
     #[cheatcode(group = Crypto)]
-    function sign(Wallet calldata wallet, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);
+    function sign(Wallet calldata wallet, bytes32 digest) external pure returns (uint8 v, bytes32 r, bytes32 s);
 
     /// Signs data with a `Wallet`.
     ///
@@ -2704,7 +2712,7 @@ interface Vm {
     /// signature's `s` value, and the recovery id `v` in a single bytes32.
     /// This format reduces the signature size from 65 to 64 bytes.
     #[cheatcode(group = Crypto)]
-    function signCompact(Wallet calldata wallet, bytes32 digest) external returns (bytes32 r, bytes32 vs);
+    function signCompact(Wallet calldata wallet, bytes32 digest) external pure returns (bytes32 r, bytes32 vs);
 
     /// Signs `digest` with `privateKey` using the secp256k1 curve.
     #[cheatcode(group = Crypto)]

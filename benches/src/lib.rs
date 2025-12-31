@@ -1,3 +1,5 @@
+//! Foundry benchmark runner.
+
 use crate::results::{HyperfineOutput, HyperfineResult};
 use eyre::{Result, WrapErr};
 use foundry_common::{sh_eprintln, sh_println};
@@ -57,7 +59,7 @@ impl FromStr for RepoConfig {
         } else {
             // Create new config with custom rev or default
             // Name should follow the format: org-repo (with hyphen)
-            RepoConfig {
+            Self {
                 name: format!("{org}-{repo}"),
                 org: org.to_string(),
                 repo: repo.to_string(),
@@ -130,10 +132,20 @@ impl BenchmarkProject {
         for entry in std::fs::read_dir(&root_path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).ok();
+            // Canonicalize the entry to prevent directory traversal
+            let canon = match path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue, // Skip if unable to canonicalize
+            };
+            // Ensure canonicalized path stays strictly within root_path (TempProject root)
+            if !canon.starts_with(&root_path) {
+                sh_eprintln!("⚠️  Skipping suspicious path during cleanup: {:?}", canon);
+                continue;
+            }
+            if canon.is_dir() {
+                std::fs::remove_dir_all(&canon).ok();
             } else {
-                std::fs::remove_file(&path).ok();
+                std::fs::remove_file(&canon).ok();
             }
         }
 
@@ -159,7 +171,7 @@ impl BenchmarkProject {
         Self::install_npm_dependencies(&root_path)?;
 
         sh_println!("  ✅ Project {} setup complete at {}", config.name, root);
-        Ok(BenchmarkProject { name: config.name.to_string(), root_path, temp_project })
+        Ok(Self { name: config.name.to_string(), root_path, temp_project })
     }
 
     /// Install npm dependencies if package.json exists

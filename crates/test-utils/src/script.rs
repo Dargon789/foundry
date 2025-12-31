@@ -123,6 +123,18 @@ impl ScriptTester {
         for entry in fs::read_dir(&from_dir)? {
             let file = &entry?.path();
             let name = file.file_name().unwrap();
+            // Validate file name to avoid path traversal and absolute paths
+            let name_str = name.to_string_lossy();
+            if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
+                // Skip invalid (potentially dangerous) file names
+                continue;
+            }
+            // Optionally verify canonicalized file is in from_dir to avoid symlink traversal
+            if let Ok(canonical_file) = file.canonicalize() {
+                if !canonical_file.starts_with(&from_dir) {
+                    continue;
+                }
+            }
             fs::copy(file, to_dir.join(name))?;
         }
         Ok(())
@@ -158,7 +170,7 @@ impl ScriptTester {
 
     /// Adds given address as sender
     pub fn sender(&mut self, addr: Address) -> &mut Self {
-        self.args(&["--sender", addr.to_string().as_str()])
+        self.args(&["--sender", &addr.to_string()])
     }
 
     pub fn add_sig(&mut self, contract_name: &str, sig: &str) -> &mut Self {
@@ -166,7 +178,7 @@ impl ScriptTester {
     }
 
     pub fn add_create2_deployer(&mut self, create2_deployer: Address) -> &mut Self {
-        self.args(&["--create2-deployer", create2_deployer.to_string().as_str()])
+        self.args(&["--create2-deployer", &create2_deployer.to_string()])
     }
 
     /// Adds the `--unlocked` flag
