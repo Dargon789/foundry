@@ -1,0 +1,50 @@
+# ~/.circleci/config.yml
+version: 2.1
+  jobs:
+    my-job:
+     steps:
+      - run: echo "Hello, world!"
+      - run:
+          command: echo "This step will automatically rerun up to 3 times if it fails with a 10 second delay between attempts"
+          max_auto_reruns: 3
+          auto_rerun_delay: 10s
+          
+  workflows:
+    dev_stage_pre-prod:
+      jobs:
+       - test_dev:
+          filters:  # using regex filters requires the entire branch to match
+            branches:
+              only:  # only branches matching the below regex filters will run
+                - dev
+                - /user-.*/
+       - test_stage:
+          filters:
+            branches:
+              only: stage
+       - test_pre-prod:
+          filters:
+            branches:
+              only: /pre-prod(?:-.+)?$/
+
+
+    build-test-deploy:
+      jobs:
+        - build:
+            filters:  # required since `test` has tag filters AND requires `build`
+              tags:
+                only: /^config-test.*/
+        - test:
+            requires:
+            - build
+            filters:  # required since `deploy` has tag filters AND requires `test`
+            tags:
+              only: /^config-test.*/
+        - deploy:
+          requires:
+            - test
+          filters:
+            tags:
+              only: /^config-test.*/
+            branches:
+              ignore: /.*/
