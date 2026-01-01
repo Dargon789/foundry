@@ -58,7 +58,7 @@ impl SettingsOverrides {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestrictionsError {
-    #[error("invalid configuration: cannot specify both exact and relative restrictions for '{0}' - please choose only one type of restriction")]
+    #[error("specified both exact and relative restrictions for {0}")]
     BothExactAndRelative(&'static str),
 }
 
@@ -100,15 +100,15 @@ where
     // Reject bare versions like "0.8.11" that lack an operator prefix
     if version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Err(serde::de::Error::custom(format!(
-            "Invalid version format '{version}' in compilation_restrictions. \
+            "Invalid version format '{opt_string}' in compilation_restrictions. \
              Bare version numbers are ambiguous and default to caret requirements (e.g. '^{version}'). \
              Use an explicit constraint such as '={version}' for an exact version or '>={version}' for a minimum version."
         )));
     }
 
-    let req = VersionReq::parse(version).map_err(|e| {
+    let req = VersionReq::parse(&opt_string).map_err(|e| {
         serde::de::Error::custom(format!(
-            "Invalid version requirement '{version}': {e}. \
+            "Invalid version requirement '{opt_string}': {e}. \
              Examples: '=0.8.11' (exact), '>=0.8.11' (minimum), '>=0.8.11 <0.9.0' (range)."
         ))
     })?;
