@@ -1,26 +1,29 @@
 use crate::{
+    Cast, SimpleCast,
+    cmd::erc20::IERC20,
     opts::{Cast as CastArgs, CastSubcommand, ToBaseArgs},
     traces::identifier::SignaturesIdentifier,
-    Cast, SimpleCast,
+    tx::CastTxSender,
 };
 use alloy_consensus::transaction::Recovered;
 use alloy_dyn_abi::{DynSolValue, ErrorExt, EventExt};
-use alloy_primitives::{eip191_hash_message, hex, keccak256, Address, B256};
+use alloy_eips::eip7702::SignedAuthorization;
+use alloy_ens::{ProviderEnsExt, namehash};
+use alloy_primitives::{Address, B256, eip191_hash_message, hex, keccak256};
 use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use eyre::Result;
-use foundry_cli::{handler, utils, utils::LoadConfig};
+use foundry_cli::{utils, utils::LoadConfig};
 use foundry_common::{
     abi::{get_error, get_event},
-    ens::{namehash, ProviderEnsExt},
-    fmt::{format_tokens, format_tokens_raw, format_uint_exp},
+    fmt::{format_tokens, format_uint_exp, serialize_value_as_json},
     fs,
     selectors::{
-        decode_calldata, decode_event_topic, decode_function_selector, decode_selectors,
-        import_selectors, parse_signatures, pretty_calldata, ParsedSignatures, SelectorImportData,
-        SelectorKind,
+        ParsedSignatures, SelectorImportData, SelectorKind, decode_calldata, decode_event_topic,
+        decode_function_selector, decode_selectors, import_selectors, parse_signatures,
+        pretty_calldata,
     },
     shell, stdin,
 };
@@ -32,23 +35,18 @@ pub fn run() -> Result<()> {
 
     let args = CastArgs::parse();
     args.global.init()?;
-
-    run_command(args)
+    args.global.tokio_runtime().block_on(run_command(args))
 }
 
 /// Setup the global logger and other utilities.
 pub fn setup() -> Result<()> {
-    utils::install_crypto_provider();
-    handler::install();
-    utils::load_dotenv();
+    utils::common_setup();
     utils::subscriber();
-    utils::enable_paint();
 
     Ok(())
 }
 
 /// Run the subcommand.
-#[tokio::main]
 pub async fn run_command(args: CastArgs) -> Result<()> {
     match args.cmd {
         // Constants
@@ -110,9 +108,9 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             };
             sh_println!("0x{output}")?
         }
-        CastSubcommand::ToCheckSumAddress { address } => {
+        CastSubcommand::ToCheckSumAddress { address, chain_id } => {
             let value = stdin::unwrap_line(address)?;
-            sh_println!("{}", value.to_checksum(None))?
+            sh_println!("{}", value.to_checksum(chain_id))?
         }
         CastSubcommand::ToUint256 { value } => {
             let value = stdin::unwrap_line(value)?;
@@ -166,6 +164,10 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let value = stdin::unwrap_line(bytes)?;
             sh_println!("{}", SimpleCast::to_bytes32(&value)?)?
         }
+        CastSubcommand::Pad { data, right, left: _, len } => {
+            let value = stdin::unwrap_line(data)?;
+            sh_println!("{}", SimpleCast::pad(&value, right, len)?)?
+        }
         CastSubcommand::FormatBytes32String { string } => {
             let value = stdin::unwrap_line(string)?;
             sh_println!("{}", SimpleCast::format_bytes32_string(&value)?)?
@@ -191,8 +193,24 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 sh_println!("{}", SimpleCast::abi_encode_packed(&sig, &args)?)?
             }
         }
-        CastSubcommand::DecodeCalldata { sig, calldata } => {
-            let tokens = SimpleCast::calldata_decode(&sig, &calldata, true)?;
+        CastSubcommand::AbiEncodeEvent { sig, args } => {
+            let log_data = SimpleCast::abi_encode_event(&sig, &args)?;
+            for (i, topic) in log_data.topics().iter().enumerate() {
+                sh_println!("[topic{}]: {}", i, topic)?;
+            }
+            if !log_data.data.is_empty() {
+                sh_println!("[data]: {}", hex::encode_prefixed(log_data.data))?;
+            }
+        }
+        CastSubcommand::DecodeCalldata { sig, calldata, file } => {
+            let raw_hex = if let Some(file_path) = file {
+                let contents = fs::read_to_string(&file_path)?;
+                contents.trim().to_string()
+            } else {
+                calldata.unwrap()
+            };
+
+            let tokens = SimpleCast::calldata_decode(&sig, &raw_hex, true)?;
             print_tokens(&tokens);
         }
         CastSubcommand::CalldataEncode { sig, args, file } => {
@@ -215,20 +233,19 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         }
         CastSubcommand::DecodeEvent { sig, data } => {
             let decoded_event = if let Some(event_sig) = sig {
-                get_event(event_sig.as_str())?.decode_log_parts(None, &hex::decode(data)?, false)?
+                let event = get_event(event_sig.as_str())?;
+                event.decode_log_parts(core::iter::once(event.selector()), &hex::decode(data)?)?
             } else {
-                let data = data.strip_prefix("0x").unwrap_or(data.as_str());
+                let data = crate::strip_0x(&data);
                 let selector = data.get(..64).unwrap_or_default();
+                let selector = selector.parse()?;
                 let identified_event =
-                    SignaturesIdentifier::new(false)?.identify_event(selector.parse()?).await;
+                    SignaturesIdentifier::new(false)?.identify_event(selector).await;
                 if let Some(event) = identified_event {
                     let _ = sh_println!("{}", event.signature());
                     let data = data.get(64..).unwrap_or_default();
-                    get_event(event.signature().as_str())?.decode_log_parts(
-                        None,
-                        &hex::decode(data)?,
-                        false,
-                    )?
+                    get_event(event.signature().as_str())?
+                        .decode_log_parts(core::iter::once(selector), &hex::decode(data)?)?
                 } else {
                     eyre::bail!("No matching event signature found for selector `{selector}`")
                 }
@@ -239,7 +256,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let error = if let Some(err_sig) = sig {
                 get_error(err_sig.as_str())?
             } else {
-                let data = data.strip_prefix("0x").unwrap_or(data.as_str());
+                let data = crate::strip_0x(&data);
                 let selector = data.get(..8).unwrap_or_default();
                 let identified_error =
                     SignaturesIdentifier::new(false)?.identify_error(selector.parse()?).await;
@@ -258,6 +275,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::ConstructorArgs(cmd) => cmd.run().await?,
         CastSubcommand::Artifact(cmd) => cmd.run().await?,
         CastSubcommand::Bind(cmd) => cmd.run().await?,
+        CastSubcommand::B2EPayload(cmd) => cmd.run().await?,
         CastSubcommand::PrettyCalldata { calldata, offline } => {
             let calldata = stdin::unwrap_line(calldata)?;
             sh_println!("{}", pretty_calldata(&calldata, offline).await?)?;
@@ -294,8 +312,13 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
 
             match erc20 {
                 Some(token) => {
-                    let balance =
-                        Cast::new(&provider).erc20_balance(token, account_addr, block).await?;
+                    let balance = IERC20::new(token, &provider)
+                        .balanceOf(account_addr)
+                        .block(block.unwrap_or_default())
+                        .call()
+                        .await?;
+
+                    sh_warn!("--erc20 flag is deprecated, use `cast erc20 balance` instead")?;
                     sh_println!("{}", format_uint_exp(balance))?
                 }
                 None => {
@@ -316,13 +339,16 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 Cast::new(provider).base_fee(block.unwrap_or(BlockId::Number(Latest))).await?
             )?
         }
-        CastSubcommand::Block { block, full, field, rpc } => {
+        CastSubcommand::Block { block, full, fields, raw, rpc } => {
             let config = rpc.load_config()?;
             let provider = utils::get_provider(&config)?;
+            // Can use either --raw or specify raw as a field
+            let raw = raw || fields.contains(&"raw".into());
+
             sh_println!(
                 "{}",
                 Cast::new(provider)
-                    .block(block.unwrap_or(BlockId::Number(Latest)), full, field)
+                    .block(block.unwrap_or(BlockId::Number(Latest)), full, fields, raw)
                     .await?
             )?
         }
@@ -369,12 +395,21 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let who = who.resolve(&provider).await?;
             sh_println!("{}", Cast::new(provider).codesize(who, block).await?)?
         }
-        CastSubcommand::ComputeAddress { address, nonce, rpc } => {
-            let config = rpc.load_config()?;
-            let provider = utils::get_provider(&config)?;
-
+        CastSubcommand::ComputeAddress { address, nonce, salt, init_code, init_code_hash, rpc } => {
             let address = stdin::unwrap_line(address)?;
-            let computed = Cast::new(provider).compute_address(address, nonce).await?;
+            let computed = {
+                // For CREATE2, init_code_hash is needed to compute the address
+                if let Some(init_code_hash) = init_code_hash {
+                    address.create2(salt.unwrap_or(B256::ZERO), init_code_hash)
+                } else if let Some(init_code) = init_code {
+                    address.create2(salt.unwrap_or(B256::ZERO), keccak256(hex::decode(init_code)?))
+                } else {
+                    // For CREATE, rpc is needed to compute the address
+                    let config = rpc.load_config()?;
+                    let provider = utils::get_provider(&config)?;
+                    Cast::new(provider).compute_address(address, nonce).await?
+                }
+            };
             sh_println!("Computed Address: {}", computed.to_checksum(None))?
         }
         CastSubcommand::Disassemble { bytecode } => {
@@ -401,7 +436,9 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             {
                 if resolve {
                     let resolved = &resolve_results[pos];
-                    sh_println!("{selector}\t{arguments:max_args_len$}\t{state_mutability:max_mutability_len$}\t{resolved}")?
+                    sh_println!(
+                        "{selector}\t{arguments:max_args_len$}\t{state_mutability:max_mutability_len$}\t{resolved}"
+                    )?
                 } else {
                     sh_println!("{selector}\t{arguments:max_args_len$}\t{state_mutability}")?
                 }
@@ -487,14 +524,14 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let provider = utils::get_provider(&config)?;
             sh_println!(
                 "{}",
-                Cast::new(provider)
+                CastTxSender::new(provider)
                     .receipt(tx_hash, field, confirmations, None, cast_async)
                     .await?
             )?
         }
         CastSubcommand::Run(cmd) => cmd.run().await?,
         CastSubcommand::SendTx(cmd) => cmd.run().await?,
-        CastSubcommand::Tx { tx_hash, from, nonce, field, raw, rpc } => {
+        CastSubcommand::Tx { tx_hash, from, nonce, field, raw, rpc, to_request } => {
             let config = rpc.load_config()?;
             let provider = utils::get_provider(&config)?;
 
@@ -503,7 +540,9 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
 
             sh_println!(
                 "{}",
-                Cast::new(&provider).transaction(tx_hash, from, nonce, field, raw).await?
+                Cast::new(&provider)
+                    .transaction(tx_hash, from, nonce, field, raw, to_request)
+                    .await?
             )?
         }
 
@@ -627,7 +666,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             };
         }
         CastSubcommand::HashMessage { message } => {
-            let message = stdin::unwrap_line(message)?;
+            let message = stdin::unwrap(message, false)?;
             sh_println!("{}", eip191_hash_message(message))?
         }
         CastSubcommand::SigEvent { event_string } => {
@@ -697,38 +736,41 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::Completions { shell } => {
             generate(shell, &mut CastArgs::command(), "cast", &mut std::io::stdout())
         }
-        CastSubcommand::GenerateFigSpec => clap_complete::generate(
-            clap_complete_fig::Fig,
-            &mut CastArgs::command(),
-            "cast",
-            &mut std::io::stdout(),
-        ),
         CastSubcommand::Logs(cmd) => cmd.run().await?,
         CastSubcommand::DecodeTransaction { tx } => {
             let tx = stdin::unwrap_line(tx)?;
             let tx = SimpleCast::decode_raw_transaction(&tx)?;
 
-            if let Ok(signer) = tx.recover_signer() {
+            if let Ok(signer) = tx.recover() {
                 let recovered = Recovered::new_unchecked(tx, signer);
                 sh_println!("{}", serde_json::to_string_pretty(&recovered)?)?;
             } else {
                 sh_println!("{}", serde_json::to_string_pretty(&tx)?)?;
             }
         }
-        CastSubcommand::DecodeEof { eof } => {
-            let eof = stdin::unwrap_line(eof)?;
-            sh_println!("{}", SimpleCast::decode_eof(&eof)?)?
+        CastSubcommand::RecoverAuthority { auth } => {
+            let auth: SignedAuthorization = serde_json::from_str(&auth)?;
+            sh_println!("{}", auth.recover_authority()?)?;
         }
         CastSubcommand::TxPool { command } => command.run().await?,
+        CastSubcommand::Erc20Token { command } => command.run().await?,
+        CastSubcommand::DAEstimate(cmd) => {
+            cmd.run().await?;
+        }
     };
 
-    /// Prints slice of tokens using [`format_tokens`] or [`format_tokens_raw`] depending whether
-    /// the shell is in JSON mode.
+    /// Prints slice of tokens using [`format_tokens`] or [`serialize_value_as_json`] depending
+    /// whether the shell is in JSON mode.
     ///
     /// This is included here to avoid a cyclic dependency between `fmt` and `common`.
     fn print_tokens(tokens: &[DynSolValue]) {
         if shell::is_json() {
-            let tokens: Vec<String> = format_tokens_raw(tokens).collect();
+            let tokens: Vec<serde_json::Value> = tokens
+                .iter()
+                .cloned()
+                .map(|t| serialize_value_as_json(t, None))
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
             let _ = sh_println!("{}", serde_json::to_string_pretty(&tokens).unwrap());
         } else {
             let tokens = format_tokens(tokens);

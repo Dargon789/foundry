@@ -1,13 +1,16 @@
 use crate::Cast;
 use alloy_dyn_abi::{DynSolType, DynSolValue, Specifier};
+use alloy_ens::NameOrAddress;
 use alloy_json_abi::Event;
 use alloy_network::AnyNetwork;
-use alloy_primitives::{hex::FromHex, Address, B256};
+use alloy_primitives::{Address, B256, hex::FromHex};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, Filter, FilterBlockOption, FilterSet, Topic};
 use clap::Parser;
 use eyre::Result;
-use foundry_cli::{opts::EthereumOpts, utils, utils::LoadConfig};
-use foundry_common::ens::NameOrAddress;
+use foundry_cli::{
+    opts::RpcOpts,
+    utils::{self, LoadConfig},
+};
 use itertools::Itertools;
 use std::{io, str::FromStr};
 
@@ -27,11 +30,8 @@ pub struct LogsArgs {
     to_block: Option<BlockId>,
 
     /// The contract address to filter on.
-    #[arg(
-        long,
-        value_parser = NameOrAddress::from_str
-    )]
-    address: Option<NameOrAddress>,
+    #[arg(long, value_parser = NameOrAddress::from_str)]
+    address: Option<Vec<NameOrAddress>>,
 
     /// The signature of the event to filter logs by which will be converted to the first topic or
     /// a topic to filter on.
@@ -48,22 +48,40 @@ pub struct LogsArgs {
     #[arg(long)]
     subscribe: bool,
 
+    /// Number of blocks to query in each chunk when the provider has range limits.
+    /// Defaults to 10000 blocks per chunk.
+    #[arg(long, default_value_t = 10000)]
+    query_size: u64,
+
     #[command(flatten)]
-    eth: EthereumOpts,
+    rpc: RpcOpts,
 }
 
 impl LogsArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { from_block, to_block, address, sig_or_topic, topics_or_args, subscribe, eth } =
-            self;
+        let Self {
+            from_block,
+            to_block,
+            address,
+            sig_or_topic,
+            topics_or_args,
+            subscribe,
+            query_size,
+            rpc,
+        } = self;
 
-        let config = eth.load_config()?;
+        let config = rpc.load_config()?;
         let provider = utils::get_provider(&config)?;
 
         let cast = Cast::new(&provider);
-
-        let address = match address {
-            Some(address) => Some(address.resolve(&provider).await?),
+        let addresses = match address {
+            Some(addresses) => Some(
+                futures::future::try_join_all(addresses.into_iter().map(|address| {
+                    let provider = provider.clone();
+                    async move { address.resolve(&provider).await }
+                }))
+                .await?,
+            ),
             None => None,
         };
 
@@ -72,12 +90,12 @@ impl LogsArgs {
         let to_block =
             cast.convert_block_number(Some(to_block.unwrap_or_else(BlockId::latest))).await?;
 
-        let filter = build_filter(from_block, to_block, address, sig_or_topic, topics_or_args)?;
+        let filter = build_filter(from_block, to_block, addresses, sig_or_topic, topics_or_args)?;
 
         if !subscribe {
-            let logs = cast.filter_logs(filter).await?;
+            let logs = cast.filter_logs_chunked(filter, query_size).await?;
             sh_println!("{logs}")?;
-            return Ok(())
+            return Ok(());
         }
 
         // FIXME: this is a hotfix for <https://github.com/foundry-rs/foundry/issues/7682>
@@ -101,7 +119,7 @@ impl LogsArgs {
 fn build_filter(
     from_block: Option<BlockNumberOrTag>,
     to_block: Option<BlockNumberOrTag>,
-    address: Option<Address>,
+    address: Option<Vec<Address>>,
     sig_or_topic: Option<String>,
     topics_or_args: Vec<String>,
 ) -> Result<Filter, eyre::Error> {
@@ -223,7 +241,9 @@ mod tests {
             address: ValueOrArray::Value(address.unwrap()).into(),
             topics: [vec![].into(), vec![].into(), vec![].into(), vec![].into()],
         };
-        let filter = build_filter(from_block, to_block, address, None, vec![]).unwrap();
+        let filter =
+            build_filter(from_block, to_block, address.map(|addr| vec![addr]), None, vec![])
+                .unwrap();
         assert_eq!(filter, expected)
     }
 
@@ -270,7 +290,7 @@ mod tests {
     #[test]
     fn test_build_filter_sig_with_arguments() {
         let addr = Address::from_str(ADDRESS).unwrap();
-        let addr = U256::from(U160::from_be_bytes(addr.0 .0));
+        let addr = U256::from(U160::from_be_bytes(addr.0.0));
         let expected = Filter {
             block_option: FilterBlockOption::Range { from_block: None, to_block: None },
             address: vec![].into(),
@@ -295,7 +315,7 @@ mod tests {
     #[test]
     fn test_build_filter_sig_with_skipped_arguments() {
         let addr = Address::from_str(ADDRESS).unwrap();
-        let addr = U256::from(U160::from_be_bytes(addr.0 .0));
+        let addr = U256::from(U160::from_be_bytes(addr.0.0));
         let expected = Filter {
             block_option: FilterBlockOption::Range { from_block: None, to_block: None },
             address: vec![].into(),
@@ -362,6 +382,29 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(filter, expected)
+    }
+
+    #[test]
+    fn test_build_filter_with_multiple_addresses() {
+        let expected = Filter {
+            block_option: FilterBlockOption::Range { from_block: None, to_block: None },
+            address: vec![Address::ZERO, ADDRESS.parse().unwrap()].into(),
+            topics: [
+                vec![TRANSFER_TOPIC.parse().unwrap()].into(),
+                vec![].into(),
+                vec![].into(),
+                vec![].into(),
+            ],
+        };
+        let filter = build_filter(
+            None,
+            None,
+            Some(vec![Address::ZERO, ADDRESS.parse().unwrap()]),
+            Some(TRANSFER_TOPIC.to_string()),
+            vec![],
+        )
+        .unwrap();
         assert_eq!(filter, expected)
     }
 

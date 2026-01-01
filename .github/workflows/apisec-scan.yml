@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
 
     - name: Run APIsec scan
       uses: apisec-inc/apisec-run-scan@025432089674a28ba8fb55f8ab06c10215e772ea

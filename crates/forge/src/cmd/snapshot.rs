@@ -1,9 +1,13 @@
 use super::test;
 use crate::result::{SuiteTestResult, TestKindReport, TestOutcome};
-use alloy_primitives::{map::HashMap, U256};
-use clap::{builder::RangedU64ValueParser, Parser, ValueHint};
+use alloy_primitives::{U256, map::HashMap};
+use clap::{Parser, ValueHint, builder::RangedU64ValueParser};
+use comfy_table::{
+    Cell, Color, Row, Table, modifiers::UTF8_ROUND_CORNERS, presets::ASCII_MARKDOWN,
+};
 use eyre::{Context, Result};
 use foundry_cli::utils::STATIC_FUZZ_SEED;
+use foundry_common::shell;
 use regex::Regex;
 use std::{
     cmp::Ordering,
@@ -70,6 +74,10 @@ pub struct GasSnapshotArgs {
     )]
     tolerance: Option<u32>,
 
+    /// How to sort diff results.
+    #[arg(long, value_name = "ORDER")]
+    diff_sort: Option<DiffSortOrder>,
+
     /// All test arguments are supported
     #[command(flatten)]
     pub(crate) test: test::TestArgs,
@@ -94,14 +102,14 @@ impl GasSnapshotArgs {
         // Set fuzz seed so gas snapshots are deterministic
         self.test.fuzz_seed = Some(U256::from_be_bytes(STATIC_FUZZ_SEED));
 
-        let outcome = self.test.execute_tests().await?;
+        let outcome = self.test.compile_and_run().await?;
         outcome.ensure_ok(false)?;
         let tests = self.config.apply(outcome);
 
         if let Some(path) = self.diff {
             let snap = path.as_ref().unwrap_or(&self.snap);
             let snaps = read_gas_snapshot(snap)?;
-            diff(tests, snaps)?;
+            diff(tests, snaps, self.diff_sort.unwrap_or_default())?;
         } else if let Some(path) = self.check {
             let snap = path.as_ref().unwrap_or(&self.snap);
             let snaps = read_gas_snapshot(snap)?;
@@ -111,13 +119,17 @@ impl GasSnapshotArgs {
                 std::process::exit(1)
             }
         } else {
+            if matches!(self.format, Some(Format::Table)) {
+                let table = build_gas_snapshot_table(&tests);
+                sh_println!("\n{}", table)?;
+            }
             write_to_gas_snapshot_file(&tests, self.snap, self.format)?;
         }
         Ok(())
     }
 }
 
-// TODO implement pretty tables
+// Gas report format on stdout.
 #[derive(Clone, Debug)]
 pub enum Format {
     Table,
@@ -154,17 +166,31 @@ struct GasSnapshotConfig {
     max: Option<u64>,
 }
 
+/// Sort order for diff output
+#[derive(Clone, Debug, Default, clap::ValueEnum)]
+enum DiffSortOrder {
+    /// Sort by percentage change (smallest to largest) - default behavior
+    #[default]
+    Percentage,
+    /// Sort by percentage change (largest to smallest)
+    PercentageDesc,
+    /// Sort by absolute gas change (smallest to largest)
+    Absolute,
+    /// Sort by absolute gas change (largest to smallest)
+    AbsoluteDesc,
+}
+
 impl GasSnapshotConfig {
     fn is_in_gas_range(&self, gas_used: u64) -> bool {
-        if let Some(min) = self.min {
-            if gas_used < min {
-                return false
-            }
+        if let Some(min) = self.min
+            && gas_used < min
+        {
+            return false;
         }
-        if let Some(max) = self.max {
-            if gas_used > max {
-                return false
-            }
+        if let Some(max) = self.max
+            && gas_used > max
+        {
+            return false;
         }
         true
     }
@@ -225,6 +251,7 @@ impl FromStr for GasSnapshotEntry {
                                         runs: runs.as_str().parse().unwrap(),
                                         median_gas: med.as_str().parse().unwrap(),
                                         mean_gas: avg.as_str().parse().unwrap(),
+                                        failed_corpus_replays: 0,
                                     },
                                 })
                         } else {
@@ -242,6 +269,7 @@ impl FromStr for GasSnapshotEntry {
                                         calls: calls.as_str().parse().unwrap(),
                                         reverts: reverts.as_str().parse().unwrap(),
                                         metrics: HashMap::default(),
+                                        failed_corpus_replays: 0,
                                     },
                                 })
                         }
@@ -286,6 +314,31 @@ fn write_to_gas_snapshot_file(
 
     let content = reports.join("\n");
     Ok(fs::write(path, content)?)
+}
+
+fn build_gas_snapshot_table(tests: &[SuiteTestResult]) -> Table {
+    let mut table = Table::new();
+    if shell::is_markdown() {
+        table.load_preset(ASCII_MARKDOWN);
+    } else {
+        table.apply_modifier(UTF8_ROUND_CORNERS);
+    }
+
+    table.set_header(vec![
+        Cell::new("Contract").fg(Color::Cyan),
+        Cell::new("Signature").fg(Color::Cyan),
+        Cell::new("Report").fg(Color::Cyan),
+    ]);
+
+    for test in tests {
+        let mut row = Row::new();
+        row.add_cell(Cell::new(test.contract_name()));
+        row.add_cell(Cell::new(&test.signature));
+        row.add_cell(Cell::new(test.result.kind.report()));
+        table.add_row(row);
+    }
+
+    table
 }
 
 /// A Gas snapshot entry diff.
@@ -352,44 +405,121 @@ fn check(
 }
 
 /// Compare the set of tests with an existing gas snapshot.
-fn diff(tests: Vec<SuiteTestResult>, snaps: Vec<GasSnapshotEntry>) -> Result<()> {
+fn diff(
+    tests: Vec<SuiteTestResult>,
+    snaps: Vec<GasSnapshotEntry>,
+    sort_order: DiffSortOrder,
+) -> Result<()> {
     let snaps = snaps
         .into_iter()
         .map(|s| ((s.contract_name, s.signature), s.gas_used))
         .collect::<HashMap<_, _>>();
     let mut diffs = Vec::with_capacity(tests.len());
+    let mut new_tests = Vec::new();
+
     for test in tests.into_iter() {
         if let Some(target_gas_used) =
             snaps.get(&(test.contract_name().to_string(), test.signature.clone())).cloned()
         {
             diffs.push(GasSnapshotDiff {
                 source_gas_used: test.result.kind.report(),
-                signature: test.signature,
+                signature: format!("{}::{}", test.contract_name(), test.signature),
                 target_gas_used,
             });
+        } else {
+            // Track new tests
+            new_tests.push(format!("{}::{}", test.contract_name(), test.signature));
         }
     }
+
+    let mut increased = 0;
+    let mut decreased = 0;
+    let mut unchanged = 0;
     let mut overall_gas_change = 0i128;
     let mut overall_gas_used = 0i128;
 
-    diffs.sort_by(|a, b| {
-        a.gas_diff().abs().partial_cmp(&b.gas_diff().abs()).unwrap_or(Ordering::Equal)
-    });
+    // Sort based on user preference
+    match sort_order {
+        DiffSortOrder::Percentage => {
+            // Default: sort by percentage change (smallest to largest)
+            diffs.sort_by(|a, b| a.gas_diff().abs().total_cmp(&b.gas_diff().abs()));
+        }
+        DiffSortOrder::PercentageDesc => {
+            // Sort by percentage change (largest to smallest)
+            diffs.sort_by(|a, b| b.gas_diff().abs().total_cmp(&a.gas_diff().abs()));
+        }
+        DiffSortOrder::Absolute => {
+            // Sort by absolute gas change (smallest to largest)
+            diffs.sort_by_key(|d| d.gas_change().abs());
+        }
+        DiffSortOrder::AbsoluteDesc => {
+            // Sort by absolute gas change (largest to smallest)
+            diffs.sort_by_key(|d| std::cmp::Reverse(d.gas_change().abs()));
+        }
+    }
 
-    for diff in diffs {
+    for diff in &diffs {
         let gas_change = diff.gas_change();
         overall_gas_change += gas_change;
         overall_gas_used += diff.target_gas_used.gas() as i128;
         let gas_diff = diff.gas_diff();
+
+        // Classify changes
+        if gas_change > 0 {
+            increased += 1;
+        } else if gas_change < 0 {
+            decreased += 1;
+        } else {
+            unchanged += 1;
+        }
+
+        // Display with icon and before/after values
+        let icon = if gas_change > 0 {
+            "↑".red().to_string()
+        } else if gas_change < 0 {
+            "↓".green().to_string()
+        } else {
+            "━".to_string()
+        };
+
         sh_println!(
-            "{} (gas: {} ({})) ",
+            "{} {} (gas: {} → {} | {} {})",
+            icon,
             diff.signature,
+            diff.target_gas_used.gas(),
+            diff.source_gas_used.gas(),
             fmt_change(gas_change),
             fmt_pct_change(gas_diff)
         )?;
     }
 
-    let overall_gas_diff = overall_gas_change as f64 / overall_gas_used as f64;
+    // Display new tests if any
+    if !new_tests.is_empty() {
+        sh_println!("\n{}", "New tests:".yellow())?;
+        for test in new_tests {
+            sh_println!("  {} {}", "+".green(), test)?;
+        }
+    }
+
+    // Summary separator
+    sh_println!("\n{}", "-".repeat(80))?;
+
+    let overall_gas_diff = if overall_gas_used > 0 {
+        overall_gas_change as f64 / overall_gas_used as f64
+    } else {
+        0.0
+    };
+
+    sh_println!(
+        "Total tests: {}, {} {}, {} {}, {} {}",
+        diffs.len(),
+        "↑".red().to_string(),
+        increased,
+        "↓".green().to_string(),
+        decreased,
+        "━",
+        unchanged
+    )?;
     sh_println!(
         "Overall gas change: {} ({})",
         fmt_change(overall_gas_change),
@@ -400,7 +530,7 @@ fn diff(tests: Vec<SuiteTestResult>, snaps: Vec<GasSnapshotEntry>) -> Result<()>
 
 fn fmt_pct_change(change: f64) -> String {
     let change_pct = change * 100.0;
-    match change.partial_cmp(&0.0).unwrap_or(Ordering::Equal) {
+    match change.total_cmp(&0.0) {
         Ordering::Less => format!("{change_pct:.3}%").green().to_string(),
         Ordering::Equal => {
             format!("{change_pct:.3}%")
@@ -412,9 +542,7 @@ fn fmt_pct_change(change: f64) -> String {
 fn fmt_change(change: i128) -> String {
     match change.cmp(&0) {
         Ordering::Less => format!("{change}").green().to_string(),
-        Ordering::Equal => {
-            format!("{change}")
-        }
+        Ordering::Equal => change.to_string(),
         Ordering::Greater => format!("{change}").red().to_string(),
     }
 }
@@ -472,7 +600,12 @@ mod tests {
             GasSnapshotEntry {
                 contract_name: "Test".to_string(),
                 signature: "deposit()".to_string(),
-                gas_used: TestKindReport::Fuzz { runs: 256, median_gas: 200, mean_gas: 100 }
+                gas_used: TestKindReport::Fuzz {
+                    runs: 256,
+                    median_gas: 200,
+                    mean_gas: 100,
+                    failed_corpus_replays: 0
+                }
             }
         );
     }
@@ -490,7 +623,8 @@ mod tests {
                     runs: 256,
                     calls: 100,
                     reverts: 200,
-                    metrics: HashMap::default()
+                    metrics: HashMap::default(),
+                    failed_corpus_replays: 0,
                 }
             }
         );
@@ -509,7 +643,8 @@ mod tests {
                     runs: 256,
                     calls: 3840,
                     reverts: 2388,
-                    metrics: HashMap::default()
+                    metrics: HashMap::default(),
+                    failed_corpus_replays: 0,
                 }
             }
         );

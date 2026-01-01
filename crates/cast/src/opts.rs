@@ -1,28 +1,26 @@
 use crate::cmd::{
-    access_list::AccessListArgs, artifact::ArtifactArgs, bind::BindArgs, call::CallArgs,
-    constructor_args::ConstructorArgsArgs, create2::Create2Args, creation_code::CreationCodeArgs,
+    access_list::AccessListArgs, artifact::ArtifactArgs, b2e_payload::B2EPayloadArgs,
+    bind::BindArgs, call::CallArgs, constructor_args::ConstructorArgsArgs, create2::Create2Args,
+    creation_code::CreationCodeArgs, da_estimate::DAEstimateArgs, erc20::Erc20Subcommand,
     estimate::EstimateArgs, find_block::FindBlockArgs, interface::InterfaceArgs, logs::LogsArgs,
     mktx::MakeTxArgs, rpc::RpcArgs, run::RunArgs, send::SendTxArgs, storage::StorageArgs,
     txpool::TxPoolSubcommands, wallet::WalletSubcommands,
 };
-use alloy_primitives::{Address, Selector, B256, U256};
+use alloy_ens::NameOrAddress;
+use alloy_primitives::{Address, B256, Selector, U256};
 use alloy_rpc_types::BlockId;
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{ArgAction, Parser, Subcommand, ValueHint};
 use eyre::Result;
 use foundry_cli::opts::{EtherscanOpts, GlobalArgs, RpcOpts};
-use foundry_common::{
-    ens::NameOrAddress,
-    version::{LONG_VERSION, SHORT_VERSION},
-};
+use foundry_common::version::{LONG_VERSION, SHORT_VERSION};
 use std::{path::PathBuf, str::FromStr};
-
 /// A Swiss Army knife for interacting with Ethereum applications from the command line.
 #[derive(Parser)]
 #[command(
     name = "cast",
     version = SHORT_VERSION,
     long_version = LONG_VERSION,
-    after_help = "Find more information in the book: http://book.getfoundry.sh/reference/cast/cast.html",
+    after_help = "Find more information in the book: https://getfoundry.sh/cast/overview",
     next_display_order = None,
 )]
 pub struct Cast {
@@ -117,6 +115,8 @@ pub enum CastSubcommand {
     ToCheckSumAddress {
         /// The address to convert.
         address: Option<Address>,
+        /// EIP-155 chain ID to encode the address using EIP-1191.
+        chain_id: Option<u64>,
     },
 
     /// Convert hex data to an ASCII string.
@@ -149,6 +149,25 @@ pub enum CastSubcommand {
     ToBytes32 {
         /// The hex data to convert.
         bytes: Option<String>,
+    },
+
+    /// Pads hex data to a specified length.
+    #[command(visible_aliases = &["pd"])]
+    Pad {
+        /// The hex data to pad.
+        data: Option<String>,
+
+        /// Right-pad the data (instead of left-pad).
+        #[arg(long)]
+        right: bool,
+
+        /// Left-pad the data (default).
+        #[arg(long, conflicts_with = "right")]
+        left: bool,
+
+        /// Target length in bytes (default: 32).
+        #[arg(long, default_value = "32")]
+        len: usize,
     },
 
     /// Convert an integer into a fixed point number.
@@ -359,8 +378,12 @@ pub enum CastSubcommand {
         block: Option<BlockId>,
 
         /// If specified, only get the given field of the block.
-        #[arg(long, short)]
-        field: Option<String>,
+        #[arg(short, long = "field", aliases = ["fields"], num_args = 0.., action = ArgAction::Append, value_delimiter = ',')]
+        fields: Vec<String>,
+
+        /// Print the raw RLP encoded block header.
+        #[arg(long, conflicts_with = "fields")]
+        raw: bool,
 
         #[arg(long, env = "CAST_FULL_BLOCK")]
         full: bool,
@@ -424,8 +447,30 @@ pub enum CastSubcommand {
         address: Option<Address>,
 
         /// The nonce of the deployer address.
-        #[arg(long)]
+        #[arg(
+            long,
+            conflicts_with = "salt",
+            conflicts_with = "init_code",
+            conflicts_with = "init_code_hash"
+        )]
         nonce: Option<u64>,
+
+        /// The salt for CREATE2 address computation.
+        #[arg(long, conflicts_with = "nonce")]
+        salt: Option<B256>,
+
+        /// The init code for CREATE2 address computation.
+        #[arg(
+            long,
+            requires = "salt",
+            conflicts_with = "init_code_hash",
+            conflicts_with = "nonce"
+        )]
+        init_code: Option<String>,
+
+        /// The init code hash for CREATE2 address computation.
+        #[arg(long, requires = "salt", conflicts_with = "init_code", conflicts_with = "nonce")]
+        init_code_hash: Option<B256>,
 
         #[command(flatten)]
         rpc: RpcOpts,
@@ -470,6 +515,10 @@ pub enum CastSubcommand {
 
         #[command(flatten)]
         rpc: RpcOpts,
+
+        /// If specified, the transaction will be converted to a TransactionRequest JSON format.
+        #[arg(long)]
+        to_request: bool,
     },
 
     /// Get the transaction receipt for a transaction.
@@ -525,7 +574,12 @@ pub enum CastSubcommand {
         sig: String,
 
         /// The ABI-encoded calldata.
-        calldata: String,
+        #[arg(required_unless_present = "file", index = 2)]
+        calldata: Option<String>,
+
+        /// Load ABI-encoded calldata from a file instead.
+        #[arg(long = "file", short = 'f', conflicts_with = "calldata")]
+        file: Option<PathBuf>,
     },
 
     /// Decode ABI-encoded string.
@@ -586,6 +640,17 @@ pub enum CastSubcommand {
         packed: bool,
 
         /// The arguments of the function.
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// ABI encode an event and its arguments to generate topics and data.
+    #[command(visible_alias = "aee")]
+    AbiEncodeEvent {
+        /// The event signature.
+        sig: String,
+
+        /// The arguments of the event.
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -989,6 +1054,10 @@ pub enum CastSubcommand {
     #[command(visible_alias = "bi")]
     Bind(BindArgs),
 
+    /// Convert Beacon payload to execution payload.
+    #[command(visible_alias = "b2e")]
+    B2EPayload(B2EPayloadArgs),
+
     /// Get the selector for a function.
     #[command(visible_alias = "si")]
     Sig {
@@ -1011,12 +1080,8 @@ pub enum CastSubcommand {
     #[command(visible_alias = "com")]
     Completions {
         #[arg(value_enum)]
-        shell: clap_complete::Shell,
+        shell: foundry_cli::clap::Shell,
     },
-
-    /// Generate Fig autocompletion spec.
-    #[command(visible_alias = "fig")]
-    GenerateFigSpec,
 
     /// Runs a published transaction in a local environment and prints the trace.
     #[command(visible_alias = "r")]
@@ -1050,6 +1115,10 @@ pub enum CastSubcommand {
     #[command(visible_aliases = &["dt", "decode-tx"])]
     DecodeTransaction { tx: Option<String> },
 
+    /// Recovery an EIP-7702 authority from a Authorization JSON string.
+    #[command(visible_aliases = &["decode-auth"])]
+    RecoverAuthority { auth: String },
+
     /// Extracts function selectors and arguments from bytecode
     #[command(visible_alias = "sel")]
     Selectors {
@@ -1061,15 +1130,21 @@ pub enum CastSubcommand {
         resolve: bool,
     },
 
-    /// Decodes EOF container bytes
-    #[command()]
-    DecodeEof { eof: Option<String> },
-
     /// Inspect the TxPool of a node.
     #[command(visible_alias = "tp")]
     TxPool {
         #[command(subcommand)]
         command: TxPoolSubcommands,
+    },
+    /// Estimates the data availability size of a given opstack block.
+    #[command(name = "da-estimate")]
+    DAEstimate(DAEstimateArgs),
+
+    /// ERC20 token operations.
+    #[command(visible_alias = "erc20")]
+    Erc20Token {
+        #[command(subcommand)]
+        command: Erc20Subcommand,
     },
 }
 

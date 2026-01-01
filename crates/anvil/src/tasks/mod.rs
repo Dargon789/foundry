@@ -2,13 +2,13 @@
 
 #![allow(rustdoc::private_doc_tests)]
 
-use crate::{shutdown::Shutdown, tasks::block_listener::BlockListener, EthApi};
+use crate::{EthApi, shutdown::Shutdown, tasks::block_listener::BlockListener};
 use alloy_network::{AnyHeader, AnyNetwork};
 use alloy_primitives::B256;
 use alloy_provider::Provider;
 use alloy_rpc_types::anvil::Forking;
 use futures::StreamExt;
-use std::{fmt, future::Future};
+use std::fmt;
 use tokio::{runtime::Handle, task::JoinHandle};
 
 pub mod block_listener;
@@ -38,12 +38,17 @@ impl TaskManager {
         self.tokio_handle.spawn(task)
     }
 
-    /// Spawns the blocking task.
-    pub fn spawn_blocking(&self, task: impl Future<Output = ()> + Send + 'static) {
+    /// Spawns the blocking task and returns a handle to it.
+    ///
+    /// Returning the `JoinHandle` allows callers to cancel the task or await its completion.
+    pub fn spawn_blocking(
+        &self,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> JoinHandle<()> {
         let handle = self.tokio_handle.clone();
         self.tokio_handle.spawn_blocking(move || {
             handle.block_on(task);
-        });
+        })
     }
 
     /// Spawns a new task that listens for new blocks and resets the forked provider for every new
@@ -52,13 +57,13 @@ impl TaskManager {
     /// ```
     /// use alloy_network::Ethereum;
     /// use alloy_provider::RootProvider;
-    /// use anvil::{spawn, NodeConfig};
+    /// use anvil::{NodeConfig, spawn};
     ///
     /// # async fn t() {
     /// let endpoint = "http://....";
     /// let (api, handle) = spawn(NodeConfig::default().with_eth_rpc_url(Some(endpoint))).await;
     ///
-    /// let provider = RootProvider::connect_builtin(endpoint).await.unwrap();
+    /// let provider = RootProvider::connect(endpoint).await.unwrap();
     ///
     /// handle.task_manager().spawn_reset_on_new_polled_blocks(provider, api);
     /// # }
@@ -110,12 +115,12 @@ impl TaskManager {
     /// ```
     /// use alloy_network::Ethereum;
     /// use alloy_provider::RootProvider;
-    /// use anvil::{spawn, NodeConfig};
+    /// use anvil::{NodeConfig, spawn};
     ///
     /// # async fn t() {
     /// let (api, handle) = spawn(NodeConfig::default().with_eth_rpc_url(Some("http://...."))).await;
     ///
-    /// let provider = RootProvider::connect_builtin("ws://...").await.unwrap();
+    /// let provider = RootProvider::connect("ws://...").await.unwrap();
     ///
     /// handle.task_manager().spawn_reset_on_subscribed_blocks(provider, api);
     ///

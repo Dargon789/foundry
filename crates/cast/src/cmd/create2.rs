@@ -1,12 +1,12 @@
-use alloy_primitives::{hex, keccak256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, hex, keccak256};
 use clap::Parser;
 use eyre::{Result, WrapErr};
-use rand::{rngs::StdRng, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 use regex::RegexSetBuilder;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };
@@ -154,7 +154,7 @@ impl Create2Args {
         if let Some(suffix) = ends_with {
             regexs.push(format!(
                 r"{}$",
-                get_regex_hex_string(suffix).wrap_err("invalid prefix hex provided")?
+                get_regex_hex_string(suffix).wrap_err("invalid suffix hex provided")?
             ))
         }
 
@@ -165,9 +165,9 @@ impl Create2Args {
 
         let regex = RegexSetBuilder::new(regexs).case_insensitive(!case_sensitive).build()?;
 
-        let mut n_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        if let Some(threads) = threads {
-            n_threads = n_threads.min(threads);
+        let mut n_threads = threads.unwrap_or(0);
+        if n_threads == 0 {
+            n_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         }
         if cfg!(test) {
             n_threads = n_threads.min(2);
@@ -184,7 +184,7 @@ impl Create2Args {
         if !no_random {
             let mut rng = match seed {
                 Some(seed) => StdRng::from_seed(seed.0),
-                None => StdRng::from_entropy(),
+                None => StdRng::from_os_rng(),
             };
             rng.fill_bytes(remaining);
         }
