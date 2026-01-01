@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
+#
 pub const DRY_RUN_DIR: &str = "dry-run";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct NestedValue {
     pub internal_type: String,
     pub value: String,
 }
-
+#
 /// Helper that saves the transactions sequence and its state on which transactions have been
 /// broadcasted
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -51,8 +51,8 @@ pub struct SensitiveScriptSequence {
     pub transactions: VecDeque<SensitiveTransactionMetadata>,
 }
 
-impl From<ScriptSequence> for SensitiveScriptSequence {
-    fn from(sequence: ScriptSequence) -> Self {
+impl From<&ScriptSequence> for SensitiveScriptSequence {
+    fn from(sequence: &ScriptSequence) -> Self {
         Self {
             transactions: sequence
                 .transactions
@@ -99,31 +99,31 @@ impl ScriptSequence {
             return Ok(());
         }
 
-        let Some((path, sensitive_path)) = self.paths.clone() else { return Ok(()) };
-
         self.timestamp = now().as_millis();
         let ts_name = format!("run-{}.json", self.timestamp);
 
-        let sensitive_script_sequence: SensitiveScriptSequence = self.clone().into();
+        let sensitive_script_sequence = SensitiveScriptSequence::from(&*self);
+
+        let Some((path, sensitive_path)) = self.paths.as_ref() else { return Ok(()) };
 
         // broadcast folder writes
         //../run-latest.json
-        let mut writer = BufWriter::new(fs::create_file(&path)?);
+        let mut writer = BufWriter::new(fs::create_file(path)?);
         serde_json::to_writer_pretty(&mut writer, &self)?;
         writer.flush()?;
         if save_ts {
             //../run-[timestamp].json
-            fs::copy(&path, path.with_file_name(&ts_name))?;
+            fs::copy(path, path.with_file_name(&ts_name))?;
         }
 
         // cache folder writes
         //../run-latest.json
-        let mut writer = BufWriter::new(fs::create_file(&sensitive_path)?);
+        let mut writer = BufWriter::new(fs::create_file(sensitive_path)?);
         serde_json::to_writer_pretty(&mut writer, &sensitive_script_sequence)?;
         writer.flush()?;
         if save_ts {
             //../run-[timestamp].json
-            fs::copy(&sensitive_path, sensitive_path.with_file_name(&ts_name))?;
+            fs::copy(sensitive_path, sensitive_path.with_file_name(&ts_name))?;
         }
 
         if !silent {
@@ -148,7 +148,7 @@ impl ScriptSequence {
     pub fn add_receipt(&mut self, receipt: AnyTransactionReceipt) {
         self.receipts.push(receipt);
     }
-
+    #
     /// Sorts all receipts with ascending transaction index
     pub fn sort_receipts(&mut self) {
         self.receipts.sort_by_key(|r| (r.block_number, r.transaction_index));
@@ -164,7 +164,7 @@ impl ScriptSequence {
     pub fn remove_pending(&mut self, tx_hash: TxHash) {
         self.pending.retain(|element| element != &tx_hash);
     }
-
+    #
     /// Gets paths in the formats
     /// `./broadcast/[contract_filename]/[chain_id]/[sig]-[timestamp].json` and
     /// `./cache/[contract_filename]/[chain_id]/[sig]-[timestamp].json`.
@@ -194,9 +194,10 @@ impl ScriptSequence {
 
         // TODO: ideally we want the name of the function here if sig is calldata
         let filename = sig_to_file_name(sig);
+        let filename_with_ext = format!("{filename}-latest.json");
 
-        broadcast.push(format!("{filename}-latest.json"));
-        cache.push(format!("{filename}-latest.json"));
+        broadcast.push(&filename_with_ext);
+        cache.push(&filename_with_ext);
 
         Ok((broadcast, cache))
     }
@@ -218,7 +219,7 @@ impl ScriptSequence {
             .for_each(|(i, tx)| tx.rpc.clone_from(&sensitive.transactions[i].rpc));
     }
 }
-
+#
 /// Converts the `sig` argument into the corresponding file path.
 ///
 /// This accepts either the signature of the function or the raw calldata.
@@ -237,7 +238,6 @@ pub fn sig_to_file_name(sig: &str) -> String {
         return sig.to_string();
     }
 
-    // return sig as is
     sig.to_string()
 }
 

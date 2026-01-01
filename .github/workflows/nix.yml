@@ -1,14 +1,11 @@
 name: nix
 
-permissions:
-  contents: read
+permissions: {}
 
 on:
   schedule:
-    # Run weekly
-    - cron: "0 0 * * SUN"
-  workflow_dispatch:
-# Needed so we can run it manually
+    - cron: "0 0 * * SUN" # Run weekly on Sundays at midnight UTC
+  workflow_dispatch: # Needed so we can run it manually
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,14 +14,16 @@ concurrency:
 jobs:
   # Opens a PR with an updated flake.lock file
   update:
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
-    runs-on: ubuntu-latest
     steps:
-      - uses: DeterminateSystems/determinate-nix-action@v3
-      - uses: actions/checkout@v5
-      - uses: DeterminateSystems/update-flake-lock@main
+      - uses: DeterminateSystems/determinate-nix-action@1d699fc25db3f9e079cd2f168ca007a4183389be # v3
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/update-flake-lock@2235257b90962ba68499d64da5b0d1eaa3b46c1e # main
         with:
           pr-title: "Update flake.lock"
           pr-labels: |
@@ -36,9 +35,13 @@ jobs:
       matrix:
         runs-on: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
     steps:
-      - uses: DeterminateSystems/determinate-nix-action@v3
-      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/determinate-nix-action@1d699fc25db3f9e079cd2f168ca007a4183389be # v3
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Update flake.lock
         run: nix flake update

@@ -43,6 +43,10 @@ pub enum EthRequest {
     #[serde(rename = "web3_sha3", with = "sequence")]
     Web3Sha3(Bytes),
 
+    /// Returns the current Ethereum protocol version.
+    #[serde(rename = "eth_protocolVersion", with = "empty_params")]
+    EthProtocolVersion(()),
+
     #[serde(rename = "eth_chainId", with = "empty_params")]
     EthChainId(()),
 
@@ -51,6 +55,10 @@ pub enum EthRequest {
 
     #[serde(rename = "net_listening", with = "empty_params")]
     NetListening(()),
+
+    /// Returns the number of hashes per second with which the node is mining.
+    #[serde(rename = "eth_hashrate", with = "empty_params")]
+    EthHashrate(()),
 
     #[serde(rename = "eth_gasPrice", with = "empty_params")]
     EthGasPrice(()),
@@ -66,6 +74,10 @@ pub enum EthRequest {
 
     #[serde(rename = "eth_blockNumber", with = "empty_params")]
     EthBlockNumber(()),
+
+    /// Returns the client coinbase address.
+    #[serde(rename = "eth_coinbase", with = "empty_params")]
+    EthCoinbase(()),
 
     #[serde(rename = "eth_getBalance")]
     EthGetBalance(Address, Option<BlockId>),
@@ -175,6 +187,9 @@ pub enum EthRequest {
         #[serde(default)] Option<Box<BlockOverrides>>,
     ),
 
+    #[serde(rename = "eth_fillTransaction", with = "sequence")]
+    EthFillTransaction(WithOtherFields<TransactionRequest>),
+
     #[serde(rename = "eth_getTransactionByHash", with = "sequence")]
     EthGetTransactionByHash(TxHash),
 
@@ -186,8 +201,16 @@ pub enum EthRequest {
     #[serde(rename = "anvil_getBlobsByTransactionHash", with = "sequence")]
     GetBlobByTransactionHash(TxHash),
 
+    /// Returns the blobs for a given transaction hash.
+    #[serde(rename = "anvil_getBlobSidecarsByBlockId", with = "sequence")]
+    GetBlobSidecarsByBlockId(BlockId),
+
+    /// Returns the genesis time for the chain
+    #[serde(rename = "anvil_getGenesisTime", with = "empty_params")]
+    GetGenesisTime(()),
+
     #[serde(rename = "eth_getTransactionByBlockHashAndIndex")]
-    EthGetTransactionByBlockHashAndIndex(TxHash, Index),
+    EthGetTransactionByBlockHashAndIndex(B256, Index),
 
     #[serde(rename = "eth_getTransactionByBlockNumberAndIndex")]
     EthGetTransactionByBlockNumberAndIndex(BlockNumber, Index),
@@ -196,7 +219,7 @@ pub enum EthRequest {
     EthGetRawTransactionByHash(TxHash),
 
     #[serde(rename = "eth_getRawTransactionByBlockHashAndIndex")]
-    EthGetRawTransactionByBlockHashAndIndex(TxHash, Index),
+    EthGetRawTransactionByBlockHashAndIndex(B256, Index),
 
     #[serde(rename = "eth_getRawTransactionByBlockNumberAndIndex")]
     EthGetRawTransactionByBlockNumberAndIndex(BlockNumber, Index),
@@ -286,6 +309,10 @@ pub enum EthRequest {
     /// reth's `debug_codeByHash` endpoint
     #[serde(rename = "debug_codeByHash")]
     DebugCodeByHash(B256, #[serde(default)] Option<BlockId>),
+
+    /// reth's `debug_dbGet` endpoint
+    #[serde(rename = "debug_dbGet")]
+    DebugDbGet(String),
 
     /// Trace transaction endpoint for parity's `trace_transaction`
     #[serde(rename = "trace_transaction", with = "sequence")]
@@ -658,6 +685,14 @@ pub enum EthRequest {
         #[serde(deserialize_with = "deserialize_number")] U256,
     ),
 
+    /// Returns the transaction by sender and nonce
+    /// Returns the full transaction data.
+    #[serde(rename = "eth_getTransactionBySenderAndNonce")]
+    EthGetTransactionBySenderAndNonce(
+        Address,
+        #[serde(deserialize_with = "deserialize_number")] U256,
+    ),
+
     /// Otterscan's `ots_getTransactionBySenderAndNonce` endpoint
     /// Given an ETH contract address, returns the tx hash and the direct address who created the
     /// contract.
@@ -679,14 +714,6 @@ pub enum EthRequest {
     /// Wallet
     #[serde(rename = "wallet_getCapabilities", with = "empty_params")]
     WalletGetCapabilities(()),
-
-    /// Wallet send_tx
-    #[serde(
-        rename = "wallet_sendTransaction",
-        alias = "odyssey_sendTransaction",
-        with = "sequence"
-    )]
-    WalletSendTransaction(Box<WithOtherFields<TransactionRequest>>),
 
     /// Add an address to the delegation capability of the wallet
     #[serde(rename = "anvil_addCapability", with = "sequence")]

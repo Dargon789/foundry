@@ -1,10 +1,6 @@
 use alloy_json_abi::JsonAbi;
-use alloy_primitives::{Address, Bytes, map::HashMap};
 use eyre::{Result, WrapErr};
-use foundry_common::{
-    ContractsByArtifact, TestFunctionExt, compile::ProjectCompiler, fs, selectors::SelectorKind,
-    shell,
-};
+use foundry_common::{TestFunctionExt, fs, fs::json_files, selectors::SelectorKind, shell};
 use foundry_compilers::{
     Artifact, ArtifactId, ProjectCompileOutput,
     artifacts::{CompactBytecode, Settings},
@@ -12,29 +8,24 @@ use foundry_compilers::{
     utils::read_json_file,
 };
 use foundry_config::{Chain, Config, NamedChain, error::ExtractConfigError, figment::Figment};
-use foundry_debugger::Debugger;
 use foundry_evm::{
     executors::{DeployResult, EvmError, RawCallResult},
     opts::EvmOpts,
     traces::{
-        CallTraceDecoder, CallTraceDecoderBuilder, TraceKind, Traces,
-        debug::{ContractSources, DebugTraceIdentifier},
-        decode_trace_arena,
-        identifier::{SignaturesCache, SignaturesIdentifier, TraceIdentifiers},
-        render_trace_arena_inner,
+        CallTraceDecoder, TraceKind, Traces, decode_trace_arena, identifier::SignaturesCache,
+        prune_trace_depth, render_trace_arena_inner,
     },
 };
 use std::{
     fmt::Write,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 use yansi::Paint;
 
-/// Given a `Project`'s output, removes the matching ABI, Bytecode and
-/// Runtime Bytecode of the given contract.
+/// Given a `Project`'s output, finds the contract by path and name and returns its
+/// ABI, creation bytecode, and `ArtifactId`.
 #[track_caller]
-pub fn remove_contract(
+pub fn find_contract_artifacts(
     output: ProjectCompileOutput,
     path: &Path,
     name: &str,
@@ -178,7 +169,8 @@ pub fn has_different_gas_calc(chain_id: u64) -> bool {
                     | NamedChain::KaruraTestnet
                     | NamedChain::Mantle
                     | NamedChain::MantleSepolia
-                    | NamedChain::MantleTestnet
+                    | NamedChain::Monad
+                    | NamedChain::MonadTestnet
                     | NamedChain::Moonbase
                     | NamedChain::Moonbeam
                     | NamedChain::MoonbeamDev
@@ -332,90 +324,12 @@ impl TryFrom<Result<RawCallResult>> for TraceResult {
     }
 }
 
-/// labels the traces, conditionally prints them or opens the debugger
-#[expect(clippy::too_many_arguments)]
-pub async fn handle_traces(
-    mut result: TraceResult,
-    config: &Config,
-    chain: Option<Chain>,
-    contracts_bytecode: &HashMap<Address, Bytes>,
-    labels: Vec<String>,
-    with_local_artifacts: bool,
-    debug: bool,
-    decode_internal: bool,
-    disable_label: bool,
-) -> Result<()> {
-    let (known_contracts, mut sources) = if with_local_artifacts {
-        let _ = sh_println!("Compiling project to generate artifacts");
-        let project = config.project()?;
-        let compiler = ProjectCompiler::new();
-        let output = compiler.compile(&project)?;
-        (
-            Some(ContractsByArtifact::new(
-                output.artifact_ids().map(|(id, artifact)| (id, artifact.clone().into())),
-            )),
-            ContractSources::from_project_output(&output, project.root(), None)?,
-        )
-    } else {
-        (None, ContractSources::default())
-    };
-
-    let labels = labels.iter().filter_map(|label_str| {
-        let mut iter = label_str.split(':');
-
-        if let Some(addr) = iter.next()
-            && let (Ok(address), Some(label)) = (Address::from_str(addr), iter.next())
-        {
-            return Some((address, label.to_string()));
-        }
-        None
-    });
-    let config_labels = config.labels.clone().into_iter();
-
-    let mut builder = CallTraceDecoderBuilder::new()
-        .with_labels(labels.chain(config_labels))
-        .with_signature_identifier(SignaturesIdentifier::from_config(config)?)
-        .with_label_disabled(disable_label);
-    let mut identifier = TraceIdentifiers::new().with_etherscan(config, chain)?;
-    if let Some(contracts) = &known_contracts {
-        builder = builder.with_known_contracts(contracts);
-        identifier = identifier.with_local_and_bytecodes(contracts, contracts_bytecode);
-    }
-
-    let mut decoder = builder.build();
-
-    for (_, trace) in result.traces.as_deref_mut().unwrap_or_default() {
-        decoder.identify(trace, &mut identifier);
-    }
-
-    if decode_internal || debug {
-        if let Some(ref etherscan_identifier) = identifier.etherscan {
-            sources.merge(etherscan_identifier.get_compiled_contracts().await?);
-        }
-
-        if debug {
-            let mut debugger = Debugger::builder()
-                .traces(result.traces.expect("missing traces"))
-                .decoder(&decoder)
-                .sources(sources)
-                .build();
-            debugger.try_run_tui()?;
-            return Ok(());
-        }
-
-        decoder.debug_identifier = Some(DebugTraceIdentifier::new(sources));
-    }
-
-    print_traces(&mut result, &decoder, shell::verbosity() > 0, shell::verbosity() > 4).await?;
-
-    Ok(())
-}
-
 pub async fn print_traces(
     result: &mut TraceResult,
     decoder: &CallTraceDecoder,
     verbose: bool,
     state_changes: bool,
+    trace_depth: Option<usize>,
 ) -> Result<()> {
     let traces = result.traces.as_mut().expect("No traces found");
 
@@ -425,6 +339,11 @@ pub async fn print_traces(
 
     for (_, arena) in traces {
         decode_trace_arena(arena, decoder).await;
+
+        if let Some(trace_depth) = trace_depth {
+            prune_trace_depth(arena, trace_depth);
+        }
+
         sh_println!("{}", render_trace_arena_inner(arena, verbose, state_changes))?;
     }
 
@@ -465,4 +384,73 @@ pub fn cache_local_signatures(output: &ProjectCompileOutput) -> Result<()> {
     }
     signatures.save(&path);
     Ok(())
+}
+
+/// Traverses all files at `folder_path`, parses any JSON ABI files found,
+/// and caches their function/event/error signatures to the local signatures cache.
+pub fn cache_signatures_from_abis(folder_path: impl AsRef<Path>) -> Result<()> {
+    let Some(cache_dir) = Config::foundry_cache_dir() else {
+        eyre::bail!("Failed to get `cache_dir` to generate local signatures.");
+    };
+    let path = cache_dir.join("signatures");
+    let mut signatures = SignaturesCache::load(&path);
+
+    json_files(folder_path.as_ref())
+        .filter_map(|path| std::fs::read_to_string(&path).ok())
+        .filter_map(|content| serde_json::from_str::<JsonAbi>(&content).ok())
+        .for_each(|json_abi| signatures.extend_from_abi(&json_abi));
+
+    signatures.save(&path);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_cache_signatures_from_abis() {
+        let temp_dir = tempdir().unwrap();
+        let abi_json = r#"[
+              {
+                  "type": "function",
+                  "name": "myCustomFunction",
+                  "inputs": [{"name": "amount", "type": "uint256"}],
+                  "outputs": [],
+                  "stateMutability": "nonpayable"
+              },
+              {
+                  "type": "event",
+                  "name": "MyCustomEvent",
+                  "inputs": [{"name": "value", "type": "uint256", "indexed": false}],
+                  "anonymous": false
+              },
+              {
+                  "type": "error",
+                  "name": "MyCustomError",
+                  "inputs": [{"name": "code", "type": "uint256"}]
+              }
+          ]"#;
+
+        let abi_path = temp_dir.path().join("test.json");
+        fs::write(&abi_path, abi_json).unwrap();
+
+        cache_signatures_from_abis(temp_dir.path()).unwrap();
+
+        let cache_dir = Config::foundry_cache_dir().unwrap();
+        let cache_path = cache_dir.join("signatures");
+        let cache = SignaturesCache::load(&cache_path);
+
+        let func_selector: alloy_primitives::Selector = "0x2e2dbaf7".parse().unwrap();
+        assert!(cache.contains_key(&SelectorKind::Function(func_selector)));
+
+        let event_selector: alloy_primitives::B256 =
+            "0x8cc20c47f3a2463817352f75dec0dbf43a7a771b5f6817a92bd5724c1f4aa745".parse().unwrap();
+        assert!(cache.contains_key(&SelectorKind::Event(event_selector)));
+
+        let error_selector: alloy_primitives::Selector = "0xd35f45de".parse().unwrap();
+        assert!(cache.contains_key(&SelectorKind::Error(error_selector)));
+    }
 }

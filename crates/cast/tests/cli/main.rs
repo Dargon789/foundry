@@ -3,9 +3,11 @@
 use alloy_chains::NamedChain;
 use alloy_hardforks::EthereumHardfork;
 use alloy_network::{TransactionBuilder, TransactionResponse};
-use alloy_primitives::{B256, Bytes, address, b256, hex};
+use alloy_primitives::{B256, Bytes, U256, address, b256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::{BlockNumberOrTag, Index, TransactionRequest};
+use alloy_rpc_types::{Authorization, BlockNumberOrTag, Index, TransactionRequest};
+use alloy_signer::Signer;
+use alloy_signer_local::PrivateKeySigner;
 use anvil::NodeConfig;
 use foundry_test_utils::{
     rpc::{
@@ -16,11 +18,13 @@ use foundry_test_utils::{
     str,
     util::OutputExt,
 };
-use std::{fs, io::Write, path::Path, str::FromStr};
+use serde_json::json;
+use std::{fs, path::Path, str::FromStr};
 
 #[macro_use]
 extern crate foundry_test_utils;
 
+mod erc20;
 mod selectors;
 
 casttest!(print_short_version, |_prj, cmd| {
@@ -56,7 +60,7 @@ Options:
 
   -j, --threads <THREADS>
           Number of threads to use. Specifying 0 defaults to the number of logical cores
-          
+...
           [aliases: --jobs]
 
   -V, --version
@@ -82,16 +86,18 @@ Display options:
 
   -v, --verbosity...
           Verbosity level of the log messages.
-          
+...
           Pass multiple times to increase the verbosity (e.g. -v, -vv, -vvv).
-          
+...
           Depending on the context the verbosity levels have different meanings.
-          
+...
           For example, the verbosity levels of the EVM are:
           - 2 (-vv): Print logs for all tests.
           - 3 (-vvv): Print execution traces for failing tests.
           - 4 (-vvvv): Print execution traces for all tests, and setup traces for failing tests.
-          - 5 (-vvvvv): Print execution and setup traces for all tests, including storage changes.
+          - 5 (-vvvvv): Print execution and setup traces for all tests, including storage changes
+          and
+            backtraces with line numbers.
 
 Find more information in the book: https://getfoundry.sh/cast/overview
 
@@ -138,9 +144,17 @@ transactions:        [
 "#]]);
 
     // <https://etherscan.io/block/15007840>
-    cmd.cast_fuse().args(["block", "15007840", "-f", "hash", "--rpc-url", eth_rpc_url.as_str()]);
+    cmd.cast_fuse().args([
+        "block",
+        "15007840",
+        "-f",
+        "hash,timestamp",
+        "--rpc-url",
+        eth_rpc_url.as_str(),
+    ]);
     cmd.assert_success().stdout_eq(str![[r#"
 0x950091817a57e22b6c1f3b951a15f52d41ac89b299cc8f9c89bb6d185f80c415
+1655904485
 
 "#]]);
 });
@@ -603,6 +617,85 @@ casttest!(wallet_sign_auth, |_prj, cmd| {
 "#]]);
 });
 
+// tests that `cast wallet sign-auth --self-broadcast` uses nonce + 1
+casttest!(wallet_sign_auth_self_broadcast, async |_prj, cmd| {
+    use alloy_rlp::Decodable;
+    use alloy_signer_local::PrivateKeySigner;
+
+    let (_, handle) =
+        anvil::spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()))).await;
+    let endpoint = handle.http_endpoint();
+
+    let private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    let signer: PrivateKeySigner = private_key.parse().unwrap();
+    let signer_address = signer.address();
+    let delegate_address = address!("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+
+    // Get the current nonce from the RPC
+    let provider = ProviderBuilder::new().connect_http(endpoint.parse().unwrap());
+    let current_nonce = provider.get_transaction_count(signer_address).await.unwrap();
+
+    // First, get the auth without --self-broadcast (should use current nonce)
+    let output_normal = cmd
+        .args([
+            "wallet",
+            "sign-auth",
+            "--private-key",
+            private_key,
+            "--rpc-url",
+            &endpoint,
+            &delegate_address.to_string(),
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy()
+        .trim()
+        .to_string();
+
+    // Then, get the auth with --self-broadcast (should use current nonce + 1)
+    let output_self_broadcast = cmd
+        .cast_fuse()
+        .args([
+            "wallet",
+            "sign-auth",
+            "--private-key",
+            private_key,
+            "--rpc-url",
+            &endpoint,
+            "--self-broadcast",
+            &delegate_address.to_string(),
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy()
+        .trim()
+        .to_string();
+
+    // The outputs should be different due to different nonces
+    assert_ne!(
+        output_normal, output_self_broadcast,
+        "self-broadcast should produce different signature due to nonce + 1"
+    );
+
+    // Decode the RLP to verify the nonces
+    let normal_bytes = hex::decode(output_normal.strip_prefix("0x").unwrap()).unwrap();
+    let self_broadcast_bytes =
+        hex::decode(output_self_broadcast.strip_prefix("0x").unwrap()).unwrap();
+
+    let normal_auth =
+        alloy_eips::eip7702::SignedAuthorization::decode(&mut normal_bytes.as_slice()).unwrap();
+    let self_broadcast_auth =
+        alloy_eips::eip7702::SignedAuthorization::decode(&mut self_broadcast_bytes.as_slice())
+            .unwrap();
+
+    assert_eq!(normal_auth.nonce(), current_nonce, "normal auth should have current nonce");
+    assert_eq!(
+        self_broadcast_auth.nonce(),
+        current_nonce + 1,
+        "self-broadcast auth should have current nonce + 1"
+    );
+});
+
 // tests that `cast wallet list` outputs the local accounts
 casttest!(wallet_list_local_accounts, |prj, cmd| {
     let keystore_path = prj.root().join("keystore");
@@ -807,6 +900,119 @@ casttest!(wallet_mnemonic_from_entropy_json_verbose, |_prj, cmd| {
     }
   ]
 }
+
+"#]]);
+});
+
+// tests that `cast wallet derive` outputs the addresses of the accounts derived from the mnemonic
+casttest!(wallet_derive_mnemonic, |_prj, cmd| {
+    cmd.args([
+        "wallet",
+        "derive",
+        "--accounts",
+        "3",
+        "test test test test test test test test test test test junk",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+- Account 0:
+[ADDRESS]
+
+- Account 1:
+[ADDRESS]
+
+- Account 2:
+[ADDRESS]
+
+
+"#]]);
+});
+
+// tests that `cast wallet derive` with insecure flag outputs the addresses and private keys of the
+// accounts derived from the mnemonic
+casttest!(wallet_derive_mnemonic_insecure, |_prj, cmd| {
+    cmd.args([
+        "wallet",
+        "derive",
+        "--accounts",
+        "3",
+        "--insecure",
+        "test test test test test test test test test test test junk",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+- Account 0:
+[ADDRESS]
+[PRIVATE_KEY]
+
+- Account 1:
+[ADDRESS]
+[PRIVATE_KEY]
+
+- Account 2:
+[ADDRESS]
+[PRIVATE_KEY]
+
+
+"#]]);
+});
+
+// tests that `cast wallet derive` with json flag outputs the addresses of the accounts derived from
+// the mnemonic in JSON format
+casttest!(wallet_derive_mnemonic_json, |_prj, cmd| {
+    cmd.args([
+        "wallet",
+        "derive",
+        "--accounts",
+        "3",
+        "--json",
+        "test test test test test test test test test test test junk",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+[
+  {
+    "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+  },
+  {
+    "address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+  },
+  {
+    "address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+  }
+]
+
+"#]]);
+});
+
+// tests that `cast wallet derive` with insecure and json flag outputs the addresses and private
+// keys of the accounts derived from the mnemonic in JSON format
+casttest!(wallet_derive_mnemonic_insecure_json, |_prj, cmd| {
+    cmd.args([
+        "wallet",
+        "derive",
+        "--accounts",
+        "3",
+        "--insecure",
+        "--json",
+        "test test test test test test test test test test test junk",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+[
+  {
+    "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+  },
+  {
+    "address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "private_key": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+  },
+  {
+    "address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+    "private_key": "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+  }
+]
 
 "#]]);
 });
@@ -1241,11 +1447,9 @@ casttest!(rpc_raw_params, |_prj, cmd| {
 casttest!(rpc_raw_params_stdin, |_prj, cmd| {
     let eth_rpc_url = next_http_rpc_endpoint();
 
-    // Call `echo "\n[\n\"0x123\",\nfalse\n]\n" | cast rpc  eth_getBlockByNumber --raw
+    // Call `echo "\n[\n\"0x123\",\nfalse\n]\n" | cast rpc eth_getBlockByNumber --raw
     cmd.args(["rpc", "--rpc-url", eth_rpc_url.as_str(), "eth_getBlockByNumber", "--raw"]).stdin(
-        |mut stdin| {
-            stdin.write_all(b"\n[\n\"0x123\",\nfalse\n]\n").unwrap();
-        },
+        b"\n[\n\"0x123\",\nfalse\n]\n"
     )
     .assert_json_stdout(str![[r#"
 {"number":"0x123","hash":"0xc5dab4e189004a1312e9db43a40abb2de91ad7dd25e75880bf36016d8e9df524","transactions":[],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","extraData":"0x476574682f4c5649562f76312e302e302f6c696e75782f676f312e342e32","nonce":"0x29d6547c196e00e0","miner":"0xbb7b8287f3f0a933474a79eae42cbca977791171","difficulty":"0x494433b31","gasLimit":"0x1388","gasUsed":"0x0","uncles":[],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x220","transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","stateRoot":"0x3fe6bd17aa85376c7d566df97d9f2e536f37f7a87abb3a6f9e2891cf9442f2e4","mixHash":"0x943056aa305aa6d22a3c06110942980342d1f4d4b11c17711961436a0f963ea0","parentHash":"0x7abfd11e862ccde76d6ea8ee20978aac26f4bcb55de1188cc0335be13e817017","timestamp":"0x55ba4564"}
@@ -1310,6 +1514,7 @@ casttest!(to_base, |_prj, cmd| {
 });
 
 // tests that revert reason is only present if transaction has reverted.
+
 casttest!(receipt_revert_reason, |_prj, cmd| {
     let rpc = next_http_archive_rpc_url();
 
@@ -1321,27 +1526,25 @@ casttest!(receipt_revert_reason, |_prj, cmd| {
         rpc.as_str(),
     ])
     .assert_success()
-    .stdout_eq(str![[r#"
-
+    .stdout_eq(format!(r#"
 blockHash            0x2cfe65be49863676b6dbc04d58176a14f39b123f1e2f4fea0383a2d82c2c50d0
 blockNumber          16239315
-contractAddress      
+contractAddress      {}
 cumulativeGasUsed    10743428
 effectiveGasPrice    10539984136
 from                 0x199D5ED7F45F4eE35960cF22EAde2076e95B253F
 gasUsed              21000
 logs                 []
 logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-root                 
+root                 {}
 status               1 (success)
 transactionHash      0x44f2aaa351460c074f2cb1e5a9e28cbc7d83f33e425101d2de14331c7b7ec31e
 transactionIndex     116
 type                 0
-blobGasPrice         
-blobGasUsed          
+blobGasPrice         {}
+blobGasUsed          {}
 to                   0x91da5bf3F8Eb72724E6f50Ec6C3D199C6355c59c
-
-"#]]);
+"#,"", "", "", ""));
 
     let rpc = next_http_archive_rpc_url();
 
@@ -1354,30 +1557,27 @@ to                   0x91da5bf3F8Eb72724E6f50Ec6C3D199C6355c59c
             rpc.as_str(),
         ])
         .assert_success()
-        .stdout_eq(str![[r#"
-
+        .stdout_eq(format!(r#"
 blockHash            0x883f974b17ca7b28cb970798d1c80f4d4bb427473dc6d39b2a7fe24edc02902d
 blockNumber          14839405
-contractAddress      
+contractAddress      {}
 cumulativeGasUsed    20273649
 effectiveGasPrice    21491736378
 from                 0x3cF412d970474804623bb4e3a42dE13F9bCa5436
 gasUsed              24952
 logs                 []
 logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-root                 
+root                 {}
 status               0 (failed)
 transactionHash      0x0e07d8b53ed3d91314c80e53cf25bcde02084939395845cbb625b029d568135c
 transactionIndex     173
 type                 2
-blobGasPrice         
-blobGasUsed          
+blobGasPrice         {}
+blobGasUsed          {}
 to                   0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
 revertReason         [..]Transaction too old, data: "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000135472616e73616374696f6e20746f6f206f6c6400000000000000000000000000"
-
-"#]]);
+"#,"","","",""));
 });
-
 // tests that the revert reason is loaded using the correct `from` address.
 casttest!(revert_reason_from, |_prj, cmd| {
     let rpc = next_rpc_endpoint(NamedChain::Sepolia);
@@ -1389,28 +1589,26 @@ casttest!(revert_reason_from, |_prj, cmd| {
         rpc.as_str(),
     ])
     .assert_success()
-    .stdout_eq(str![[r#"
-
+    .stdout_eq(format!(r#"
 blockHash            0x32663d7730c9ea8e1de6d99854483e25fcc05bb56c91c0cc82f9f04944fbffc1
 blockNumber          7823353
-contractAddress      
+contractAddress      {}
 cumulativeGasUsed    7500797
 effectiveGasPrice    14296851013
 from                 0x3583fF95f96b356d716881C871aF7Eb55ea34a93
 gasUsed              25815
 logs                 []
 logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-root                 
+root                 {}
 status               0 (failed)
 transactionHash      0x10ee70cf9f5ced5c515e8d53bfab5ea9f5c72cd61b25fba455c8355ee286c4e4
 transactionIndex     96
 type                 0
-blobGasPrice         
-blobGasUsed          
+blobGasPrice         {}
+blobGasUsed          {}
 to                   0x91b5d4111a4C038153b24e31F75ccdC47123595d
 revertReason         Counter is too large, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000014436f756e74657220697320746f6f206c61726765000000000000000000000000"
-
-"#]]);
+"#, "", "", "", ""));
 });
 
 // tests that `cast --parse-bytes32-address` command is working correctly.
@@ -1526,6 +1724,24 @@ casttest!(logs_sig_2, |_prj, cmd| {
     .stdout_eq(file!["../fixtures/cast_logs.stdout"]);
 });
 
+casttest!(logs_chunked_large_range, |_prj, cmd| {
+    let rpc = next_http_archive_rpc_url();
+    cmd.args([
+        "logs",
+        "--rpc-url",
+        rpc.as_str(),
+        "--from-block",
+        "18000000",
+        "--to-block",
+        "18050000",
+        "--query-size",
+        "1000",
+        "Transfer(address indexed from, address indexed to, uint256 value)",
+        "0xA0b86a33E6441d02dd8C6B2b7E5D1E3eD7F73b4b",
+    ])
+    .assert_success();
+});
+
 casttest!(mktx, |_prj, cmd| {
     cmd.args([
         "mktx",
@@ -1636,9 +1852,9 @@ casttest!(mktx_raw_unsigned, |_prj, cmd| {
 });
 
 casttest!(mktx_raw_unsigned_no_from_missing_chain, async |_prj, cmd| {
-    // As chain is not provided, a query is made to the provider to get the chain id, before the tx
-    // is built. Anvil is configured to use chain id 1 so that the produced tx will be the same
-    // as in the `mktx_raw_unsigned` test.
+    // As chain is not provided, a query is made to the provider to get the chain id, before the
+    // tx is built. Anvil is configured to use chain id 1 so that the produced tx will
+    // be the same as in the `mktx_raw_unsigned` test.
     let (_, handle) = anvil::spawn(NodeConfig::test().with_chain_id(Some(1u64))).await;
     cmd.args([
         "mktx",
@@ -1688,7 +1904,7 @@ casttest!(mktx_raw_unsigned_no_from_missing_nonce, |_prj, cmd| {
         "--chain",
         "1",
         "--gas-limit",
-        "21000", 
+        "21000",
         "--gas-price",
         "20000000000",
         "0x742d35Cc6634C0532925a3b8D6Ac6F67C9c2b7FD",
@@ -1790,29 +2006,25 @@ casttest!(tx_to_request_json, |_prj, cmd| {
 "#]]);
 });
 
-casttest!(
-    #[ignore = "reth is currently slightly broken"]
-    tx_using_sender_and_nonce,
-    |_prj, cmd| {
-        let rpc = "https://reth-ethereum.ithaca.xyz/rpc";
-        // <https://etherscan.io/tx/0x5bcd22734cca2385dc25b2d38a3d33a640c5961bd46d390dff184c894204b594>
-        let args = vec![
-            "tx",
-            "--from",
-            "0x4648451b5F87FF8F0F7D622bD40574bb97E25980",
-            "--nonce",
-            "113642",
-            "--rpc-url",
-            rpc,
-        ];
-        cmd.args(args).assert_success().stdout_eq(str![[r#"
+casttest!(tx_using_sender_and_nonce, |_prj, cmd| {
+    let rpc = next_http_archive_rpc_url();
+    // <https://etherscan.io/tx/0x5bcd22734cca2385dc25b2d38a3d33a640c5961bd46d390dff184c894204b594>
+    let args = vec![
+        "tx",
+        "--from",
+        "0x4648451b5F87FF8F0F7D622bD40574bb97E25980",
+        "--nonce",
+        "113642",
+        "--rpc-url",
+        rpc.as_str(),
+    ];
+    cmd.args(args).assert_success().stdout_eq(str![[r#"
 
 blockHash            0x29518c1cea251b1bda5949a9b039722604ec1fb99bf9d8124cfe001c95a50bdc
 blockNumber          22287055
 from                 0x4648451b5F87FF8F0F7D622bD40574bb97E25980
 transactionIndex     230
 effectiveGasPrice    363392048
-
 accessList           []
 chainId              1
 gasLimit             350000
@@ -1829,8 +2041,7 @@ value                0
 yParity              1
 ...
 "#]]);
-    }
-);
+});
 
 // ensure receipt or code is required
 casttest!(send_requires_to, |_prj, cmd| {
@@ -1939,6 +2150,77 @@ casttest!(storage, |_prj, cmd| {
         .assert_success()
         .stdout_eq(str![[r#"
 0x0000000000000000000000000000000000000000000000000000000000000006
+
+"#]]);
+});
+
+casttest!(storage_with_valid_solc_version_1, |_prj, cmd| {
+    cmd.args([
+        "storage",
+        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+        "--solc-version",
+        "0.8.10",
+        "--rpc-url",
+        next_http_archive_rpc_url().as_str(),
+        "--etherscan-api-key",
+        next_etherscan_api_key().as_str(),
+    ])
+    .assert_success();
+});
+
+casttest!(storage_with_valid_solc_version_2, |_prj, cmd| {
+    cmd.args([
+        "storage",
+        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+        "--solc-version",
+        "0.8.23",
+        "--rpc-url",
+        next_http_archive_rpc_url().as_str(),
+        "--etherscan-api-key",
+        next_etherscan_api_key().as_str(),
+    ])
+    .assert_success();
+});
+
+casttest!(storage_with_invalid_solc_version_1, |_prj, cmd| {
+    let output = cmd
+        .args([
+            "storage",
+            "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+            "--solc-version",
+            "0.4.0",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+        ])
+        .assert_failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(
+        stderr.contains(
+            "Warning: The provided --solc-version is 0.4.0 while the minimum version for storage layouts is 0.6.5"
+        ),
+        "stderr did not contain expected warning. Full stderr:\n{stderr}"
+    );
+});
+
+casttest!(storage_with_invalid_solc_version_2, |_prj, cmd| {
+    cmd.args([
+        "storage",
+        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+        "--solc-version",
+        "0.8.2",
+        "--rpc-url",
+        next_http_archive_rpc_url().as_str(),
+        "--etherscan-api-key",
+        next_etherscan_api_key().as_str(),
+    ])
+    .assert_failure()
+    .stderr_eq(str![[r#"
+Error: Encountered invalid solc version in contracts/Create2Deployer.sol: No solc version exists that matches the version requirement: ^0.8.9
 
 "#]]);
 });
@@ -2131,14 +2413,14 @@ casttest!(storage_layout_complex_json, |_prj, cmd| {
 
 casttest!(balance, |_prj, cmd| {
     let rpc = next_http_rpc_endpoint();
-    let usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+    let dai = "0x6B175474E89094C44Da98b954EedeAC495271d0F";
 
-    let usdt_result = cmd
+    let dai_result = cmd
         .args([
             "balance",
             "0x0000000000000000000000000000000000000000",
             "--erc20",
-            usdt,
+            dai,
             "--rpc-url",
             &rpc,
         ])
@@ -2154,7 +2436,7 @@ casttest!(balance, |_prj, cmd| {
             "balance",
             "0x0000000000000000000000000000000000000000",
             "--erc721",
-            usdt,
+            dai,
             "--rpc-url",
             &rpc,
         ])
@@ -2164,8 +2446,8 @@ casttest!(balance, |_prj, cmd| {
         .trim()
         .to_string();
 
-    assert_ne!(usdt_result, "0");
-    assert_eq!(alias_result, usdt_result);
+    assert_ne!(dai_result, "0");
+    assert_eq!(alias_result, dai_result);
 });
 
 // tests that `cast interface` excludes the constructor
@@ -2424,6 +2706,114 @@ casttest!(send_eip7702, async |_prj, cmd| {
 0xef010070997970c51812dc3a010c7d01b50e0d17dc79c8
 
 "#]]);
+});
+
+casttest!(send_eip7702_multiple_auth, async |_prj, cmd| {
+    let (_api, handle) =
+        anvil::spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()))).await;
+    let endpoint = handle.http_endpoint();
+
+    // Create a pre-signed authorization using a different signer (account index 1)
+    let signer: PrivateKeySigner =
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".parse().unwrap();
+    // Anvil default chain_id is 31337
+    let auth = Authorization {
+        chain_id: U256::from(31337),
+        // Delegate to account index 2
+        address: address!("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
+        nonce: 0,
+    };
+    let signature = signer.sign_hash(&auth.signature_hash()).await.unwrap();
+    let signed_auth = auth.into_signed(signature);
+    let encoded_auth = hex::encode_prefixed(alloy_rlp::encode(&signed_auth));
+
+    // Send transaction with multiple --auth flags: one address and one pre-signed authorization
+    let output = cmd
+        .args([
+            "send",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            "--auth",
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+            "--auth",
+            &encoded_auth,
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &endpoint,
+            "--gas-limit",
+            "100000",
+            "--json",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    // Extract transaction hash from JSON output
+    let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let tx_hash = json["transactionHash"].as_str().unwrap();
+
+    // Use cast tx to verify multiple authorizations were included
+    let tx_output = cmd
+        .cast_fuse()
+        .args(["tx", tx_hash, "--rpc-url", &endpoint, "--json"])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    let tx_json: serde_json::Value = serde_json::from_str(&tx_output).unwrap();
+    let auth_list = tx_json["authorizationList"].as_array().unwrap();
+
+    // Verify we have 2 authorizations
+    assert_eq!(auth_list.len(), 2, "Expected 2 authorizations in the transaction");
+});
+
+// Test that multiple address-based authorizations are rejected
+casttest!(send_eip7702_multiple_address_auth_rejected, async |_prj, cmd| {
+    let (_api, handle) =
+        anvil::spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()))).await;
+    let endpoint = handle.http_endpoint();
+
+    cmd.args([
+        "send",
+        "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        "--auth",
+        "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "--auth",
+        "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+        "--private-key",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "--rpc-url",
+        &endpoint,
+    ]);
+    cmd.assert_failure().stderr_eq(str![[r#"
+Error: Multiple address-based authorizations provided. Only one address can be specified; use pre-signed authorizations (hex-encoded) for multiple authorizations.
+
+"#]]);
+});
+
+casttest!(send_sync, async |_prj, cmd| {
+    let (_api, handle) = anvil::spawn(NodeConfig::test()).await;
+    let endpoint = handle.http_endpoint();
+
+    let output = cmd
+        .args([
+            "send",
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+            "--value",
+            "1",
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &endpoint,
+            "--sync",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    assert!(output.contains("transactionHash"));
+    assert!(output.contains("blockNumber"));
+    assert!(output.contains("gasUsed"));
 });
 
 casttest!(hash_message, |_prj, cmd| {
@@ -2697,6 +3087,7 @@ forgetest_async!(show_state_changes_in_traces, |prj, cmd| {
     let (api, handle) = anvil::spawn(NodeConfig::test()).await;
 
     foundry_test_utils::util::initialize(prj.root());
+    prj.initialize_default_contracts();
     // Deploy counter contract.
     cmd.args([
         "script",
@@ -2819,9 +3210,9 @@ contract CounterInExternalLibScript is Script {
         .unwrap()
         .tx_hash();
 
-    // Cache project selectors.
+    // Build and cache project selectors.
+    cmd.forge_fuse().args(["build"]).assert_success();
     cmd.forge_fuse().args(["selectors", "cache"]).assert_success();
-
     // Assert cast with local artifacts can decode external lib signature.
     cmd.cast_fuse()
         .args(["run", format!("{tx_hash}").as_str(), "--rpc-url", &handle.http_endpoint()])
@@ -2865,6 +3256,7 @@ forgetest_async!(cast_call_disable_labels, |prj, cmd| {
     let (_, handle) = anvil::spawn(NodeConfig::test()).await;
 
     foundry_test_utils::util::initialize(prj.root());
+    prj.initialize_default_contracts();
     prj.add_source(
         "Counter",
         r#"
@@ -2966,6 +3358,7 @@ forgetest_async!(cast_call_custom_override, |prj, cmd| {
     let (_, handle) = anvil::spawn(NodeConfig::test()).await;
 
     foundry_test_utils::util::initialize(prj.root());
+    prj.initialize_default_contracts();
     prj.add_source(
         "Counter",
         r#"
@@ -3299,35 +3692,36 @@ contract WETH9 {
 
 // <https://github.com/foundry-rs/foundry/issues/10553>
 // <https://basescan.org/tx/0x17b2de59ebd7dfd2452a3638a16737b6b65ae816c1c5571631dc0d80b63c41de>
-casttest!(odyssey_can_run_p256_precompile, |_prj, cmd| {
+casttest!(osaka_can_run_p256_precompile, |_prj, cmd| {
     cmd.args([
         "run",
         "0x17b2de59ebd7dfd2452a3638a16737b6b65ae816c1c5571631dc0d80b63c41de",
         "--rpc-url",
         next_rpc_endpoint(NamedChain::Base).as_str(),
         "--quick",
-        "--odyssey",
+        "--evm-version",
+        "osaka",
     ])
     .assert_success()
     .stdout_eq(str![[r#"
 Traces:
-  [88087] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::execute(0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000a12384c5e52fd646e7bc7f6b3b33a605651f566e000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f0000000000000000000000000000000000000000000000000000000000036cd000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000327a25ad5cfe5c4d4339c1a4267d4a83e8c93312000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000005a00000000000000000000000000b55b053230e4effb6609de652fca73fd1c2980400000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000221000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
+  [91537] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::execute(0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000a12384c5e52fd646e7bc7f6b3b33a605651f566e000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f0000000000000000000000000000000000000000000000000000000000036cd000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000327a25ad5cfe5c4d4339c1a4267d4a83e8c93312000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000005a00000000000000000000000000b55b053230e4effb6609de652fca73fd1c2980400000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000221000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
     ├─ [2241] 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E::fallback(00) [staticcall]
     │   └─ ← [Return] 0x0000000000000000000000000b55b053230e4effb6609de652fca73fd1c29804
     ├─ [9750] 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913::balanceOf(0xA12384c5E52fD646E7BC7F6B3b33A605651F566E) [staticcall]
     │   ├─ [2553] 0x2Ce6311ddAE708829bc0784C967b7d77D19FD779::balanceOf(0xA12384c5E52fD646E7BC7F6B3b33A605651F566E) [delegatecall]
     │   │   └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000f3b9
     │   └─ ← [Return] 0x000000000000000000000000000000000000000000000000000000000000f3b9
-    ├─ [61992] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::00000000(00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000a12384c5e52fd646e7bc7f6b3b33a605651f566e000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f0000000000000000000000000000000000000000000000000000000000036cd000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000327a25ad5cfe5c4d4339c1a4267d4a83e8c93312000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000005a00000000000000000000000000b55b053230e4effb6609de652fca73fd1c2980400000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000221000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
-    │   ├─ [21620] 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E::unwrapAndValidateSignature(0x290a4c4039f102eceba2147e1fcc46f994a46d1229faf43ffff26a058e7378ff, 0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00) [staticcall]
-    │   │   ├─ [18617] 0x0B55b053230E4EFFb6609de652fCa73Fd1C29804::unwrapAndValidateSignature(0x290a4c4039f102eceba2147e1fcc46f994a46d1229faf43ffff26a058e7378ff, 0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00) [delegatecall]
+    ├─ [65442] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::fulfillBasicOrder_efficient_6GL6yc()
+    │   ├─ [25070] 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E::unwrapAndValidateSignature(0x290a4c4039f102eceba2147e1fcc46f994a46d1229faf43ffff26a058e7378ff, 0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00) [staticcall]
+    │   │   ├─ [22067] 0x0B55b053230E4EFFb6609de652fCa73Fd1C29804::unwrapAndValidateSignature(0x290a4c4039f102eceba2147e1fcc46f994a46d1229faf43ffff26a058e7378ff, 0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00) [delegatecall]
     │   │   │   ├─ [2369] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::pauseFlag() [staticcall]
     │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000000
     │   │   │   ├─ [120] PRECOMPILES::sha256(0x7b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d) [staticcall]
     │   │   │   │   └─ ← [Return] 0xc13089327d3c20c0ce35f2f058c423de29977e6950e406c095e366a8fabd463f
     │   │   │   ├─ [96] PRECOMPILES::sha256(0x424242424242424242424242424242424242424242424242424242424242424201000000c13089327d3c20c0ce35f2f058c423de29977e6950e406c095e366a8fabd463f) [staticcall]
     │   │   │   │   └─ ← [Return] 0xc544bd9a4ea526dda3a008f43c21b6f0be3031b1ff71832b9876915dc91deea0
-    │   │   │   ├─ [3450] 0x0000000000000000000000000000000000000100::c544bd9a(4ea526dda3a008f43c21b6f0be3031b1ff71832b9876915dc91deea0dd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f925bf54fa13f88658092efa36c51b1e3c4db31d3afb92812fb852dac7cf9614bc479bf5da7241d9c4ab1b431b57ec3369587b4c831d7a564438990da053708c3289) [staticcall]
+    │   │   │   ├─ [6900] 0x0000000000000000000000000000000000000100::c544bd9a(4ea526dda3a008f43c21b6f0be3031b1ff71832b9876915dc91deea0dd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f925bf54fa13f88658092efa36c51b1e3c4db31d3afb92812fb852dac7cf9614bc479bf5da7241d9c4ab1b431b57ec3369587b4c831d7a564438990da053708c3289) [staticcall]
     │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
     │   │   │   └─ ← [Return] 0x00000000000000000000000000000000000000000000000000000000000000011bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b
     │   │   └─ ← [Return] 0x00000000000000000000000000000000000000000000000000000000000000011bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b
@@ -3352,7 +3746,7 @@ Traces:
     │   │   ├─ [553] 0x2Ce6311ddAE708829bc0784C967b7d77D19FD779::balanceOf(0x327a25aD5Cfe5c4D4339C1A4267D4a83E8c93312) [delegatecall]
     │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000009c9a
     │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000009c9a
-    │   ├─ [5675] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::00000001(00000000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b290a4c4039f102eceba2147e1fcc46f994a46d1229faf43ffff26a058e7378ff0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000a12384c5e52fd646e7bc7f6b3b33a605651f566e000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f0000000000000000000000000000000000000000000000000000000000036cd000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000327a25ad5cfe5c4d4339c1a4267d4a83e8c93312000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000005a00000000000000000000000000b55b053230e4effb6609de652fca73fd1c2980400000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000221000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
+    │   ├─ [5675] 0xc2FF493F28e894742b968A7DB5D3F21F0aD80C6c::multicallN2M_001Taw5z()
     │   │   ├─ [4148] 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E::execute(0x0100000000007821000100000000000000000000000000000000000000000000, 0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000201bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b)
     │   │   │   ├─ [3693] 0x0B55b053230E4EFFb6609de652fCa73Fd1C29804::execute(0x0100000000007821000100000000000000000000000000000000000000000000, 0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000201bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b) [delegatecall]
     │   │   │   │   ├─ [435] 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E::fallback()
@@ -3520,12 +3914,12 @@ forgetest_async!(cast_send_create_with_constructor_args, |prj, cmd| {
 contract ConstructorContract {
     uint256 public value;
     string public name;
-    
+
     constructor(uint256 _value, string memory _name) {
         value = _value;
         name = _name;
     }
-    
+
     function getValue() public view returns (uint256) {
         return value;
     }
@@ -3599,7 +3993,7 @@ casttest!(cast_estimate_create_with_constructor_args, |prj, cmd| {
 contract EstimateContract {
     uint256 public value;
     string public name;
-    
+
     constructor(uint256 _value, string memory _name) {
         value = _value;
         name = _name;
@@ -3701,13 +4095,13 @@ contract ComplexContract {
     address public owner;
     uint256[] public values;
     bool public active;
-    
+
     constructor(address _owner, uint256[] memory _values, bool _active) {
         owner = _owner;
         values = _values;
         active = _active;
     }
-    
+
     function getValuesLength() public view returns (uint256) {
         return values.length;
     }
@@ -3958,6 +4352,8 @@ casttest!(cast_access_list_negative_numbers, |_prj, cmd| {
         "0x9999999999999999999999999999999999999999",
         "adjustPosition(int128)",
         "-33333",
+        "--gas-limit",
+        "1000000",
         "--rpc-url",
         rpc.as_str(),
     ])
@@ -4011,6 +4407,203 @@ casttest!(cast_call_can_override_several_state_diff, |_prj, cmd| {
 ...
   [..] 0x5EA1d9A6dDC3A0329378a327746D71A2019eC332::isOwner(0x2066901073a33ba2500274704aB04763875cF210)
 ...
+"#]]);
+});
+
+casttest!(correct_json_serialization, |_prj, cmd| {
+    let rpc = next_http_archive_rpc_url();
+    // cast calldata "decimals()"
+    let calldata = "0x313ce567";
+    let tokens = [
+        "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT
+        "0x6b175474e89094c44da98b954eedeac495271d0f", // DAI
+        "0x6b175474e89094c44da98b954eedeac495271d0f", // WETH
+    ];
+    let calldata_args = format!(
+        "[{}]",
+        tokens
+            .iter()
+            .map(|token| format!("({token},false,{calldata})"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let args = vec![
+        "call",
+        "--json",
+        "--rpc-url",
+        rpc.as_str(),
+        "0xcA11bde05977b3631167028862bE2a173976CA11",
+        "aggregate3((address,bool,bytes)[])((bool,bytes)[])",
+        &calldata_args,
+    ];
+    let expected_output = json!([[
+        [true, "0x0000000000000000000000000000000000000000000000000000000000000006"],
+        [true, "0x0000000000000000000000000000000000000000000000000000000000000012"],
+        [true, "0x0000000000000000000000000000000000000000000000000000000000000012"]
+    ]]);
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&cmd.args(args).assert_success().get_output().stdout)
+            .expect("not valid json");
+    assert_eq!(decoded, expected_output);
+});
+
+// Test cast abi-encode-event with indexed parameters
+casttest!(abi_encode_event_indexed, |_prj, cmd| {
+    cmd.args([
+        "abi-encode-event",
+        "Transfer(address indexed from, address indexed to, uint256 value)",
+        "0x1234567890123456789012345678901234567890",
+        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "1000",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+[topic0]: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+[topic1]: 0x0000000000000000000000001234567890123456789012345678901234567890
+[topic2]: 0x000000000000000000000000abcdefabcdefabcdefabcdefabcdefabcdefabcd
+[data]: 0x00000000000000000000000000000000000000000000000000000000000003e8
+
+"#]]);
+});
+
+// Test cast abi-encode-event with no indexed parameters
+casttest!(abi_encode_event_no_indexed, |_prj, cmd| {
+    cmd.args([
+        "abi-encode-event",
+        "Approval(address owner, address spender, uint256 value)",
+        "0x1234567890123456789012345678901234567890",
+        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "2000"
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+[topic0]: 0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925
+[data]: 0x0000000000000000000000001234567890123456789012345678901234567890000000000000000000000000abcdefabcdefabcdefabcdefabcdefabcdefabcd00000000000000000000000000000000000000000000000000000000000007d0
+
+"#]]);
+});
+
+// Test cast abi-encode-event with dynamic indexed parameter (string)
+casttest!(abi_encode_event_dynamic_indexed, |_prj, cmd| {
+    cmd.args(["abi-encode-event", "Log(string indexed message, uint256 data)", "hello", "42"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[topic0]: 0xdd970dd9b5bfe707922155b058a407655cb18288b807e2216442bca8ad83d6b5
+[topic1]: 0x984002fcc0ca639f96622add24c2edd2fe72c65e71ca3faa243e091e0bc7cdab
+[data]: 0x000000000000000000000000000000000000000000000000000000000000002a
+
+"#]]);
+});
+
+// Test cast run Celo transfer with precompiles.
+casttest!(
+    #[ignore = "flaky celo rpc url"]
+    run_celo_with_precompiles,
+    |_prj, cmd| {
+        let rpc = next_rpc_endpoint(NamedChain::Celo);
+        cmd.args([
+        "run",
+        "0xa652b9f41bb1a617ea6b2835b3316e79f0f21b8264e7bcd20e57c4092a70a0f6",
+        "--quick",
+        "--rpc-url",
+        rpc.as_str(),
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+Traces:
+  [17776] 0x471EcE3750Da237f93B8E339c536989b8978a438::transfer(0xD2eB2d37d238Caeff39CFA36A013299C6DbAC56A, 138000000000000000 [1.38e17])
+    ├─ [12370] 0xFeA1B35f1D5f2A58532a70e7A32e6F2D3Bc4F7B1::transfer(0xD2eB2d37d238Caeff39CFA36A013299C6DbAC56A, 138000000000000000 [1.38e17]) [delegatecall]
+    │   ├─ [9000] CELO_TRANSFER_PRECOMPILE::00000000(00000000000000008106680ba7095cfd8f4351a8b7041da3060afb83000000000000000000000000d2eb2d37d238caeff39cfa36a013299c6dbac56a00000000000000000000000000000000000000000000000001ea4644d3010000)
+    │   │   └─ ← [Return]
+    │   ├─ emit Transfer(param0: 0x8106680Ba7095CfD8F4351a8B7041da3060Afb83, param1: 0xD2eB2d37d238Caeff39CFA36A013299C6DbAC56A, param2: 138000000000000000 [1.38e17])
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+    }
+);
+casttest!(keccak_stdin_bytes, |_prj, cmd| {
+    cmd.args(["keccak"]).stdin("0x12").assert_success().stdout_eq(str![[r#"
+0x5fa2358263196dbbf23d1ca7a509451f7a2f64c15837bfbb81298b1e3e24e4fa
+
+"#]]);
+});
+
+casttest!(keccak_stdin_bytes_with_newline, |_prj, cmd| {
+    cmd.args(["keccak"]).stdin("0x12\n").assert_success().stdout_eq(str![[r#"
+0x5fa2358263196dbbf23d1ca7a509451f7a2f64c15837bfbb81298b1e3e24e4fa
+
+"#]]);
+});
+
+// Test cast send with raw --data flag using encoded calldata
+forgetest_async!(cast_send_with_data, |prj, cmd| {
+    let (api, handle) = anvil::spawn(NodeConfig::test()).await;
+
+    foundry_test_utils::util::initialize(prj.root());
+    prj.initialize_default_contracts();
+
+    // Deploy counter contract
+    cmd.args([
+        "script",
+        "--private-key",
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "--rpc-url",
+        &handle.http_endpoint(),
+        "--broadcast",
+        "CounterScript",
+    ])
+    .assert_success();
+
+    // setNumber(111) encoded: selector 0x3fb5c1cb + uint256(111)
+    let calldata = "0x3fb5c1cb000000000000000000000000000000000000000000000000000000000000006f";
+
+    // Send tx using --data instead of sig+args
+    cmd.cast_fuse()
+        .args([
+            "send",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "--data",
+            calldata,
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success();
+
+    // Verify via trace that setNumber(111) was called
+    let tx_hash = api
+        .transaction_by_block_number_and_index(BlockNumberOrTag::Latest, Index::from(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .tx_hash();
+
+    cmd.cast_fuse()
+        .args([
+            "run",
+            format!("{tx_hash}").as_str(),
+            "-vvvvv",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Executing previous transactions from the block.
+Traces:
+  [..] 0x5FbDB2315678afecb367f032d93F642f64180aa3::setNumber(111)
+    ├─  storage changes:
+    │   @ 0: 0 → 111
+    └─ ← [Stop]
+
+
+Transaction successfully executed.
+[GAS]
 
 "#]]);
 });
