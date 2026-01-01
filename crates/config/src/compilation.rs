@@ -101,7 +101,7 @@ where
     if version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Err(serde::de::Error::custom(format!(
             "Invalid version format '{opt_string}' in compilation_restrictions. \
-             Bare version numbers are ambiguous because Cargo interprets them as caret requirements (e.g. '^{version}'). \
+             Bare version numbers are ambiguous and default to caret requirements (e.g. '^{version}'). \
              Use an explicit constraint such as '={version}' for an exact version or '>={version}' for a minimum version."
         )));
     }
