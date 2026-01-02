@@ -231,7 +231,7 @@ impl RunArgs {
         )?;
 
         if let Some(parent_beacon_block_root) = parent_beacon_block_root {
-            let timestamp: u64 = env.evm_env.block_env.timestamp.try_into().unwrap_or(0);
+            let timestamp: u64 = env.evm_env.block_env.timestamp.try_into().wrap_err("failed to convert block timestamp to u64")?;
             executor.process_beacon_block_root(timestamp, parent_beacon_block_root)?;
         }
 
