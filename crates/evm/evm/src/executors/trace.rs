@@ -100,7 +100,7 @@ impl TracingExecutor {
         beacon_root: FixedBytes<32>,
     ) -> eyre::Result<()> {
         const BEACON_ROOTS_ADDRESS: Address = address!("000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
-        const HISTORY_BUFFER_LENGTH: u64 = 8191;
+        const HISTORY_BUFFER_LENGTH: u64 = 8192;
 
         let timestamp_index = block_timestamp % HISTORY_BUFFER_LENGTH;
         let root_index = timestamp_index + HISTORY_BUFFER_LENGTH;
