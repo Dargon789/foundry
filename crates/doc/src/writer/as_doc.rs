@@ -1,12 +1,11 @@
 use crate::{
-    CONTRACT_INHERITANCE_ID, CommentTag, Comments, CommentsRef, DEPLOYMENTS_ID, Document,
-    GIT_SOURCE_ID, INHERITDOC_ID, Markdown, PreprocessorOutput,
-    document::{DocumentContent, read_context},
-    helpers::function_signature,
+    document::{read_context, DocumentContent},
     parser::ParseSource,
-    solang_ext::SafeUnwrap,
     writer::BufWriter,
+    CommentTag, Comments, CommentsRef, Document, Markdown, PreprocessorOutput,
+    CONTRACT_INHERITANCE_ID, DEPLOYMENTS_ID, GIT_SOURCE_ID, INHERITDOC_ID,
 };
+use forge_fmt::solang_ext::SafeUnwrap;
 use itertools::Itertools;
 use solang_parser::pt::{Base, FunctionDefinition};
 use std::path::Path;
@@ -63,7 +62,7 @@ impl AsDoc for CommentsRef<'_> {
         // Write dev tags
         let devs = self.include_tag(CommentTag::Dev);
         for d in devs.iter() {
-            writer.write_dev_content(&d.value)?;
+            writer.write_italic(&d.value)?;
             writer.writeln()?;
         }
 
@@ -107,7 +106,16 @@ impl AsDoc for Document {
 
                 for item in items {
                     let func = item.as_function().unwrap();
-                    let heading = function_signature(func).replace(',', ", ");
+                    let mut heading = item.source.ident();
+                    if !func.params.is_empty() {
+                        heading.push_str(&format!(
+                            "({})",
+                            func.params
+                                .iter()
+                                .map(|p| p.1.as_ref().map(|p| p.ty.to_string()).unwrap_or_default())
+                                .join(", ")
+                        ));
+                    }
                     writer.write_heading(&heading)?;
                     writer.write_section(&item.comments, &item.code)?;
                 }
@@ -226,7 +234,15 @@ impl AsDoc for Document {
                             writer.write_subtitle("Enums")?;
                             enums.into_iter().try_for_each(|(item, comments, code)| {
                                 writer.write_heading(&item.name.safe_unwrap().name)?;
-                                writer.write_section(comments, code)?;
+
+                                let filtered_comments: Comments = (*comments)
+                                    .iter()
+                                    .filter(|c| c.tag != CommentTag::Custom("variant".to_string()))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .into();
+
+                                writer.write_section(&filtered_comments, code)?;
                                 writer.try_write_variant_table(item, comments)
                             })?;
                         }
@@ -292,10 +308,9 @@ impl Document {
         comments: &Comments,
         code: &str,
     ) -> Result<(), std::fmt::Error> {
-        let func_sign = function_signature(func);
         let func_name = func.name.as_ref().map_or(func.ty.to_string(), |n| n.name.to_owned());
         let comments =
-            comments.merge_inheritdoc(&func_sign, read_context!(self, INHERITDOC_ID, Inheritdoc));
+            comments.merge_inheritdoc(&func_name, read_context!(self, INHERITDOC_ID, Inheritdoc));
 
         // Write function name
         writer.write_heading(&func_name)?;
