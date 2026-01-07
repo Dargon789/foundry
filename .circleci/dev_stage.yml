@@ -6,11 +6,6 @@ executors:
   my-custom-executor:
     docker:
       - image: cimg/base:stable
-        auth:
-          # ensure you have first added these secrets
-           # visit app.circleci.com/settings/project/github/Dargon789/foundry/environment-variables
-          username: $DOCKER_HUB_USER
-          password: $DOCKER_HUB_PASSWORD
 jobs:
   web3-defi-game-project-:
 
