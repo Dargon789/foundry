@@ -1,14 +1,15 @@
 use crate::tx::{self, CastTxBuilder};
+use alloy_eips::Encodable2718;
 use alloy_ens::NameOrAddress;
-use alloy_network::{eip2718::Encodable2718, EthereumWallet, TransactionBuilder};
-use alloy_primitives::hex;
+use alloy_network::{EthereumWallet, NetworkWallet, TransactionBuilder};
+use alloy_primitives::{Address, hex};
 use alloy_provider::Provider;
 use alloy_signer::Signer;
 use clap::Parser;
-use eyre::{OptionExt, Result};
+use eyre::Result;
 use foundry_cli::{
     opts::{EthereumOpts, TransactionOpts},
-    utils::{get_provider, LoadConfig},
+    utils::{LoadConfig, get_provider},
 };
 use std::{path::PathBuf, str::FromStr};
 
@@ -25,6 +26,7 @@ pub struct MakeTxArgs {
     sig: Option<String>,
 
     /// The arguments of the function to call.
+    #[arg(allow_negative_numbers = true)]
     args: Vec<String>,
 
     #[command(subcommand)]
@@ -49,7 +51,7 @@ pub struct MakeTxArgs {
     /// Generate a raw RLP-encoded unsigned transaction.
     ///
     /// Relaxes the wallet requirement.
-    #[arg(long, requires = "from")]
+    #[arg(long)]
     raw_unsigned: bool,
 
     /// Call `eth_signTransaction` using the `--from` argument or $ETH_FROM as sender
@@ -69,6 +71,7 @@ pub enum MakeTxSubcommands {
         sig: Option<String>,
 
         /// The constructor arguments.
+        #[arg(allow_negative_numbers = true)]
         args: Vec<String>,
     },
 }
@@ -96,7 +99,7 @@ impl MakeTxArgs {
 
         let provider = get_provider(&config)?;
 
-        let tx_builder = CastTxBuilder::new(&provider, tx, &config)
+        let tx_builder = CastTxBuilder::new(&provider, tx.clone(), &config)
             .await?
             .with_to(to)
             .await?
@@ -106,18 +109,30 @@ impl MakeTxArgs {
 
         if raw_unsigned {
             // Build unsigned raw tx
-            let from = eth.wallet.from.ok_or_eyre("missing `--from` address")?;
+            // Check if nonce is provided when --from is not specified
+            // See: <https://github.com/foundry-rs/foundry/issues/11110>
+            if eth.wallet.from.is_none() && tx.nonce.is_none() {
+                eyre::bail!(
+                    "Missing required parameters for raw unsigned transaction. When --from is not provided, you must specify: --nonce"
+                );
+            }
+
+            // Use zero address as placeholder for unsigned transactions
+            let from = eth.wallet.from.unwrap_or(Address::ZERO);
+
             let raw_tx = tx_builder.build_unsigned_raw(from).await?;
 
             sh_println!("{raw_tx}")?;
             return Ok(());
         }
 
+        let is_tempo = tx_builder.is_tempo();
+
         if ethsign {
             // Use "eth_signTransaction" to sign the transaction only works if the node/RPC has
             // unlocked accounts.
             let (tx, _) = tx_builder.build(config.sender).await?;
-            let signed_tx = provider.sign_transaction(tx).await?;
+            let signed_tx = provider.sign_transaction(tx.into_inner()).await?;
 
             sh_println!("{signed_tx}")?;
             return Ok(());
@@ -130,9 +145,29 @@ impl MakeTxArgs {
 
         tx::validate_from_address(eth.wallet.from, from)?;
 
+        // Handle Tempo transactions separately
+        // TODO(onbjerg): All of this is a side effect of a few things, most notably that we do
+        // not use `FoundryNetwork` and `FoundryTransactionRequest` everywhere, which is
+        // downstream of the fact that we use `EthereumWallet` everywhere.
+        if is_tempo {
+            let (ftx, _) = tx_builder.build(&signer).await?;
+
+            // Sign using NetworkWallet<FoundryNetwork>
+            let signed_tx = signer.sign_request(ftx).await?;
+
+            // Encode as 2718
+            let mut raw_tx = Vec::with_capacity(signed_tx.encode_2718_len());
+            signed_tx.encode_2718(&mut raw_tx);
+
+            let signed_tx_hex = hex::encode(&raw_tx);
+            sh_println!("0x{signed_tx_hex}")?;
+
+            return Ok(());
+        }
+
         let (tx, _) = tx_builder.build(&signer).await?;
 
-        let tx = tx.build(&EthereumWallet::new(signer)).await?;
+        let tx = tx.into_inner().build(&EthereumWallet::new(signer)).await?;
 
         let signed_tx = hex::encode(tx.encoded_2718());
         sh_println!("0x{signed_tx}")?;
