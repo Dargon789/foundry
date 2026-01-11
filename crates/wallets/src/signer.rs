@@ -333,7 +333,7 @@ impl TxSigner<Signature> for WalletSigner {
         &self,
         tx: &mut dyn SignableTransaction<Signature>,
     ) -> alloy_signer::Result<Signature> {
-        delegate!(self, inner => inner.sign_transaction(tx)).await
+        delegate!(self, inner => TxSigner::sign_transaction(inner, tx)).await
     }
 }
 
