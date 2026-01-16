@@ -1,4 +1,5 @@
 import * as NodePath from 'node:path'
+import { URL } from 'node:url'
 
 /**
  * @typedef {'amd64' | 'arm64'} Arch
@@ -33,11 +34,36 @@ export function resolveTargetTool(raw = process.env.TARGET_TOOL || process.argv[
 export function getRegistryUrl() {
   // Prefer npm's configured registry (works with Verdaccio and custom registries)
   // Fallback to REGISTRY_URL for tests/dev, then npmjs
-  return (
+  const raw =
     process.env.npm_config_registry
     || process.env.REGISTRY_URL
     || 'https://registry.npmjs.org'
-  )
+
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new Error(`Invalid registry URL: "${raw}"`)
+  }
+
+  // Enforce secure scheme
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`Insecure registry URL scheme "${parsed.protocol}". Only "https:" is allowed.`)
+  }
+
+  // Basic SSRF mitigation: disallow obvious loopback hosts
+  const hostname = parsed.hostname.toLowerCase()
+  if (
+    hostname === 'localhost'
+    || hostname === '127.0.0.1'
+    || hostname === '::1'
+  ) {
+    throw new Error(`Registry URL host "${parsed.hostname}" is not allowed.`)
+  }
+
+  // Normalize to a consistent base URL without trailing slash
+  const base = parsed.origin + parsed.pathname
+  return base.replace(/\/+$/, '')
 }
 
 /**
