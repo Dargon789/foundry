@@ -5,7 +5,7 @@ import { URL } from 'node:url'
  * @typedef {'amd64' | 'arm64'} Arch
  * @typedef {'linux' | 'darwin' | 'win32'} Platform
  * @typedef {'forge' | 'cast' | 'anvil' | 'chisel'} Tool
- * @typedef {'debug' | 'release' | 'maxperf'} Profile
+ * @typedef {'debug' | 'release' | 'maxperf' | 'dist'} Profile
  */
 
 /** @type {readonly Tool[]} */
