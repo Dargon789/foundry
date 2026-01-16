@@ -119,12 +119,22 @@ impl<'a> ContractsByArtifactBuilder<'a> {
         Self { artifacts: artifacts.into_iter().collect(), storage_layouts: BTreeMap::new() }
     }
 
-    /// Adds storage layouts from `ProjectCompileOutput` to known artifacts.
-    pub fn with_storage_layouts(mut self, output: ProjectCompileOutput) -> Self {
-        self.storage_layouts = output
-            .into_artifacts()
-            .filter_map(|(id, artifact)| artifact.storage_layout.map(|layout| (id, layout)))
-            .collect();
+    /// Add storage layouts from the given `ProjectCompileOutput` to known artifacts.
+    pub fn with_output(self, output: &ProjectCompileOutput, base: &Path) -> Self {
+        self.with_storage_layouts(output.artifact_ids().filter_map(|(id, artifact)| {
+            artifact
+                .storage_layout
+                .as_ref()
+                .map(|layout| (id.with_stripped_file_prefixes(base), layout.clone()))
+        }))
+    }
+
+    /// Add storage layouts.
+    pub fn with_storage_layouts(
+        mut self,
+        layouts: impl IntoIterator<Item = (ArtifactId, StorageLayout)>,
+    ) -> Self {
+        self.storage_layouts.extend(layouts);
         self
     }
 
@@ -229,7 +239,7 @@ impl ContractsByArtifact {
                     None
                 }
             })
-            .min_by(|(score1, _), (score2, _)| score1.total_cmp(score2))
+            .min_by(|(score1, _), (score2, _)| score1.partial_cmp(score2).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(_, data)| data)
     }
 
@@ -383,15 +393,6 @@ impl ContractsByArtifact {
         }
 
         Ok(contracts.first().copied())
-    }
-
-    /// Finds abi for contract which has the same contract name or identifier as `id`.
-    pub fn find_abi_by_name_or_identifier(&self, id: &str) -> Option<JsonAbi> {
-        self.iter()
-            .find(|(artifact, _)| {
-                artifact.name.split(".").next().unwrap() == id || artifact.identifier() == id
-            })
-            .map(|(_, contract)| contract.abi.clone())
     }
 
     /// Finds abi by name or source path

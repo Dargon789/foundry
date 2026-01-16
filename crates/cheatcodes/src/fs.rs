@@ -12,7 +12,10 @@ use dialoguer::{Input, Password};
 use forge_script_sequence::{BroadcastReader, TransactionWithMetadata};
 use foundry_common::fs;
 use foundry_config::fs_permissions::FsAccessKind;
-use revm::{context::CreateScheme, interpreter::CreateInputs};
+use revm::{
+    context::{CreateScheme, JournalTr},
+    interpreter::CreateInputs,
+};
 use revm_inspectors::tracing::types::CallKind;
 use semver::Version;
 use std::{
@@ -359,6 +362,12 @@ fn deploy_code(
     salt: Option<U256>,
 ) -> Result {
     let mut bytecode = get_artifact_code(ccx.state, path, false)?.to_vec();
+
+    // If active broadcast then set flag to deploy from code.
+    if let Some(broadcast) = &mut ccx.state.broadcast {
+        broadcast.deploy_from_code = true;
+    }
+
     if let Some(args) = constructor_args {
         bytecode.extend_from_slice(args);
     }
@@ -366,9 +375,15 @@ fn deploy_code(
     let scheme =
         if let Some(salt) = salt { CreateScheme::Create2 { salt } } else { CreateScheme::Create };
 
+    // If prank active at current depth, then use it as caller for create input.
+    let caller = ccx
+        .state
+        .get_prank(ccx.ecx.journaled_state.depth())
+        .map_or(ccx.caller, |prank| prank.new_caller);
+
     let outcome = executor.exec_create(
         CreateInputs {
-            caller: ccx.caller,
+            caller,
             scheme,
             value: value.unwrap_or(U256::ZERO),
             init_code: bytecode.into(),
@@ -386,7 +401,7 @@ fn deploy_code(
     Ok(address.abi_encode())
 }
 
-/// Returns the path to the json artifact depending on the input
+/// Returns the bytecode from a JSON artifact file.
 ///
 /// Can parse following input formats:
 /// - `path/to/artifact.json`
@@ -396,6 +411,10 @@ fn deploy_code(
 /// - `path/to/contract.sol:0.8.23`
 /// - `ContractName`
 /// - `ContractName:0.8.23`
+///
+/// This function is safe to use with contracts that have library dependencies.
+/// `alloy_json_abi::ContractObject` validates bytecode during JSON parsing and will
+/// reject artifacts with unlinked library placeholders.
 fn get_artifact_code(state: &Cheatcodes, path: &str, deployed: bool) -> Result<Bytes> {
     let path = if path.ends_with(".json") {
         PathBuf::from(path)
@@ -458,63 +477,76 @@ fn get_artifact_code(state: &Cheatcodes, path: &str, deployed: bool) -> Result<B
                 .collect::<Vec<_>>();
 
             let artifact = match &filtered[..] {
-                [] => Err(fmt_err!("no matching artifact found")),
-                [artifact] => Ok(*artifact),
+                [] => None,
+                [artifact] => Some(Ok(*artifact)),
                 filtered => {
                     let mut filtered = filtered.to_vec();
                     // If we know the current script/test contract solc version, try to filter by it
-                    state
-                        .config
-                        .running_artifact
-                        .as_ref()
-                        .and_then(|running| {
-                            // Firstly filter by version
-                            filtered.retain(|(id, _)| id.version == running.version);
+                    Some(
+                        state
+                            .config
+                            .running_artifact
+                            .as_ref()
+                            .and_then(|running| {
+                                // Firstly filter by version
+                                filtered.retain(|(id, _)| id.version == running.version);
 
-                            // Return artifact if only one matched
-                            if filtered.len() == 1 {
-                                return Some(filtered[0]);
-                            }
+                                // Return artifact if only one matched
+                                if filtered.len() == 1 {
+                                    return Some(filtered[0]);
+                                }
 
-                            // Try filtering by profile as well
-                            filtered.retain(|(id, _)| id.profile == running.profile);
+                                // Try filtering by profile as well
+                                filtered.retain(|(id, _)| id.profile == running.profile);
 
-                            if filtered.len() == 1 { Some(filtered[0]) } else { None }
-                        })
-                        .ok_or_else(|| fmt_err!("multiple matching artifacts found"))
+                                if filtered.len() == 1 { Some(filtered[0]) } else { None }
+                            })
+                            .ok_or_else(|| fmt_err!("multiple matching artifacts found")),
+                    )
                 }
-            }?;
-
-            let maybe_bytecode = if deployed {
-                artifact.1.deployed_bytecode().cloned()
-            } else {
-                artifact.1.bytecode().cloned()
             };
 
-            return maybe_bytecode
-                .ok_or_else(|| fmt_err!("no bytecode for contract; is it abstract or unlinked?"));
-        } else {
-            let path_in_artifacts =
-                match (file.map(|f| f.to_string_lossy().to_string()), contract_name) {
-                    (Some(file), Some(contract_name)) => {
-                        PathBuf::from(format!("{file}/{contract_name}.json"))
-                    }
-                    (None, Some(contract_name)) => {
-                        PathBuf::from(format!("{contract_name}.sol/{contract_name}.json"))
-                    }
-                    (Some(file), None) => {
-                        let name = file.replace(".sol", "");
-                        PathBuf::from(format!("{file}/{name}.json"))
-                    }
-                    _ => bail!("invalid artifact path"),
+            if let Some(artifact) = artifact {
+                let artifact = artifact?;
+                let maybe_bytecode = if deployed {
+                    artifact.1.deployed_bytecode().cloned()
+                } else {
+                    artifact.1.bytecode().cloned()
                 };
 
-            state.config.paths.artifacts.join(path_in_artifacts)
+                return maybe_bytecode.ok_or_else(|| {
+                    fmt_err!("no bytecode for contract; is it abstract or unlinked?")
+                });
+            }
         }
+
+        // Fallback: construct path manually when no artifacts list or no match found
+        let path_in_artifacts = match (file.map(|f| f.to_string_lossy().to_string()), contract_name)
+        {
+            (Some(file), Some(contract_name)) => {
+                PathBuf::from(format!("{file}/{contract_name}.json"))
+            }
+            (None, Some(contract_name)) => {
+                PathBuf::from(format!("{contract_name}.sol/{contract_name}.json"))
+            }
+            (Some(file), None) => {
+                let name = file.replace(".sol", "");
+                PathBuf::from(format!("{file}/{name}.json"))
+            }
+            _ => bail!("invalid artifact path"),
+        };
+
+        state.config.paths.artifacts.join(path_in_artifacts)
     };
 
     let path = state.config.ensure_path_allowed(path, FsAccessKind::Read)?;
-    let data = fs::read_to_string(path)?;
+    let data = fs::read_to_string(path).map_err(|e| {
+        if state.config.available_artifacts.is_some() {
+            fmt_err!("no matching artifact found")
+        } else {
+            e.into()
+        }
+    })?;
     let artifact = serde_json::from_str::<ContractObject>(&data)?;
     let maybe_bytecode = if deployed { artifact.deployed_bytecode } else { artifact.bytecode };
     maybe_bytecode.ok_or_else(|| fmt_err!("no bytecode for contract; is it abstract or unlinked?"))
@@ -926,5 +958,18 @@ mod tests {
 
         let artifact: ContractObject = serde_json::from_str(s).unwrap();
         assert!(artifact.deployed_bytecode.is_some());
+    }
+
+    #[test]
+    fn test_alloy_json_abi_rejects_unlinked_bytecode() {
+        let artifact_json = r#"{
+            "abi": [],
+            "bytecode": "0x73__$987e73aeca5e61ce83e4cb0814d87beda9$__63baf2f868"
+        }"#;
+
+        let result: Result<ContractObject, _> = serde_json::from_str(artifact_json);
+        assert!(result.is_err(), "should reject unlinked bytecode with placeholders");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("expected bytecode, found unlinked bytecode with placeholder"));
     }
 }

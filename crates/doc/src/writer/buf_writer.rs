@@ -1,4 +1,4 @@
-use crate::{AsDoc, CommentTag, Comments, Deployment, Markdown, writer::traits::ParamLike};
+use crate::{writer::traits::ParamLike, AsDoc, CommentTag, Comments, Deployment, Markdown};
 use itertools::Itertools;
 use solang_parser::pt::{
     EnumDefinition, ErrorParameter, EventParameter, Parameter, VariableDeclaration,
@@ -191,7 +191,8 @@ impl BufWriter {
         params: &EnumDefinition,
         comments: &Comments,
     ) -> fmt::Result {
-        let comments = comments.include_tags(&[CommentTag::Param]);
+        let comments =
+            comments.include_tags(&[CommentTag::Param, CommentTag::Custom("variant".to_string())]);
 
         // There is nothing to write.
         if comments.is_empty() {
@@ -204,7 +205,7 @@ impl BufWriter {
         self.write_piped(&VARIANTS_TABLE_HEADERS.join("|"))?;
         self.write_piped(&VARIANTS_TABLE_SEPARATOR)?;
 
-        for value in &params.values {
+        for value in params.values.iter() {
             let param_name = value.as_ref().map(|v| v.name.clone());
 
             let comment = param_name.as_ref().and_then(|name| {
@@ -212,7 +213,7 @@ impl BufWriter {
             });
 
             let row = [
-                Markdown::Code(&param_name.unwrap_or("<none>".to_string())).as_doc()?,
+                Markdown::Code(param_name.as_deref().unwrap_or("<none>")).as_doc()?,
                 comment.unwrap_or_default().replace('\n', " "),
             ];
             self.write_piped(&row.join("|"))?;

@@ -1,13 +1,13 @@
 //! Implementations of [`Scripting`](spec::Group::Scripting) cheatcodes.
 
-use crate::{Cheatcode, CheatsCtxt, Result, Vm::*};
+use crate::{Cheatcode, CheatsCtxt, Result, Vm::*, evm::journaled_account};
 use alloy_consensus::{SidecarBuilder, SimpleCoder};
 use alloy_primitives::{Address, B256, U256, Uint};
 use alloy_rpc_types::Authorization;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolValue;
-use foundry_wallets::{WalletSigner, multi_wallet::MultiWallet};
+use foundry_wallets::{WalletSigner, wallet_multi::MultiWallet};
 use parking_lot::Mutex;
 use revm::{
     bytecode::Bytecode,
@@ -228,8 +228,12 @@ impl Cheatcode for attachBlobCall {
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
         let sidecar: SidecarBuilder<SimpleCoder> = SidecarBuilder::from_slice(blob);
-        let sidecar = sidecar.build().map_err(|e| format!("{e}"))?;
-        ccx.state.active_blob_sidecar = Some(sidecar);
+        let sidecar_variant = if ccx.ecx.cfg.spec < SpecId::OSAKA {
+            sidecar.build_4844().map_err(|e| format!("{e}"))?.into()
+        } else {
+            sidecar.build_7594().map_err(|e| format!("{e}"))?.into()
+        };
+        ccx.state.active_blob_sidecar = Some(sidecar_variant);
         Ok(Default::default())
     }
 }
@@ -285,6 +289,8 @@ pub struct Broadcast {
     pub depth: usize,
     /// Whether the prank stops by itself after the next call
     pub single_call: bool,
+    /// Whether `vm.deployCode` cheatcode is used to deploy from code.
+    pub deploy_from_code: bool,
 }
 
 /// Contains context for wallet management.
@@ -316,12 +322,6 @@ impl Wallets {
         Arc::into_inner(self.inner)
             .map(|m| m.into_inner().multi_wallet)
             .unwrap_or_else(|| panic!("not all instances were dropped"))
-    }
-
-    /// Locks inner Mutex and adds a signer to the [MultiWallet].
-    pub fn add_private_key(&self, private_key: &B256) -> Result<()> {
-        self.add_local_signer(PrivateKeySigner::from_bytes(private_key)?);
-        Ok(())
     }
 
     /// Locks inner Mutex and adds a signer to the [MultiWallet].
@@ -373,13 +373,17 @@ fn broadcast(ccx: &mut CheatsCtxt, new_origin: Option<&Address>, single_call: bo
             }
         }
     }
+    let new_origin = new_origin.unwrap_or(ccx.ecx.tx.caller);
+    // Ensure new origin is loaded and touched.
+    let _ = journaled_account(ccx.ecx, new_origin)?;
 
     let broadcast = Broadcast {
-        new_origin: new_origin.unwrap_or(ccx.ecx.tx.caller),
+        new_origin,
         original_caller: ccx.caller,
         original_origin: ccx.ecx.tx.caller,
         depth,
         single_call,
+        deploy_from_code: false,
     };
     debug!(target: "cheatcodes", ?broadcast, "started");
     ccx.state.broadcast = Some(broadcast);

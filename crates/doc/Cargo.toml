@@ -19,12 +19,13 @@ foundry-common.workspace = true
 foundry-compilers.workspace = true
 foundry-config.workspace = true
 
+solar.workspace = true
 alloy-primitives.workspace = true
 
 derive_more.workspace = true
 eyre.workspace = true
 itertools.workspace = true
-mdbook = { version = "0.4", default-features = false, features = ["search"] }
+mdbook-driver = { version = "0.5", default-features = false, features = ["search"] }
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true

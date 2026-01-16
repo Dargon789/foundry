@@ -15,14 +15,12 @@ use foundry_common::{
 };
 use foundry_evm_core::{
     abi::{Vm, console},
-    constants::{
-        CALLER, CHEATCODE_ADDRESS, DEFAULT_CREATE2_DEPLOYER, HARDHAT_CONSOLE_ADDRESS,
-        TEST_CONTRACT_ADDRESS,
-    },
+    constants::{CALLER, CHEATCODE_ADDRESS, DEFAULT_CREATE2_DEPLOYER, HARDHAT_CONSOLE_ADDRESS},
     decode::RevertDecoder,
     precompiles::{
-        BLAKE_2F, EC_ADD, EC_MUL, EC_PAIRING, EC_RECOVER, IDENTITY, MOD_EXP, POINT_EVALUATION,
-        RIPEMD_160, SHA_256,
+        BLAKE_2F, BLS12_G1ADD, BLS12_G1MSM, BLS12_G2ADD, BLS12_G2MSM, BLS12_MAP_FP_TO_G1,
+        BLS12_MAP_FP2_TO_G2, BLS12_PAIRING_CHECK, EC_ADD, EC_MUL, EC_PAIRING, EC_RECOVER, IDENTITY,
+        MOD_EXP, P256_VERIFY, POINT_EVALUATION, RIPEMD_160, SHA_256,
     },
 };
 use itertools::Itertools;
@@ -176,7 +174,6 @@ impl CallTraceDecoder {
                 (HARDHAT_CONSOLE_ADDRESS, "console".to_string()),
                 (DEFAULT_CREATE2_DEPLOYER, "Create2Deployer".to_string()),
                 (CALLER, "DefaultSender".to_string()),
-                (TEST_CONTRACT_ADDRESS, "DefaultTestContract".to_string()),
                 (EC_RECOVER, "ECRecover".to_string()),
                 (SHA_256, "SHA-256".to_string()),
                 (RIPEMD_160, "RIPEMD-160".to_string()),
@@ -187,6 +184,14 @@ impl CallTraceDecoder {
                 (EC_PAIRING, "ECPairing".to_string()),
                 (BLAKE_2F, "Blake2F".to_string()),
                 (POINT_EVALUATION, "PointEvaluation".to_string()),
+                (BLS12_G1ADD, "BLS12_G1ADD".to_string()),
+                (BLS12_G1MSM, "BLS12_G1MSM".to_string()),
+                (BLS12_G2ADD, "BLS12_G2ADD".to_string()),
+                (BLS12_G2MSM, "BLS12_G2MSM".to_string()),
+                (BLS12_PAIRING_CHECK, "BLS12_PAIRING_CHECK".to_string()),
+                (BLS12_MAP_FP_TO_G1, "BLS12_MAP_FP_TO_G1".to_string()),
+                (BLS12_MAP_FP2_TO_G2, "BLS12_MAP_FP2_TO_G2".to_string()),
+                (P256_VERIFY, "P256VERIFY".to_string()),
             ]),
             receive_contracts: Default::default(),
             fallback_contracts: Default::default(),
@@ -269,6 +274,29 @@ impl CallTraceDecoder {
                 entry.insert(vec![function]);
             }
         }
+    }
+
+    /// Selects the appropriate function from a list of functions with the same selector
+    /// by checking which one belongs to the contract being called, this avoids collisions
+    /// where multiple different functions across different contracts have the same selector.
+    fn select_contract_function<'a>(
+        &self,
+        functions: &'a [Function],
+        trace: &CallTrace,
+    ) -> &'a [Function] {
+        // When there are selector collisions, try to decode the calldata with each function
+        // to determine which one is actually being called. The correct function should
+        // decode successfully while the wrong ones will fail due to parameter type mismatches.
+        if functions.len() > 1 {
+            for (i, func) in functions.iter().enumerate() {
+                if trace.data.len() >= SELECTOR_LEN
+                    && func.abi_decode_input(&trace.data[SELECTOR_LEN..]).is_ok()
+                {
+                    return &functions[i..i + 1];
+                }
+            }
+        }
+        functions
     }
 
     /// Adds a single error to the decoder.
@@ -426,7 +454,8 @@ impl CallTraceDecoder {
                 };
             }
 
-            let [func, ..] = &functions[..] else {
+            let contract_functions = self.select_contract_function(functions, trace);
+            let [func, ..] = contract_functions else {
                 return DecodedCallTrace {
                     label,
                     call_data: self.fallback_call_data(trace),
@@ -447,7 +476,7 @@ impl CallTraceDecoder {
             DecodedCallTrace {
                 label,
                 call_data: Some(call_data),
-                return_data: self.decode_function_output(trace, functions),
+                return_data: self.decode_function_output(trace, contract_functions),
             }
         } else {
             DecodedCallTrace {
@@ -827,6 +856,63 @@ fn indexed_inputs(event: &Event) -> usize {
 mod tests {
     use super::*;
     use alloy_primitives::hex;
+
+    #[test]
+    fn test_selector_collision_resolution() {
+        use alloy_json_abi::Function;
+        use alloy_primitives::Address;
+
+        // Create two functions with the same selector but different signatures
+        let func1 = Function::parse("transferFrom(address,address,uint256)").unwrap();
+        let func2 = Function::parse("gasprice_bit_ether(int128)").unwrap();
+
+        // Verify they have the same selector (this is the collision)
+        assert_eq!(func1.selector(), func2.selector());
+
+        let functions = vec![func1, func2];
+
+        // Create a mock trace with calldata that matches func1
+        let trace = CallTrace {
+            address: Address::from([0x12; 20]),
+            data: hex!("23b872dd000000000000000000000000000000000000000000000000000000000000012300000000000000000000000000000000000000000000000000000000000004560000000000000000000000000000000000000000000000000000000000000064").to_vec().into(),
+            ..Default::default()
+        };
+
+        let decoder = CallTraceDecoder::new();
+        let result = decoder.select_contract_function(&functions, &trace);
+
+        // Should return only the function that can decode the calldata (func1)
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].signature(), "transferFrom(address,address,uint256)");
+    }
+
+    #[test]
+    fn test_selector_collision_resolution_second_function() {
+        use alloy_json_abi::Function;
+        use alloy_primitives::Address;
+
+        // Create two functions with the same selector but different signatures
+        let func1 = Function::parse("transferFrom(address,address,uint256)").unwrap();
+        let func2 = Function::parse("gasprice_bit_ether(int128)").unwrap();
+
+        let functions = vec![func1, func2];
+
+        // Create a mock trace with calldata that matches func2
+        let trace = CallTrace {
+            address: Address::from([0x12; 20]),
+            data: hex!("23b872dd0000000000000000000000000000000000000000000000000000000000000064")
+                .to_vec()
+                .into(),
+            ..Default::default()
+        };
+
+        let decoder = CallTraceDecoder::new();
+        let result = decoder.select_contract_function(&functions, &trace);
+
+        // Should return only the function that can decode the calldata (func2)
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].signature(), "gasprice_bit_ether(int128)");
+    }
 
     #[test]
     fn test_should_redact() {

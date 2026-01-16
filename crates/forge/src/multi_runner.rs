@@ -7,33 +7,34 @@ use crate::{
 use alloy_json_abi::{Function, JsonAbi};
 use alloy_primitives::{Address, Bytes, U256};
 use eyre::Result;
+use foundry_cli::opts::configure_pcx_from_compile_output;
 use foundry_common::{
     ContractsByArtifact, ContractsByArtifactBuilder, TestFunctionExt, get_contract_name,
     shell::verbosity,
 };
 use foundry_compilers::{
-    Artifact, ArtifactId, ProjectCompileOutput,
+    Artifact, ArtifactId, Compiler, ProjectCompileOutput,
     artifacts::{Contract, Libraries},
-    compilers::Compiler,
 };
 use foundry_config::{Config, InlineConfig};
 use foundry_evm::{
     Env,
     backend::Backend,
     decode::RevertDecoder,
-    executors::{Executor, ExecutorBuilder, FailFast},
+    executors::{EarlyExit, Executor, ExecutorBuilder},
     fork::CreateFork,
+    fuzz::strategies::LiteralsDictionary,
     inspectors::CheatsConfig,
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode},
 };
+use foundry_evm_networks::NetworkConfigs;
 use foundry_linking::{LinkOutput, Linker};
 use rayon::prelude::*;
 use revm::primitives::hardfork::SpecId;
 use std::{
     borrow::Borrow,
     collections::BTreeMap,
-    fmt::Debug,
     path::Path,
     sync::{Arc, mpsc},
     time::Instant,
@@ -49,6 +50,7 @@ pub type DeployableContracts = BTreeMap<ArtifactId, TestContract>;
 
 /// A multi contract runner receives a set of contracts deployed in an EVM instance and proceeds
 /// to run all test functions in these contracts.
+#[derive(Clone, Debug)]
 pub struct MultiContractRunner {
     /// Mapping of contract name to JsonAbi, creation bytecode and library bytecode which
     /// needs to be deployed & linked against
@@ -61,6 +63,10 @@ pub struct MultiContractRunner {
     pub libs_to_deploy: Vec<Bytes>,
     /// Library addresses used to link contracts.
     pub libraries: Libraries,
+    /// Solar compiler instance, to grant syntactic and semantic analysis capabilities
+    pub analysis: Arc<solar::sema::Compiler>,
+    /// Literals dictionary for fuzzing.
+    pub fuzz_literals: LiteralsDictionary,
 
     /// The fork to use at launch
     pub fork: Option<CreateFork>,
@@ -252,7 +258,12 @@ impl MultiContractRunner {
 
         debug!("start executing all tests in contract");
 
-        let executor = self.tcfg.executor(self.known_contracts.clone(), artifact_id, db.clone());
+        let executor = self.tcfg.executor(
+            self.known_contracts.clone(),
+            self.analysis.clone(),
+            artifact_id,
+            db.clone(),
+        );
         let runner = ContractRunner::new(
             &identifier,
             contract,
@@ -273,7 +284,7 @@ impl MultiContractRunner {
 /// Configuration for the test runner.
 ///
 /// This is modified after instantiation through inline config.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TestRunnerConfig {
     /// Project config.
     pub config: Arc<Config>,
@@ -297,10 +308,10 @@ pub struct TestRunnerConfig {
     pub decode_internal: InternalTraceMode,
     /// Whether to enable call isolation.
     pub isolation: bool,
-    /// Whether to enable Odyssey features.
-    pub odyssey: bool,
-    /// Whether to exit early on test failure.
-    pub fail_fast: FailFast,
+    /// Networks with enabled features.
+    pub networks: NetworkConfigs,
+    /// Whether to exit early on test failure or if test run interrupted.
+    pub early_exit: EarlyExit,
 }
 
 impl TestRunnerConfig {
@@ -311,15 +322,18 @@ impl TestRunnerConfig {
 
         self.spec_id = config.evm_spec_id();
         self.sender = config.sender;
-        self.odyssey = config.odyssey;
+        self.networks = config.networks;
         self.isolation = config.isolate;
 
         // Specific to Forge, not present in config.
-        // TODO: self.evm_opts
-        // TODO: self.env
-        // self.coverage = N/A;
+        // self.line_coverage = N/A;
         // self.debug = N/A;
         // self.decode_internal = N/A;
+
+        // TODO: self.evm_opts
+        self.evm_opts.always_use_create_2_factory = config.always_use_create_2_factory;
+
+        // TODO: self.env
 
         self.config = config;
     }
@@ -337,7 +351,7 @@ impl TestRunnerConfig {
         inspector.tracing(self.trace_mode());
         inspector.collect_line_coverage(self.line_coverage);
         inspector.enable_isolation(self.isolation);
-        inspector.odyssey(self.odyssey);
+        inspector.networks(self.networks);
         // inspector.set_create2_deployer(self.evm_opts.create2_deployer);
 
         // executor.env_mut().clone_from(&self.env);
@@ -350,6 +364,7 @@ impl TestRunnerConfig {
     pub fn executor(
         &self,
         known_contracts: ContractsByArtifact,
+        analysis: Arc<solar::sema::Compiler>,
         artifact_id: &ArtifactId,
         db: Backend,
     ) -> Executor {
@@ -366,8 +381,9 @@ impl TestRunnerConfig {
                     .trace_mode(self.trace_mode())
                     .line_coverage(self.line_coverage)
                     .enable_isolation(self.isolation)
-                    .odyssey(self.odyssey)
+                    .networks(self.networks)
                     .create2_deployer(self.evm_opts.create2_deployer)
+                    .set_analysis(analysis)
             })
             .spec_id(self.spec_id)
             .gas_limit(self.evm_opts.gas_limit())
@@ -385,7 +401,7 @@ impl TestRunnerConfig {
 }
 
 /// Builder used for instantiating the multi-contract runner
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[must_use = "builders do nothing unless you call `build` on them"]
 pub struct MultiContractRunnerBuilder {
     /// The address which will be used to deploy the initial contracts and send all
@@ -407,8 +423,8 @@ pub struct MultiContractRunnerBuilder {
     pub decode_internal: InternalTraceMode,
     /// Whether to enable call isolation
     pub isolation: bool,
-    /// Whether to enable Odyssey features.
-    pub odyssey: bool,
+    /// Networks with enabled features.
+    pub networks: NetworkConfigs,
     /// Whether to exit early on test failure.
     pub fail_fast: bool,
 }
@@ -425,7 +441,7 @@ impl MultiContractRunnerBuilder {
             debug: Default::default(),
             isolation: Default::default(),
             decode_internal: Default::default(),
-            odyssey: Default::default(),
+            networks: Default::default(),
             fail_fast: false,
         }
     }
@@ -475,8 +491,8 @@ impl MultiContractRunnerBuilder {
         self
     }
 
-    pub fn odyssey(mut self, enable: bool) -> Self {
-        self.odyssey = enable;
+    pub fn networks(mut self, networks: NetworkConfigs) -> Self {
+        self.networks = networks;
         self
     }
 
@@ -484,11 +500,11 @@ impl MultiContractRunnerBuilder {
     /// against that evm
     pub fn build<C: Compiler<CompilerContract = Contract>>(
         self,
-        root: &Path,
         output: &ProjectCompileOutput,
         env: Env,
         evm_opts: EvmOpts,
     ) -> Result<MultiContractRunner> {
+        let root = &self.config.root;
         let contracts = output
             .artifact_ids()
             .map(|(id, v)| (id.with_stripped_file_prefixes(root), v))
@@ -535,9 +551,43 @@ impl MultiContractRunnerBuilder {
         }
 
         // Create known contracts from linked contracts and storage layout information (if any).
-        let known_contracts = ContractsByArtifactBuilder::new(linked_contracts)
-            .with_storage_layouts(output.clone().with_stripped_file_prefixes(root))
-            .build();
+        let known_contracts =
+            ContractsByArtifactBuilder::new(linked_contracts).with_output(output, root).build();
+
+        // Initialize and configure the solar compiler.
+        let mut analysis = solar::sema::Compiler::new(
+            solar::interface::Session::builder().with_stderr_emitter().build(),
+        );
+        let dcx = analysis.dcx_mut();
+        dcx.set_emitter(Box::new(
+            solar::interface::diagnostics::HumanEmitter::stderr(Default::default())
+                .source_map(Some(dcx.source_map().unwrap())),
+        ));
+        dcx.set_flags_mut(|f| f.track_diagnostics = false);
+
+        // Populate solar's global context by parsing and lowering the sources.
+        let files: Vec<_> =
+            output.output().sources.as_ref().keys().map(|path| path.to_path_buf()).collect();
+
+        analysis.enter_mut(|compiler| -> Result<()> {
+            let mut pcx = compiler.parse();
+            configure_pcx_from_compile_output(
+                &mut pcx,
+                &self.config,
+                output,
+                if files.is_empty() { None } else { Some(&files) },
+            )?;
+            pcx.parse();
+            let _ = compiler.lower_asts();
+            Ok(())
+        })?;
+
+        let analysis = Arc::new(analysis);
+        let fuzz_literals = LiteralsDictionary::new(
+            Some(analysis.clone()),
+            Some(self.config.project_paths()),
+            self.config.fuzz.dictionary.max_fuzz_dictionary_literals,
+        );
 
         Ok(MultiContractRunner {
             contracts: deployable_contracts,
@@ -545,8 +595,8 @@ impl MultiContractRunnerBuilder {
             known_contracts,
             libs_to_deploy,
             libraries,
-
-            fork: self.fork,
+            analysis,
+            fuzz_literals,
 
             tcfg: TestRunnerConfig {
                 evm_opts,
@@ -558,10 +608,12 @@ impl MultiContractRunnerBuilder {
                 decode_internal: self.decode_internal,
                 inline_config: Arc::new(InlineConfig::new_parsed(output, &self.config)?),
                 isolation: self.isolation,
-                odyssey: self.odyssey,
+                networks: self.networks,
+                early_exit: EarlyExit::new(self.fail_fast),
                 config: self.config,
-                fail_fast: FailFast::new(self.fail_fast),
             },
+
+            fork: self.fork,
         })
     }
 }

@@ -21,17 +21,7 @@ fn init_script_cmd(
     cmd.forge_fuse();
     cmd.set_current_dir(project_root);
 
-    cmd.args([
-        "script",
-        "-R",
-        "ds-test/=lib/",
-        "-R",
-        "cheats/=cheats/",
-        target_contract,
-        "--root",
-        project_root.to_str().unwrap(),
-        "-vvvvv",
-    ]);
+    cmd.args(["script", target_contract, "--root", project_root.to_str().unwrap(), "-vvvvv"]);
 
     if let Some(rpc_url) = endpoint {
         cmd.args(["--fork-url", rpc_url]);
@@ -125,11 +115,39 @@ impl ScriptTester {
     }
 
     /// Initialises the test contracts by copying them into the workspace
-    fn copy_testdata(current_dir: &Path) -> Result<()> {
+    fn copy_testdata(root: &Path) -> Result<()> {
         let testdata = Self::testdata_path();
-        fs::create_dir_all(current_dir.join("cheats"))?;
-        fs::copy(testdata.join("cheats/Vm.sol"), current_dir.join("cheats/Vm.sol"))?;
-        fs::copy(testdata.join("lib/ds-test/src/test.sol"), current_dir.join("lib/test.sol"))?;
+        let from_dir = testdata.join("utils");
+        let to_dir = root.join("utils");
+        fs::create_dir_all(&to_dir)?;
+        for entry in fs::read_dir(&from_dir)? {
+            let file = entry?.path();
+            // Only operate on regular files to avoid following symlinks or directories
+            let metadata = fs::symlink_metadata(&file)?;
+            let ftype = metadata.file_type();
+            if !ftype.is_file() {
+                continue;
+            }
+            let name = match file.file_name() {
+                Some(name) => name,
+                None => continue,
+            };
+            // Validate file name to avoid path traversal and absolute paths
+            let name_str = name.to_string_lossy();
+            if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
+                // Skip invalid (potentially dangerous) file names
+                continue;
+            }
+            // Verify canonicalized file is in from_dir to avoid symlink traversal
+            if let Ok(canonical_file) = file.canonicalize() {
+                if !canonical_file.starts_with(&from_dir) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            fs::copy(&file, to_dir.join(name))?;
+        }
         Ok(())
     }
 
@@ -163,7 +181,7 @@ impl ScriptTester {
 
     /// Adds given address as sender
     pub fn sender(&mut self, addr: Address) -> &mut Self {
-        self.args(&["--sender", addr.to_string().as_str()])
+        self.args(&["--sender", &addr.to_string()])
     }
 
     pub fn add_sig(&mut self, contract_name: &str, sig: &str) -> &mut Self {
@@ -171,7 +189,7 @@ impl ScriptTester {
     }
 
     pub fn add_create2_deployer(&mut self, create2_deployer: Address) -> &mut Self {
-        self.args(&["--create2-deployer", create2_deployer.to_string().as_str()])
+        self.args(&["--create2-deployer", &create2_deployer.to_string()])
     }
 
     /// Adds the `--unlocked` flag

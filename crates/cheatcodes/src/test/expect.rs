@@ -73,7 +73,7 @@ pub enum ExpectedRevertKind {
 #[derive(Clone, Debug)]
 pub struct ExpectedRevert {
     /// The expected data returned by the revert, None being any.
-    pub reason: Option<Vec<u8>>,
+    pub reason: Option<Bytes>,
     /// The depth at which the revert is expected.
     pub depth: usize,
     /// The type of expected revert.
@@ -668,7 +668,7 @@ impl RevertParameters for ExpectedRevert {
     }
 
     fn reason(&self) -> Option<&[u8]> {
-        self.reason.as_deref()
+        self.reason.as_ref().map(|b| &***b)
     }
 
     fn partial_match(&self) -> bool {
@@ -793,8 +793,12 @@ fn expect_emit(
 pub(crate) fn handle_expect_emit(
     state: &mut Cheatcodes,
     log: &alloy_primitives::Log,
-    interpreter: &mut Interpreter,
-) {
+    mut interpreter: Option<&mut Interpreter>,
+) -> Option<&'static str> {
+    // This function returns an optional string indicating a failure reason.
+    // If the string is `Some`, it indicates that the expectation failed with the provided reason.
+    let mut should_fail = None;
+
     // Fill or check the expected emits.
     // We expect for emit checks to be filled as they're declared (from oldest to newest),
     // so we fill them and push them to the back of the queue.
@@ -806,7 +810,32 @@ pub(crate) fn handle_expect_emit(
     // This allows a contract to arbitrarily emit more events than expected (additive behavior),
     // as long as all the previous events were matched in the order they were expected to be.
     if state.expected_emits.iter().all(|(expected, _)| expected.found) {
-        return;
+        return should_fail;
+    }
+
+    // Check count=0 expectations against this log - fail immediately if violated
+    for (expected_emit, _) in &state.expected_emits {
+        if expected_emit.count == 0
+            && !expected_emit.found
+            && let Some(expected_log) = &expected_emit.log
+            && checks_topics_and_data(expected_emit.checks, expected_log, log)
+            // Check revert address 
+            && (expected_emit.address.is_none() || expected_emit.address == Some(log.address))
+        {
+            if let Some(interpreter) = &mut interpreter {
+                // This event was emitted but we expected it NOT to be (count=0)
+                // Fail immediately
+                interpreter.bytecode.set_action(InterpreterAction::new_return(
+                    InstructionResult::Revert,
+                    Error::encode("log emitted but expected 0 times"),
+                    interpreter.gas,
+                ));
+            } else {
+                should_fail = Some("log emitted but expected 0 times");
+            }
+
+            return should_fail;
+        }
     }
 
     let should_fill_logs = state.expected_emits.iter().any(|(expected, _)| expected.log.is_none());
@@ -820,10 +849,18 @@ pub(crate) fn handle_expect_emit(
             .unwrap_or(state.expected_emits.len())
             .saturating_sub(1)
     } else {
-        // Otherwise, if all expected logs are filled, we start to check any unmatched event
+        // if all expected logs are filled, check any unmatched event
         // in the declared order, so we start from the front (like a queue).
-        0
+        // Skip count=0 expectations as they are handled separately above
+        state.expected_emits.iter().position(|(emit, _)| !emit.found && emit.count > 0).unwrap_or(0)
     };
+
+    // If there are only count=0 expectations left, we can return early
+    if !should_fill_logs
+        && state.expected_emits.iter().all(|(emit, _)| emit.found || emit.count == 0)
+    {
+        return should_fail;
+    }
 
     let (mut event_to_fill_or_check, mut count_map) = state
         .expected_emits
@@ -839,31 +876,29 @@ pub(crate) fn handle_expect_emit(
             state
                 .expected_emits
                 .insert(index_to_fill_or_check, (event_to_fill_or_check, count_map));
-        } else {
+        } else if let Some(interpreter) = &mut interpreter {
             interpreter.bytecode.set_action(InterpreterAction::new_return(
                 InstructionResult::Revert,
                 Error::encode("use vm.expectEmitAnonymous to match anonymous events"),
                 interpreter.gas,
             ));
+        } else {
+            should_fail = Some("use vm.expectEmitAnonymous to match anonymous events");
         }
-        return;
+
+        return should_fail;
     };
 
     // Increment/set `count` for `log.address` and `log.data`
     match count_map.entry(log.address) {
         Entry::Occupied(mut entry) => {
-            // Checks and inserts the log into the map.
-            // If the log doesn't pass the checks, it is ignored and `count` is not incremented.
             let log_count_map = entry.get_mut();
             log_count_map.insert(&log.data);
         }
         Entry::Vacant(entry) => {
             let mut log_count_map = LogCountMap::new(&event_to_fill_or_check);
-
             if log_count_map.satisfies_checks(&log.data) {
                 log_count_map.insert(&log.data);
-
-                // Entry is only inserted if it satisfies the checks.
                 entry.insert(log_count_map);
             }
         }
@@ -875,7 +910,7 @@ pub(crate) fn handle_expect_emit(
 
             // Try to decode the events if we have a signature identifier
             let (expected_decoded, actual_decoded) = if let Some(signatures_identifier) =
-                &state.signatures_identifier
+                state.signatures_identifier()
                 && !event_to_fill_or_check.anonymous
             {
                 (
@@ -910,7 +945,6 @@ pub(crate) fn handle_expect_emit(
         }
 
         let expected_count = event_to_fill_or_check.count;
-
         match event_to_fill_or_check.address {
             Some(emitter) => count_map
                 .get(&emitter)
@@ -931,6 +965,8 @@ pub(crate) fn handle_expect_emit(
         // appear.
         state.expected_emits.push_front((event_to_fill_or_check, count_map));
     }
+
+    should_fail
 }
 
 /// Handles expected emits specified by the `expectEmit` cheatcodes.
@@ -1022,7 +1058,7 @@ fn expect_revert(
         "you must call another function prior to expecting a second revert"
     );
     state.expected_revert = Some(ExpectedRevert {
-        reason: reason.map(<[_]>::to_vec),
+        reason: reason.map(Bytes::copy_from_slice),
         depth,
         kind: if cheatcode {
             ExpectedRevertKind::Cheatcode { pending_processing: true }
