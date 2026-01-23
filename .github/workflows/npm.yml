@@ -226,6 +226,7 @@ jobs:
           RELEASE_VERSION: ${{ steps.release-version.outputs.RELEASE_VERSION }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ARTIFACT_DIR: ${{ steps.paths.outputs.artifact_dir }}
         run: |
           set -euo pipefail
 
@@ -245,7 +246,21 @@ jobs:
           esac
 
           PACKAGE_DIR="./@foundry-rs/${TOOL}-${PLATFORM}-${ARCH}"
-          echo "Preparing to publish package from: $PACKAGE_DIR"
+          EXPECTED_PKG_NAME="${TOOL}-${PLATFORM}-${ARCH}"
+
+          # Ensure corresponding artifact directory exists in the isolated artifact dir
+          if [[ -z "${ARTIFACT_DIR:-}" ]]; then
+            echo "ERROR: ARTIFACT_DIR is not set; refusing to publish." >&2
+            exit 1
+          fi
+
+          EXPECTED_ARTIFACT_PATH="${ARTIFACT_DIR}/${EXPECTED_PKG_NAME}"
+          if [[ ! -d "$EXPECTED_ARTIFACT_PATH" ]]; then
+            echo "ERROR: Expected artifact directory not found at: $EXPECTED_ARTIFACT_PATH" >&2
+            exit 1
+          fi
+
+          echo "Preparing to publish package from: $PACKAGE_DIR (artifact: $EXPECTED_ARTIFACT_PATH)"
 
           if [[ ! -d "$PACKAGE_DIR" ]]; then
             echo "ERROR: Package directory does not exist: $PACKAGE_DIR" >&2
