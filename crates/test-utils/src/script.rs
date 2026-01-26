@@ -118,6 +118,7 @@ impl ScriptTester {
     fn copy_testdata(root: &Path) -> Result<()> {
         let testdata = Self::testdata_path();
         let from_dir = testdata.join("utils");
+        let canonical_from_dir = from_dir.canonicalize()?;
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
         for entry in fs::read_dir(&from_dir)? {
@@ -138,9 +139,9 @@ impl ScriptTester {
                 // Skip invalid (potentially dangerous) file names
                 continue;
             }
-            // Verify canonicalized file is in from_dir to avoid symlink traversal
+            // Verify canonicalized file is in canonical_from_dir to avoid symlink traversal
             if let Ok(canonical_file) = file.canonicalize() {
-                if !canonical_file.starts_with(&from_dir) {
+                if !canonical_file.starts_with(&canonical_from_dir) {
                     continue;
                 }
             } else {
