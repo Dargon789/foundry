@@ -164,15 +164,29 @@ jobs:
 
           # Derive RELEASE_VERSION from any foundry artifact we downloaded
           # Expected names: foundry_<VERSION>_<platform>_<arch>.{tar.gz,zip}
-          first_file=$(ls "$ARTIFACT_DIR"/foundry_* 2>/dev/null | head -n1 || true)
-          if [[ -z "${first_file}" ]]; then
-            echo "No foundry artifacts found to publish" >&2
+          shopt -s nullglob
+          foundry_files=("$ARTIFACT_DIR"/foundry_*)
+          shopt -u nullglob
+
+          if [[ ${#foundry_files[@]} -eq 0 ]]; then
+            echo "No foundry artifacts found to publish in $ARTIFACT_DIR" >&2
             exit 1
           fi
+
+          first_file="${foundry_files[0]}"
           version_part=$(basename "$first_file")
           version_part=${version_part#foundry_}
-          export RELEASE_VERSION=${version_part%%_*}
-          echo "Detected RELEASE_VERSION=$RELEASE_VERSION"
+          RELEASE_VERSION=${version_part%%_*}
+
+          # Validate derived RELEASE_VERSION to mitigate artifact poisoning
+          # Require a sane version format, e.g. 1.2.3 or 1.2.3-beta.1
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Derived RELEASE_VERSION '$RELEASE_VERSION' from artifact '$first_file' is not a valid version" >&2
+            exit 1
+          fi
+
+          export RELEASE_VERSION
+          echo "Detected RELEASE_VERSION=$RELEASE_VERSION from artifact $first_file"
 
           printf 'RELEASE_VERSION=%s\n' "$RELEASE_VERSION" >>"$GITHUB_OUTPUT"
 
