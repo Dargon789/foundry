@@ -121,21 +121,32 @@ impl ScriptTester {
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
         for entry in fs::read_dir(&from_dir)? {
-            let file = &entry?.path();
-            let name = file.file_name().unwrap();
+            let file = entry?.path();
+            // Only operate on regular files to avoid following symlinks or directories
+            let metadata = fs::symlink_metadata(&file)?;
+            let ftype = metadata.file_type();
+            if !ftype.is_file() {
+                continue;
+            }
+            let name = match file.file_name() {
+                Some(name) => name,
+                None => continue,
+            };
             // Validate file name to avoid path traversal and absolute paths
             let name_str = name.to_string_lossy();
             if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
                 // Skip invalid (potentially dangerous) file names
                 continue;
             }
-            // Optionally verify canonicalized file is in from_dir to avoid symlink traversal
+            // Verify canonicalized file is in from_dir to avoid symlink traversal
             if let Ok(canonical_file) = file.canonicalize() {
                 if !canonical_file.starts_with(&from_dir) {
                     continue;
                 }
+            } else {
+                continue;
             }
-            fs::copy(file, to_dir.join(name))?;
+            fs::copy(&file, to_dir.join(name))?;
         }
         Ok(())
     }
