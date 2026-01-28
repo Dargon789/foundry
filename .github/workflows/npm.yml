@@ -155,13 +155,14 @@ jobs:
           fi
 
           # Reject files with suspicious paths (absolute paths or parent directory traversals)
-          while IFS= read -r path; do
+          # Use null-delimited paths to safely handle filenames with newlines or whitespace
+          while IFS= read -r -d '' path; do
             rel="${path#"$ARTIFACT_DIR"/}"
             if [[ "$rel" == /* ]] || [[ "$rel" == *".."* ]]; then
               echo "ERROR: Suspicious artifact path detected: $rel" >&2
               exit 1
             fi
-          done < <(find "$ARTIFACT_DIR" -type f -print)
+          done < <(find "$ARTIFACT_DIR" -type f -print0)
 
           echo "Artifact validation completed successfully."
 
