@@ -123,13 +123,21 @@ impl ScriptTester {
         fs::create_dir_all(&to_dir)?;
         for entry in fs::read_dir(&from_dir)? {
             let file = entry?.path();
+            // Canonicalize the file path and ensure it stays within canonical_from_dir
+            let canonical_file = match file.canonicalize() {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if !canonical_file.starts_with(&canonical_from_dir) {
+                continue;
+            }
             // Only operate on regular files to avoid following symlinks or directories
-            let metadata = fs::symlink_metadata(&file)?;
+            let metadata = fs::symlink_metadata(&canonical_file)?;
             let ftype = metadata.file_type();
             if !ftype.is_file() {
                 continue;
             }
-            let name = match file.file_name() {
+            let name = match canonical_file.file_name() {
                 Some(name) => name,
                 None => continue,
             };
@@ -139,15 +147,7 @@ impl ScriptTester {
                 // Skip invalid (potentially dangerous) file names
                 continue;
             }
-            // Verify canonicalized file is in canonical_from_dir to avoid symlink traversal
-            if let Ok(canonical_file) = file.canonicalize() {
-                if !canonical_file.starts_with(&canonical_from_dir) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-            fs::copy(&file, to_dir.join(name))?;
+            fs::copy(&canonical_file, to_dir.join(name))?;
         }
         Ok(())
     }
