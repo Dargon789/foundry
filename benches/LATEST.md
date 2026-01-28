@@ -4,7 +4,7 @@
 
 ## Summary
 
-Benchmarked 2 Foundry versions across 1 repositories.
+Benchmarked 2 Foundry versions across 1 repository.
 
 ### Repositories Tested
 
