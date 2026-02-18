@@ -14,9 +14,8 @@ use crate::{
     },
     mem::{self, in_memory_db::MemDb},
 };
-use alloy_chains::Chain;
 use alloy_consensus::BlockHeader;
-use alloy_eips::eip7840::BlobParams;
+use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_evm::EvmEnv;
 use alloy_genesis::Genesis;
 use alloy_network::{AnyNetwork, TransactionResponse};
@@ -206,7 +205,8 @@ pub struct NodeConfig {
     pub networks: NetworkConfigs,
     /// Do not print log messages.
     pub silent: bool,
-    /// The path where states are cached.
+    /// The path where persisted states are cached (used with `max_persisted_states`).
+    /// This does not affect the fork RPC cache location.
     pub cache_path: Option<PathBuf>,
 }
 
@@ -533,7 +533,7 @@ impl NodeConfig {
             BlobExcessGasAndPrice::new(
                 excess_blob_gas,
                 get_blob_base_fee_update_fraction(
-                    self.chain_id.unwrap_or(Chain::mainnet().id()),
+                    self.get_chain_id(),
                     self.get_genesis_timestamp(),
                 ),
             )
@@ -542,10 +542,7 @@ impl NodeConfig {
 
     /// Returns the [`BlobParams`] that should be used.
     pub fn get_blob_params(&self) -> BlobParams {
-        get_blob_params(
-            self.chain_id.unwrap_or(Chain::mainnet().id()),
-            self.get_genesis_timestamp(),
-        )
+        get_blob_params(self.get_chain_id(), self.get_genesis_timestamp())
     }
 
     /// Returns the hardfork to use
@@ -1044,7 +1041,10 @@ impl NodeConfig {
         self
     }
 
-    /// Sets the path where states are cached
+    /// Sets the path where persisted states are cached (used with `max_persisted_states`).
+    ///
+    /// Note: This does not control the fork RPC cache location (`storage.json`), which uses
+    /// `~/.foundry/cache/rpc/<chain>/<block>/` via [`Config::foundry_block_cache_file`].
     #[must_use]
     pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
         self.cache_path = cache_path;
@@ -1094,6 +1094,9 @@ impl NodeConfig {
             self.networks,
         );
 
+        let base_fee_params: BaseFeeParams =
+            self.networks.base_fee_params(self.get_genesis_timestamp());
+
         let fees = FeeManager::new(
             spec_id,
             self.get_base_fee(),
@@ -1101,6 +1104,7 @@ impl NodeConfig {
             self.get_gas_price(),
             self.get_blob_excess_gas_and_price(),
             self.get_blob_params(),
+            base_fee_params,
         );
 
         let (db, fork): (Arc<TokioRwLock<Box<dyn Db>>>, Option<ClientFork>) =
@@ -1208,7 +1212,7 @@ impl NodeConfig {
         eth_rpc_url: String,
         env: &mut Env,
         fees: &FeeManager,
-    ) -> Result<(ForkedDatabase, ClientForkConfig)> {
+    ) -> Result<(ForkedDatabase<AnyNetwork>, ClientForkConfig)> {
         debug!(target: "node", ?eth_rpc_url, "setting up fork db");
         let provider = Arc::new(
             ProviderBuilder::new(&eth_rpc_url)
@@ -1295,6 +1299,23 @@ latest block number: {latest_block}"
             ..Default::default()
         };
 
+        // Determine chain_id early so we can use it consistently
+        let chain_id = if let Some(chain_id) = self.chain_id {
+            chain_id
+        } else {
+            let chain_id = if let Some(fork_chain_id) = fork_chain_id {
+                fork_chain_id.to()
+            } else {
+                provider.get_chain_id().await.wrap_err("failed to fetch network chain ID")?
+            };
+
+            // need to update the dev signers and env with the chain id
+            self.set_chain_id(Some(chain_id));
+            env.evm_env.cfg_env.chain_id = chain_id;
+            env.tx.base.chain_id = chain_id.into();
+            chain_id
+        };
+
         // if not set explicitly we use the base fee of the latest block
         if self.base_fee.is_none() {
             if let Some(base_fee) = block.header.base_fee_per_gas {
@@ -1315,12 +1336,7 @@ latest block number: {latest_block}"
                 (block.header.excess_blob_gas, block.header.blob_gas_used)
             {
                 // derive the blobparams that are active at this timestamp
-                let blob_params = get_blob_params(
-                    fork_chain_id
-                        .unwrap_or_else(|| U256::from(Chain::mainnet().id()))
-                        .saturating_to(),
-                    block.header.timestamp,
-                );
+                let blob_params = get_blob_params(chain_id, block.header.timestamp);
 
                 env.evm_env.block_env.blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(
                     blob_excess_gas,
@@ -1348,21 +1364,6 @@ latest block number: {latest_block}"
 
         let block_hash = block.header.hash;
 
-        let chain_id = if let Some(chain_id) = self.chain_id {
-            chain_id
-        } else {
-            let chain_id = if let Some(fork_chain_id) = fork_chain_id {
-                fork_chain_id.to()
-            } else {
-                provider.get_chain_id().await.wrap_err("failed to fetch network chain ID")?
-            };
-
-            // need to update the dev signers and env with the chain id
-            self.set_chain_id(Some(chain_id));
-            env.evm_env.cfg_env.chain_id = chain_id;
-            env.tx.base.chain_id = chain_id.into();
-            chain_id
-        };
         let override_chain_id = self.chain_id;
         // apply changes such as difficulty -> prevrandao and chain specifics for current chain id
         apply_chain_and_block_specific_env_changes::<AnyNetwork>(

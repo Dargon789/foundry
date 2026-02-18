@@ -2,7 +2,6 @@
 
 use alloy_primitives::{Address, B256, U256};
 use clap::Parser;
-use eyre::ContextCompat;
 use foundry_config::{
     Chain, Config,
     figment::{
@@ -94,6 +93,11 @@ pub struct EvmArgs {
     #[serde(skip)]
     pub ffi: bool,
 
+    /// Whether to show `console.log` outputs in realtime during script/test execution
+    #[arg(long)]
+    #[serde(skip)]
+    pub live_logs: bool,
+
     /// Use the create 2 factory in all cases including tests and non-broadcasting scripts.
     #[arg(long)]
     #[serde(skip)]
@@ -156,6 +160,10 @@ impl Provider for EvmArgs {
 
         if self.ffi {
             dict.insert("ffi".to_string(), self.ffi.into());
+        }
+
+        if self.live_logs {
+            dict.insert("live_logs".to_string(), self.live_logs.into());
         }
 
         if self.isolate {
@@ -258,13 +266,6 @@ pub struct EnvArgs {
     #[arg(long, visible_alias = "tx-gas-limit")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub enable_tx_gas_limit: bool,
-}
-
-impl EvmArgs {
-    /// Ensures that fork url exists and returns its reference.
-    pub fn ensure_fork_url(&self) -> eyre::Result<&String> {
-        self.fork_url.as_ref().wrap_err("Missing `--fork-url` field.")
-    }
 }
 
 /// We have to serialize chain IDs and not names because when extracting an EVM `Env`, it expects
