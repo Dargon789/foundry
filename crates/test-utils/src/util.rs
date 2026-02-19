@@ -3,7 +3,7 @@ use foundry_config::Config;
 use std::{
     env,
     fs::{self, File},
-    io::{IsTerminal, Read, Seek, Write},
+    io::{self, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::LazyLock,
@@ -235,8 +235,54 @@ pub fn read_string(path: impl AsRef<Path>) -> String {
 /// like `out/`, `cache/`, and `broadcast/` which are build artifacts that should not be
 /// copied to temporary test workspaces.
 pub fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    copy_dir_filtered_inner(src, dst, true)
+    let src = resolve_and_validate_under_base(src)?;
+    let dst = resolve_and_validate_under_base(dst)?;
+
+    fs::create_dir_all(&dst)?;
+    copy_dir_filtered_inner(&src, &dst, true)
+}
+
+/// Resolve a path against a safe base directory and ensure it does not escape that base.
+///
+/// This guards against using uncontrolled paths that could traverse outside the intended
+/// workspace (for example, via `..` components or absolute paths).
+fn resolve_and_validate_under_base(path: &Path) -> io::Result<PathBuf> {
+    // Choose the current working directory as the safe base for test utilities.
+    let base = env::current_dir()?;
+
+    // If `path` is absolute, interpret it relative to the base by stripping the
+    // root and joining the remaining components. This avoids treating arbitrary
+    // absolute paths as trustworthy.
+    let joined = if path.is_absolute() {
+        let relative_components = path.components().filter_map(|c| {
+            use std::path::Component;
+            match c {
+                Component::Normal(p) => Some(PathBuf::from(p)),
+                // Skip root and current-dir components; preserve parent-dir so that
+                // canonicalization below can detect and resolve them safely.
+                Component::RootDir | Component::CurDir => None,
+                Component::ParentDir => Some(PathBuf::from("..")),
+                Component::Prefix(_) => None,
+            }
+        });
+        let mut rel = PathBuf::new();
+        for c in relative_components {
+            rel.push(c);
+        }
+        base.join(rel)
+    } else {
+        base.join(path)
+    };
+
+    let canonical = joined.canonicalize()?;
+    if !canonical.starts_with(&base) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path escapes allowed base directory",
+        ));
+    }
+
+    Ok(canonical)
 }
 
 fn copy_dir_filtered_inner(src: &Path, dst: &Path, is_root: bool) -> std::io::Result<()> {
