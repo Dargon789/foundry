@@ -33,6 +33,8 @@ use std::time::Instant;
 pub fn run() -> Result<()> {
     setup()?;
 
+    foundry_cli::opts::GlobalArgs::check_markdown_help::<CastArgs>();
+
     let args = CastArgs::parse();
     args.global.init()?;
     args.global.tokio_runtime().block_on(run_command(args))
@@ -757,6 +759,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::DAEstimate(cmd) => {
             cmd.run().await?;
         }
+        CastSubcommand::Trace(cmd) => cmd.run().await?,
     };
 
     /// Prints slice of tokens using [`format_tokens`] or [`serialize_value_as_json`] depending

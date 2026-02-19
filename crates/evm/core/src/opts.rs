@@ -4,14 +4,11 @@ use crate::{
     constants::DEFAULT_CREATE2_DEPLOYER,
     fork::{CreateFork, configure_env},
 };
-use alloy_network::Network;
+use alloy_network::{AnyNetwork, Network};
 use alloy_primitives::{Address, B256, U256};
-use alloy_provider::{Provider, network::AnyRpcBlock};
+use alloy_provider::{Provider, RootProvider, network::AnyRpcBlock};
 use eyre::WrapErr;
-use foundry_common::{
-    ALCHEMY_FREE_TIER_CUPS,
-    provider::{ProviderBuilder, RetryProvider},
-};
+use foundry_common::{ALCHEMY_FREE_TIER_CUPS, provider::ProviderBuilder};
 use foundry_config::{Chain, Config, GasLimit};
 use foundry_evm_networks::NetworkConfigs;
 use revm::context::{BlockEnv, TxEnv};
@@ -116,8 +113,12 @@ impl Default for EvmOpts {
 }
 
 impl EvmOpts {
-    /// Returns a `RetryProvider` for the given fork URL configured with options in `self`.
-    pub fn fork_provider_with_url(&self, fork_url: &str) -> eyre::Result<RetryProvider> {
+    /// Returns a `RootProvider` for the given fork URL configured with options in `self` and
+    /// annotated `Network` type.
+    pub fn fork_provider_with_url<N: Network>(
+        &self,
+        fork_url: &str,
+    ) -> eyre::Result<RootProvider<N>> {
         ProviderBuilder::new(fork_url)
             .maybe_max_retry(self.fork_retries)
             .maybe_initial_backoff(self.fork_retry_backoff)
@@ -141,7 +142,7 @@ impl EvmOpts {
     /// Returns the `revm::Env` that is configured with settings retrieved from the endpoint,
     /// and the block that was used to configure the environment.
     pub async fn fork_evm_env(&self, fork_url: &str) -> eyre::Result<(crate::Env, AnyRpcBlock)> {
-        let provider = self.fork_provider_with_url(fork_url)?;
+        let provider = self.fork_provider_with_url::<AnyNetwork>(fork_url)?;
         self.fork_evm_env_with_provider(fork_url, &provider).await
     }
 
@@ -223,7 +224,16 @@ impl EvmOpts {
     pub fn get_fork(&self, config: &Config, env: crate::Env) -> Option<CreateFork> {
         let url = self.fork_url.clone()?;
         let enable_caching = config.enable_caching(&url, env.evm_env.cfg_env.chain_id);
-        Some(CreateFork { url, enable_caching, env, evm_opts: self.clone() })
+
+        // Pin fork_block_number to the block that was already fetched in env, so subsequent
+        // fork operations use the same block. This prevents inconsistencies when forking at
+        // "latest" where the chain could advance between calls.
+        let mut evm_opts = self.clone();
+        if evm_opts.fork_block_number.is_none() {
+            evm_opts.fork_block_number = Some(env.evm_env.block_env.number.to());
+        }
+
+        Some(CreateFork { url, enable_caching, env, evm_opts })
     }
 
     /// Returns the gas limit to use
@@ -248,7 +258,7 @@ impl EvmOpts {
     /// Returns the chain ID from the RPC, if any.
     pub async fn get_remote_chain_id(&self) -> Option<Chain> {
         if let Some(url) = &self.fork_url
-            && let Ok(provider) = self.fork_provider_with_url(url)
+            && let Ok(provider) = self.fork_provider_with_url::<AnyNetwork>(url)
         {
             trace!(?url, "retrieving chain via eth_chainId");
 
@@ -320,4 +330,57 @@ pub struct Env {
     /// EIP-170: Contract code size limit in bytes. Useful to increase this because of tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_size_limit: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_fork_pins_block_number_from_env() {
+        let endpoint = foundry_test_utils::rpc::next_http_rpc_endpoint();
+
+        let config = Config::figment();
+        let mut evm_opts = config.extract::<EvmOpts>().unwrap();
+        evm_opts.fork_url = Some(endpoint.clone());
+        // Explicitly leave fork_block_number as None to simulate --fork-url without --block-number
+        assert!(evm_opts.fork_block_number.is_none());
+
+        // Fetch the environment (this resolves "latest" to an actual block number)
+        let env = evm_opts.evm_env().await.unwrap();
+        let resolved_block = env.evm_env.block_env.number;
+        assert!(resolved_block > U256::ZERO, "should have resolved to a real block number");
+
+        // Create the fork - this should pin the block number
+        let fork = evm_opts.get_fork(&Config::default(), env).unwrap();
+
+        // The fork's evm_opts should now have fork_block_number set to the resolved block
+        assert_eq!(
+            fork.evm_opts.fork_block_number,
+            Some(resolved_block.to::<u64>()),
+            "get_fork should pin fork_block_number to the block from env"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_fork_preserves_explicit_block_number() {
+        let endpoint = foundry_test_utils::rpc::next_http_rpc_endpoint();
+
+        let config = Config::figment();
+        let mut evm_opts = config.extract::<EvmOpts>().unwrap();
+        evm_opts.fork_url = Some(endpoint.clone());
+        // Set an explicit block number
+        evm_opts.fork_block_number = Some(12345678);
+
+        let env = evm_opts.evm_env().await.unwrap();
+
+        let fork = evm_opts.get_fork(&Config::default(), env).unwrap();
+
+        // Should preserve the explicit block number, not override it
+        assert_eq!(
+            fork.evm_opts.fork_block_number,
+            Some(12345678),
+            "get_fork should preserve explicitly set fork_block_number"
+        );
+    }
 }
