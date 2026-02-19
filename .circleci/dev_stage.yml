@@ -1,5 +1,25 @@
-# ~/.circleci/config.yml
+# Use the latest 2.1 version of CircleCI pipeline process engine.
+# See: https://circleci.com/docs/configuration-reference
+
 version: 2.1
+executors:
+  my-custom-executor:
+    docker:
+      - image: cimg/base:stable
+jobs:
+  web3-defi-game-project-:
+
+    executor: my-custom-executor
+    steps:
+      - checkout
+      - run: |
+          # echo Hello, World!
+
+workflows:
+  my-custom-workflow:
+    jobs:
+      - web3-defi-game-project-
+      
   jobs:
     my-job:
      steps:
