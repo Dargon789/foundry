@@ -354,10 +354,10 @@ jobs:
               ART_NAME="$(jq -r '.name // empty' < "$EXPECTED_ARTIFACT_PATH/package.json")"
               ART_VERSION="$(jq -r '.version // empty' < "$EXPECTED_ARTIFACT_PATH/package.json")"
             else
-              SRC_NAME="$(grep -m1 '"name"' "$PACKAGE_DIR/package.json" | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')" || SRC_NAME=""
-              SRC_VERSION="$(grep -m1 '"version"' "$PACKAGE_DIR/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')" || SRC_VERSION=""
-              ART_NAME="$(grep -m1 '"name"' "$EXPECTED_ARTIFACT_PATH/package.json" | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')" || ART_NAME=""
-              ART_VERSION="$(grep -m1 '"version"' "$EXPECTED_ARTIFACT_PATH/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')" || ART_VERSION=""
+              SRC_NAME="$(grep -m1 '"name"' "$PACKAGE_DIR/package.json" | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+              SRC_VERSION="$(grep -m1 '"version"' "$PACKAGE_DIR/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+              ART_NAME="$(grep -m1 '"name"' "$EXPECTED_ARTIFACT_PATH/package.json" | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+              ART_VERSION="$(grep -m1 '"version"' "$EXPECTED_ARTIFACT_PATH/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
             fi
 
             if [[ -n "$SRC_NAME" && -n "$ART_NAME" && "$SRC_NAME" != "$ART_NAME" ]]; then
