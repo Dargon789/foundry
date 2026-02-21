@@ -304,6 +304,19 @@ jobs:
             exit 1
           fi
 
+          # Resolve artifact path to an absolute path and ensure it stays within ARTIFACT_DIR
+          ABS_ARTIFACT_PATH="$(realpath "$EXPECTED_ARTIFACT_PATH")"
+          ABS_ARTIFACT_ROOT="$(realpath "$ARTIFACT_DIR")"
+          case "$ABS_ARTIFACT_PATH" in
+            "$ABS_ARTIFACT_ROOT"/*) ;;
+            *)
+              echo "ERROR: Resolved artifact path is outside isolated artifact root:" >&2
+              echo "  ABS_ARTIFACT_PATH=$ABS_ARTIFACT_PATH" >&2
+              echo "  ABS_ARTIFACT_ROOT=$ABS_ARTIFACT_ROOT" >&2
+              exit 1
+              ;;
+          esac
+
           echo "Preparing to publish package from: $PACKAGE_DIR (artifact: $EXPECTED_ARTIFACT_PATH)"
 
           if [[ ! -d "$PACKAGE_DIR" ]]; then
@@ -330,6 +343,32 @@ jobs:
           if [[ ! -f "$PACKAGE_DIR/package.json" ]]; then
             echo "ERROR: package.json not found in $PACKAGE_DIR; refusing to publish." >&2
             exit 1
+          fi
+
+          # If the artifact also contains a package.json, ensure it matches the source package
+          if [[ -f "$EXPECTED_ARTIFACT_PATH/package.json" ]]; then
+            # Extract name and version from both package.json files using jq if available; fall back to grep/sed
+            if command -v jq >/dev/null 2>&1; then
+              SRC_NAME="$(jq -r '.name // empty' < "$PACKAGE_DIR/package.json")"
+              SRC_VERSION="$(jq -r '.version // empty' < "$PACKAGE_DIR/package.json")"
+              ART_NAME="$(jq -r '.name // empty' < "$EXPECTED_ARTIFACT_PATH/package.json")"
+              ART_VERSION="$(jq -r '.version // empty' < "$EXPECTED_ARTIFACT_PATH/package.json")"
+            else
+              SRC_NAME="$(grep -m1 '"name"' "$PACKAGE_DIR/package.json" | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+              SRC_VERSION="$(grep -m1 '"version"' "$PACKAGE_DIR/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+              ART_NAME="$(grep -m1 '"name"' "$EXPECTED_ARTIFACT_PATH/package.json" | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+              ART_VERSION="$(grep -m1 '"version"' "$EXPECTED_ARTIFACT_PATH/package.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+            fi
+
+            if [[ -n "$SRC_NAME" && -n "$ART_NAME" && "$SRC_NAME" != "$ART_NAME" ]]; then
+              echo "ERROR: Artifact package name ($ART_NAME) does not match source package name ($SRC_NAME); refusing to publish." >&2
+              exit 1
+            fi
+
+            if [[ -n "$SRC_VERSION" && -n "$ART_VERSION" && "$SRC_VERSION" != "$ART_VERSION" ]]; then
+              echo "ERROR: Artifact package version ($ART_VERSION) does not match source package version ($SRC_VERSION); refusing to publish." >&2
+              exit 1
+            fi
           fi
 
           bun ./scripts/publish.mjs "$PACKAGE_DIR"
