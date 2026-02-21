@@ -9,6 +9,17 @@ use std::{
     sync::LazyLock,
 };
 
+/// Base directory under which all test utility filesystem operations are constrained.
+/// Using a fixed directory under the system temp dir avoids trusting the current
+/// working directory (which may be user-controlled) as a security boundary.
+static TEST_UTIL_BASE: LazyLock<PathBuf> = LazyLock::new(|| {
+    let mut base = env::temp_dir();
+    base.push("foundry_test_utils");
+    // Ignore errors here; they will surface when the path is actually used.
+    let _ = fs::create_dir_all(&base);
+    base
+});
+
 /// Directories to skip when copying project directories.
 /// These are build artifacts and runtime-generated files that should not be copied to temp
 /// workspaces.
@@ -247,8 +258,9 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// This guards against using uncontrolled paths that could traverse outside the intended
 /// workspace (for example, via `..` components or absolute paths).
 fn resolve_and_validate_under_base(path: &Path) -> io::Result<PathBuf> {
-    // Choose the current working directory as the safe base for test utilities.
-    let base = env::current_dir()?;
+    // Use a fixed base directory for test utilities instead of the current working
+    // directory, which may be influenced by the environment.
+    let base = TEST_UTIL_BASE.clone();
 
     // If `path` is absolute, interpret it relative to the base by stripping the
     // root and joining the remaining components. This avoids treating arbitrary
