@@ -6,12 +6,12 @@ use crate::{
     evm::new_evm_with_inspector,
     fork::{CreateFork, ForkId, MultiFork},
     state_snapshot::StateSnapshots,
-    utils::{configure_tx_env, configure_tx_req_env, get_blob_base_fee_update_fraction_by_spec_id},
+    utils::{configure_tx_env, configure_tx_req_env, get_blob_base_fee_update_fraction},
 };
 use alloy_consensus::Typed2718;
 use alloy_evm::Evm;
 use alloy_genesis::GenesisAccount;
-use alloy_network::{AnyRpcBlock, AnyTxEnvelope, TransactionResponse};
+use alloy_network::{AnyNetwork, AnyRpcBlock, AnyTxEnvelope, TransactionResponse};
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256, uint};
 use alloy_rpc_types::{BlockNumberOrTag, Transaction, TransactionRequest};
 use eyre::Context;
@@ -21,7 +21,10 @@ use revm::{
     Database, DatabaseCommit, JournalEntry,
     bytecode::Bytecode,
     context::JournalInner,
-    context_interface::{block::BlobExcessGasAndPrice, result::ResultAndState},
+    context_interface::{
+        block::BlobExcessGasAndPrice, journaled_state::account::JournaledAccountTr,
+        result::ResultAndState,
+    },
     database::{CacheDB, DatabaseRef},
     inspector::NoOpInspector,
     precompile::{PrecompileSpecId, Precompiles},
@@ -435,7 +438,7 @@ struct _ObjectSafe(dyn DatabaseExt);
 #[must_use]
 pub struct Backend {
     /// The access point for managing forks
-    forks: MultiFork,
+    forks: MultiFork<AnyNetwork>,
     // The default in memory db
     mem_db: FoundryEvmInMemoryDB,
     /// The journaled_state to use to initialize new forks with
@@ -478,7 +481,7 @@ impl Backend {
     /// database.
     ///
     /// Prefer using [`spawn`](Self::spawn) instead.
-    pub fn new(forks: MultiFork, fork: Option<CreateFork>) -> eyre::Result<Self> {
+    pub fn new(forks: MultiFork<AnyNetwork>, fork: Option<CreateFork>) -> eyre::Result<Self> {
         trace!(target: "backend", forking_mode=?fork.is_some(), "creating executor backend");
         // Note: this will take of registering the `fork`
         let inner = BackendInner {
@@ -1954,7 +1957,7 @@ fn update_env_block(env: &mut EnvMut<'_>, block: &AnyRpcBlock) {
     if let Some(excess_blob_gas) = block.header.excess_blob_gas {
         env.block.blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(
             excess_blob_gas,
-            get_blob_base_fee_update_fraction_by_spec_id(env.cfg.spec),
+            get_blob_base_fee_update_fraction(env.cfg.chain_id, block.header.timestamp),
         ));
     }
 }

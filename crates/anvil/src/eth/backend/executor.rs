@@ -18,6 +18,7 @@ use alloy_consensus::{
     proofs::calculate_receipt_root, transaction::Either,
 };
 use alloy_eips::{
+    Encodable2718,
     eip7685::EMPTY_REQUESTS_HASH,
     eip7702::{RecoveredAuthority, RecoveredAuthorization},
     eip7840::BlobParams,
@@ -71,7 +72,7 @@ impl ExecutedTransaction {
         *cumulative_gas_used = cumulative_gas_used.saturating_add(self.gas_used);
 
         // successful return see [Return]
-        let status_code = u8::from(self.exit_reason as u8 <= InstructionResult::SelfDestruct as u8);
+        let status_code = u8::from(self.exit_reason.is_ok());
         let receipt_with_bloom: ReceiptWithBloom = Receipt {
             status: (status_code == 1).into(),
             cumulative_gas_used: *cumulative_gas_used,
@@ -210,14 +211,16 @@ impl<DB: Db + ?Sized, V: TransactionValidator> TransactionExecutor<'_, DB, V> {
             let ExecutedTransaction { transaction, logs, out, traces, exit_reason: exit, .. } = tx;
             build_logs_bloom(&logs, &mut bloom);
 
-            let contract_address = out.as_ref().and_then(|out| {
-                if let Output::Create(_, contract_address) = out {
-                    trace!(target: "backend", "New contract deployed: at {:?}", contract_address);
-                    *contract_address
-                } else {
-                    None
-                }
-            });
+            // For contract creation transactions, compute the contract address from sender + nonce.
+            // This should be set even if the transaction reverted, matching geth's behavior.
+            let sender = *transaction.pending_transaction.sender();
+            let contract_address = if transaction.pending_transaction.transaction.to().is_none() {
+                let addr = sender.create(tx.nonce);
+                trace!(target: "backend", "Contract creation tx: computed address {:?}", addr);
+                Some(addr)
+            } else {
+                None
+            };
 
             let transaction_index = transaction_infos.len() as u64;
             let info = TransactionInfo {
@@ -303,7 +306,7 @@ impl<DB: Db + ?Sized, V: TransactionValidator> TransactionExecutor<'_, DB, V> {
         }
 
         if self.networks.is_optimism() {
-            tx_env.enveloped_tx = Some(alloy_rlp::encode(tx.transaction.as_ref()).into());
+            tx_env.enveloped_tx = Some(tx.transaction.encoded_2718().into());
         }
 
         Env::new(self.evm_env.clone(), tx_env, self.networks)
@@ -502,7 +505,10 @@ where
 {
     if env.networks.is_optimism() {
         let evm_env = EvmEnv::new(
-            env.evm_env.cfg_env.clone().with_spec(op_revm::OpSpecId::ISTHMUS),
+            env.evm_env
+                .cfg_env
+                .clone()
+                .with_spec_and_mainnet_gas_params(op_revm::OpSpecId::ISTHMUS),
             env.evm_env.block_env.clone(),
         );
         EitherEvm::Op(OpEvmFactory::default().create_evm_with_inspector(db, evm_env, inspector))
