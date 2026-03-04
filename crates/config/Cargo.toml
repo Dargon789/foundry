@@ -51,6 +51,9 @@ walkdir.workspace = true
 yansi.workspace = true
 clap = { version = "4", features = ["derive"] }
 
+# schema
+schemars = { version = "1.0", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 path-slash = "0.2"
 
@@ -62,3 +65,4 @@ tempfile.workspace = true
 
 [features]
 isolate-by-default = []
+schema = ["dep:schemars"]
