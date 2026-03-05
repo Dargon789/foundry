@@ -1109,7 +1109,8 @@ mod tests {
     }
 
     fn temp_corpus_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("foundry-corpus-tests-{}", Uuid::new_v4()));
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let dir = base.join(format!("foundry-corpus-tests-{}", Uuid::new_v4()));
         let _ = fs::create_dir_all(&dir);
         dir
     }
