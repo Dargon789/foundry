@@ -11,8 +11,9 @@ use foundry_cheatcodes::{CheatcodeAnalysis, CheatcodesExecutor, Wallets};
 use foundry_common::compile::Analysis;
 use foundry_compilers::ProjectPathsConfig;
 use foundry_evm_core::{
-    ContextExt, Env, InspectorExt,
-    backend::{DatabaseExt, JournaledState},
+    Env, FoundryInspectorExt, InspectorExt,
+    backend::{DatabaseExt, FoundryJournalExt, JournaledState},
+    env::FoundryContextExt,
     evm::new_evm_with_inspector,
 };
 use foundry_evm_coverage::HitMaps;
@@ -21,10 +22,11 @@ use foundry_evm_traces::{SparsedTraceArena, TraceMode};
 use revm::{
     Inspector,
     context::{
-        BlockEnv,
+        BlockEnv, Cfg, ContextTr, JournalTr,
         result::{ExecutionResult, Output},
     },
     context_interface::CreateScheme,
+    inspector::JournalExt,
     interpreter::{
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
         Interpreter, InterpreterResult,
@@ -59,6 +61,9 @@ pub struct InspectorStackBuilder {
     /// Whether to enable tracing and revert diagnostics.
     pub trace_mode: TraceMode,
     /// Whether logs should be collected.
+    /// - None for no log collection.
+    /// - Some(true) for realtime console.log-ing.
+    /// - Some(false) for log collection.
     pub logs: Option<bool>,
     /// Whether line coverage info should be collected.
     pub line_coverage: Option<bool>,
@@ -134,10 +139,10 @@ impl InspectorStackBuilder {
         self
     }
 
-    /// Set whether to collect logs.
+    /// Set the log collector, and whether to print the logs directly to stdout.
     #[inline]
-    pub fn logs(mut self, yes: bool) -> Self {
-        self.logs = Some(yes);
+    pub fn logs(mut self, live_logs: bool) -> Self {
+        self.logs = Some(live_logs);
         self
     }
 
@@ -228,7 +233,7 @@ impl InspectorStackBuilder {
             stack.set_chisel(chisel_state);
         }
         stack.collect_line_coverage(line_coverage.unwrap_or(false));
-        stack.collect_logs(logs.unwrap_or(true));
+        stack.collect_logs(logs);
         stack.print(print.unwrap_or(false));
         stack.tracing(trace_mode);
 
@@ -366,6 +371,17 @@ impl CheatcodesExecutor for InspectorStackInner {
     fn tracing_inspector(&mut self) -> Option<&mut TracingInspector> {
         self.tracer.as_deref_mut()
     }
+
+    fn set_in_inner_context(&mut self, enabled: bool, original_origin: Option<Address>) {
+        self.in_inner_context = enabled;
+        self.inner_context_data = if enabled {
+            Some(InnerContextData {
+                original_origin: original_origin.expect("origin required when enabling inner ctx"),
+            })
+        } else {
+            None
+        };
+    }
 }
 
 impl InspectorStack {
@@ -479,9 +495,18 @@ impl InspectorStack {
     }
 
     /// Set whether to enable the log collector.
+    /// - None for no log collection.
+    /// - Some(true) for realtime console.log-ing.
+    /// - Some(false) for log collection.
     #[inline]
-    pub fn collect_logs(&mut self, yes: bool) {
-        self.log_collector = yes.then(Default::default);
+    pub fn collect_logs(&mut self, live_logs: Option<bool>) {
+        self.log_collector = live_logs.map(|live_logs| {
+            Box::new(if live_logs {
+                LogCollector::LiveLogs
+            } else {
+                LogCollector::Capture { logs: Vec::new() }
+            })
+        });
     }
 
     /// Set whether to enable the trace printer.
@@ -556,7 +581,7 @@ impl InspectorStack {
         });
 
         InspectorData {
-            logs: log_collector.map(|logs| logs.logs).unwrap_or_default(),
+            logs: log_collector.and_then(|logs| logs.into_captured_logs()).unwrap_or_default(),
             labels: cheatcodes
                 .as_ref()
                 .map(|cheatcodes| cheatcodes.labels.clone())
@@ -579,7 +604,7 @@ impl InspectorStackRefMut<'_> {
     fn adjust_evm_data_for_inner_context(&mut self, ecx: &mut EthEvmContext<&mut dyn DatabaseExt>) {
         let inner_context_data =
             self.inner_context_data.as_ref().expect("should be called in inner context");
-        ecx.tx.caller = inner_context_data.original_origin;
+        ecx.tx_mut().caller = inner_context_data.original_origin;
     }
 
     fn do_call_end(
@@ -654,29 +679,30 @@ impl InspectorStackRefMut<'_> {
         gas_limit: u64,
         value: U256,
     ) -> (InterpreterResult, Option<Address>) {
-        let cached_env = Env::from(ecx.cfg.clone(), ecx.block.clone(), ecx.tx.clone());
+        let cached_env = Env::from(ecx.cfg().clone(), ecx.block().clone(), ecx.tx().clone());
 
-        ecx.block.basefee = 0;
-        ecx.tx.chain_id = Some(ecx.cfg.chain_id);
-        ecx.tx.caller = caller;
-        ecx.tx.kind = kind;
-        ecx.tx.data = input;
-        ecx.tx.value = value;
+        ecx.block_mut().basefee = 0;
+        ecx.tx_mut().chain_id = Some(ecx.cfg().chain_id());
+        ecx.tx_mut().caller = caller;
+        ecx.tx_mut().kind = kind;
+        ecx.tx_mut().data = input;
+        ecx.tx_mut().value = value;
         // Add 21000 to the gas limit to account for the base cost of transaction.
-        ecx.tx.gas_limit = gas_limit + 21000;
+        ecx.tx_mut().gas_limit = gas_limit + 21000;
 
         // If we haven't disabled gas limit checks, ensure that transaction gas limit will not
         // exceed block gas limit.
-        if !ecx.cfg.disable_block_gas_limit {
-            ecx.tx.gas_limit = std::cmp::min(ecx.tx.gas_limit, ecx.block.gas_limit);
+        if !ecx.cfg().disable_block_gas_limit {
+            ecx.tx_mut().gas_limit = std::cmp::min(ecx.tx().gas_limit, ecx.block().gas_limit);
         }
-        ecx.tx.gas_price = 0;
+        ecx.tx_mut().gas_price = 0;
 
         self.inner_context_data = Some(InnerContextData { original_origin: cached_env.tx.caller });
         self.in_inner_context = true;
 
         let res = self.with_inspector(|inspector| {
-            let (db, journal, env) = ecx.as_db_env_and_journal();
+            let (journal, env) = ecx.journal_and_env_mut();
+            let (db, journal) = journal.as_db_and_inner();
             let mut evm = new_evm_with_inspector(db, env.to_owned(), inspector);
 
             evm.journaled_state.state = {
@@ -726,8 +752,8 @@ impl InspectorStackRefMut<'_> {
         };
 
         for (addr, mut acc) in res.state {
-            let Some(acc_mut) = ecx.journaled_state.state.get_mut(&addr) else {
-                ecx.journaled_state.state.insert(addr, acc);
+            let Some(acc_mut) = ecx.journal_mut().evm_state_mut().get_mut(&addr) else {
+                ecx.journal_mut().evm_state_mut().insert(addr, acc);
                 continue;
             };
 
@@ -797,7 +823,7 @@ impl InspectorStackRefMut<'_> {
         if self.enable_isolation {
             // If we're in isolation mode, we need to keep track of the state at the beginning of
             // the frame to be able to roll back on revert
-            self.top_frame_journal.clone_from(&ecx.journaled_state.state);
+            self.top_frame_journal.clone_from(ecx.journal().evm_state());
         }
     }
 
@@ -821,7 +847,7 @@ impl InspectorStackRefMut<'_> {
         // created We can't rely on revm's journal because it doesn't account for changes
         // made by isolated calls
         if self.enable_isolation {
-            ecx.journaled_state.state = std::mem::take(&mut self.top_frame_journal);
+            *ecx.journal_mut().evm_state_mut() = std::mem::take(&mut self.top_frame_journal);
         }
     }
 
@@ -934,12 +960,12 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
         ecx: &mut EthEvmContext<&mut dyn DatabaseExt>,
         call: &mut CallInputs,
     ) -> Option<CallOutcome> {
-        if self.in_inner_context && ecx.journaled_state.depth == 1 {
+        if self.in_inner_context && ecx.journal().depth() == 1 {
             self.adjust_evm_data_for_inner_context(ecx);
             return None;
         }
 
-        if ecx.journaled_state.depth == 0 {
+        if ecx.journal().depth() == 0 {
             self.top_level_frame_start(ecx);
         }
 
@@ -963,7 +989,7 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
 
         if let Some(cheatcodes) = self.cheatcodes.as_deref_mut() {
             // Handle mocked functions, replace bytecode address with mock if matched.
-            if let Some(mocks) = cheatcodes.mocked_functions.get(&call.target_address) {
+            if let Some(mocks) = cheatcodes.mocked_functions.get(&call.bytecode_address) {
                 let input_bytes = call.input.bytes(ecx);
                 // Check if any mock function set for call data or if catch-all mock function set
                 // for selector.
@@ -981,7 +1007,7 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
             }
         }
 
-        if self.enable_isolation && !self.in_inner_context && ecx.journaled_state.depth == 1 {
+        if self.enable_isolation && !self.in_inner_context && ecx.journal().depth() == 1 {
             match call.scheme {
                 // Isolate CALLs
                 CallScheme::Call => {
@@ -1003,8 +1029,8 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
                 }
                 // Mark accounts and storage cold before STATICCALLs
                 CallScheme::StaticCall => {
-                    let JournaledState { state, warm_addresses, .. } =
-                        &mut ecx.journaled_state.inner;
+                    let (_, journal_inner) = ecx.journal_mut().as_db_and_inner();
+                    let JournaledState { state, warm_addresses, .. } = journal_inner;
                     for (addr, acc_mut) in state {
                         // Do not mark accounts and storage cold accounts with arbitrary storage.
                         if let Some(cheatcodes) = &self.cheatcodes
@@ -1038,13 +1064,13 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
     ) {
         // We are processing inner context outputs in the outer context, so need to avoid processing
         // twice.
-        if self.in_inner_context && ecx.journaled_state.depth == 1 {
+        if self.in_inner_context && ecx.journal().depth() == 1 {
             return;
         }
 
         self.do_call_end(ecx, inputs, outcome);
 
-        if ecx.journaled_state.depth == 0 {
+        if ecx.journal().depth() == 0 {
             self.top_level_frame_end(ecx, outcome.result.result);
         }
     }
@@ -1054,12 +1080,12 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
         ecx: &mut EthEvmContext<&mut dyn DatabaseExt>,
         create: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
-        if self.in_inner_context && ecx.journaled_state.depth == 1 {
+        if self.in_inner_context && ecx.journal().depth() == 1 {
             self.adjust_evm_data_for_inner_context(ecx);
             return None;
         }
 
-        if ecx.journaled_state.depth == 0 {
+        if ecx.journal().depth() == 0 {
             self.top_level_frame_start(ecx);
         }
 
@@ -1069,18 +1095,18 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
             |inspector| inspector.create(ecx, create).map(Some),
         );
 
-        if !matches!(create.scheme, CreateScheme::Create2 { .. })
+        if !matches!(create.scheme(), CreateScheme::Create2 { .. })
             && self.enable_isolation
             && !self.in_inner_context
-            && ecx.journaled_state.depth == 1
+            && ecx.journal().depth() == 1
         {
             let (result, address) = self.transact_inner(
                 ecx,
                 TxKind::Create,
-                create.caller,
-                create.init_code.clone(),
-                create.gas_limit,
-                create.value,
+                create.caller(),
+                create.init_code().clone(),
+                create.gas_limit(),
+                create.value(),
             );
             return Some(CreateOutcome { result, address });
         }
@@ -1096,13 +1122,13 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
     ) {
         // We are processing inner context outputs in the outer context, so need to avoid processing
         // twice.
-        if self.in_inner_context && ecx.journaled_state.depth == 1 {
+        if self.in_inner_context && ecx.journal().depth() == 1 {
             return;
         }
 
         self.do_create_end(ecx, call, outcome);
 
-        if ecx.journaled_state.depth == 0 {
+        if ecx.journal().depth() == 0 {
             self.top_level_frame_end(ecx, outcome.result.result);
         }
     }
@@ -1116,23 +1142,19 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
     }
 }
 
-impl InspectorExt for InspectorStackRefMut<'_> {
-    fn should_use_create2_factory(
-        &mut self,
-        ecx: &mut EthEvmContext<&mut dyn DatabaseExt>,
-        inputs: &CreateInputs,
-    ) -> bool {
+impl FoundryInspectorExt for InspectorStackRefMut<'_> {
+    fn should_use_create2_factory(&mut self, depth: usize, inputs: &CreateInputs) -> bool {
         call_inspectors!(
             #[ret]
             [&mut self.cheatcodes],
-            |inspector| { inspector.should_use_create2_factory(ecx, inputs).then_some(true) },
+            |inspector| { inspector.should_use_create2_factory(depth, inputs).then_some(true) },
         );
 
         false
     }
 
     fn console_log(&mut self, msg: &str) {
-        call_inspectors!([&mut self.log_collector], |inspector| InspectorExt::console_log(
+        call_inspectors!([&mut self.log_collector], |inspector| FoundryInspectorExt::console_log(
             inspector, msg
         ));
     }
@@ -1223,13 +1245,9 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStack {
     }
 }
 
-impl InspectorExt for InspectorStack {
-    fn should_use_create2_factory(
-        &mut self,
-        ecx: &mut EthEvmContext<&mut dyn DatabaseExt>,
-        inputs: &CreateInputs,
-    ) -> bool {
-        self.as_mut().should_use_create2_factory(ecx, inputs)
+impl FoundryInspectorExt for InspectorStack {
+    fn should_use_create2_factory(&mut self, depth: usize, inputs: &CreateInputs) -> bool {
+        self.as_mut().should_use_create2_factory(depth, inputs)
     }
 
     fn get_networks(&self) -> NetworkConfigs {
