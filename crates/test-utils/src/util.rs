@@ -233,14 +233,29 @@ pub fn read_string(path: impl AsRef<Path>) -> String {
 /// copied to temporary test workspaces.
 pub fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
-    copy_dir_filtered_inner(src, dst, true)
+    // Canonicalize the source once and treat it as the base directory for all traversal.
+    let base = src.canonicalize()?;
+    copy_dir_filtered_inner(src, dst, &base, true)
 }
 
-fn copy_dir_filtered_inner(src: &Path, dst: &Path, is_root: bool) -> std::io::Result<()> {
+fn copy_dir_filtered_inner(
+    src: &Path,
+    dst: &Path,
+    base: &Path,
+    is_root: bool,
+) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         let src_path = entry.path();
+        // Ensure that any path we operate on stays within the original base directory.
+        let canonical_src_path = src_path.canonicalize()?;
+        if !canonical_src_path.starts_with(base) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attempted to access path outside of allowed base directory",
+            ));
+        }
         let dst_path = dst.join(entry.file_name());
 
         if ty.is_dir() {
@@ -252,9 +267,9 @@ fn copy_dir_filtered_inner(src: &Path, dst: &Path, is_root: bool) -> std::io::Re
                 continue;
             }
             fs::create_dir_all(&dst_path)?;
-            copy_dir_filtered_inner(&src_path, &dst_path, false)?;
+            copy_dir_filtered_inner(&src_path, &dst_path, base, false)?;
         } else {
-            fs::copy(&src_path, &dst_path)?;
+            fs::copy(&canonical_src_path, &dst_path)?;
         }
     }
     Ok(())
