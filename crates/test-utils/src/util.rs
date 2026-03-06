@@ -298,17 +298,25 @@ fn resolve_and_validate_under_base(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn copy_dir_filtered_inner(src: &Path, dst: &Path, is_root: bool) -> std::io::Result<()> {
-    for entry in fs::read_dir(src)? {
+    // Ensure that each recursion step operates on paths that are constrained to the
+    // configured base directory. This guarantees that any `src_path` passed to
+    // filesystem operations cannot escape the allowed workspace even if the initial
+    // input was influenced by the user.
+    let src = resolve_and_validate_under_base(src)?;
+    let dst = resolve_and_validate_under_base(dst)?;
+
+    for entry in fs::read_dir(&src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let name = entry.file_name();
+        let src_path = src.join(&name);
+        let dst_path = dst.join(&name);
 
         if ty.is_dir() {
             // Skip build artifact directories at the root level
             if is_root
-                && let Some(name) = entry.file_name().to_str()
-                && SKIP_DIRS.contains(&name)
+                && let Some(name_str) = name.to_str()
+                && SKIP_DIRS.contains(&name_str)
             {
                 continue;
             }
