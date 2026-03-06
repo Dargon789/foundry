@@ -13,7 +13,12 @@ use std::{
 /// Using a fixed directory under the system temp dir avoids trusting the current
 /// working directory (which may be user-controlled) as a security boundary.
 static TEST_UTIL_BASE: LazyLock<PathBuf> = LazyLock::new(|| {
-    let mut base = env::temp_dir();
+    // Resolve the system temp directory to an absolute, canonical path where possible.
+    // If canonicalization fails for any reason, fall back to the raw temp_dir value.
+    let tmp = env::temp_dir();
+    let mut base = tmp
+        .canonicalize()
+        .unwrap_or(tmp);
     base.push("foundry_test_utils");
     // Ignore errors here; they will surface when the path is actually used.
     let _ = fs::create_dir_all(&base);
