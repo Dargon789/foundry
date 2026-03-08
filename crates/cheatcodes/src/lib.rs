@@ -24,7 +24,7 @@ pub use config::CheatsConfig;
 pub use error::{Error, ErrorKind, Result};
 pub use inspector::{
     BroadcastableTransaction, BroadcastableTransactions, Cheatcodes, CheatcodesExecutor,
-    CheatsCtxExt,
+    CheatsCtxExt, NestedEvmClosure,
 };
 pub use spec::{CheatcodeDef, Vm};
 
@@ -88,7 +88,7 @@ pub(crate) trait Cheatcode<CTX>: CheatcodeDef {
     fn apply_full(
         &self,
         ccx: &mut CheatsCtxt<'_, CTX>,
-        executor: &mut dyn CheatcodesExecutor,
+        executor: &mut dyn CheatcodesExecutor<CTX>,
     ) -> Result {
         let _ = executor;
         self.apply_stateful(ccx)
