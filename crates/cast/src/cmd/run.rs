@@ -1,5 +1,6 @@
 use crate::{debug::handle_traces, utils::apply_chain_and_block_specific_env_changes};
 use alloy_consensus::{BlockHeader, Transaction};
+use alloy_evm::FromRecoveredTx;
 use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::{
     Address, Bytes, U256,
@@ -27,10 +28,9 @@ use foundry_evm::{
     executors::{EvmError, Executor, TracingExecutor},
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode, Traces},
-    utils::configure_tx_env,
 };
 use futures::TryFutureExt;
-use revm::{DatabaseRef, primitives::hardfork::SpecId};
+use revm::{DatabaseRef, context::TxEnv};
 
 /// CLI arguments for `cast run`.
 #[derive(Clone, Debug, Parser)]
@@ -182,8 +182,6 @@ impl RunArgs {
         env.evm_env.cfg_env.limit_contract_code_size = None;
         env.evm_env.block_env.number = U256::from(tx_block_number);
 
-        let mut parent_beacon_block_root = None;
-
         if let Some(block) = &block {
             env.evm_env.block_env.timestamp = U256::from(block.header.timestamp());
             env.evm_env.block_env.beneficiary = block.header.beneficiary();
@@ -191,10 +189,6 @@ impl RunArgs {
             env.evm_env.block_env.prevrandao = Some(block.header.mix_hash().unwrap_or_default());
             env.evm_env.block_env.basefee = block.header.base_fee_per_gas().unwrap_or_default();
             env.evm_env.block_env.gas_limit = block.header.gas_limit();
-
-            if env.evm_env.cfg_env.spec >= SpecId::CANCUN {
-                parent_beacon_block_root = block.header.parent_beacon_block_root;
-            }
 
             // TODO: we need a smarter way to map the block to the corresponding evm_version for
             // commonly used chains
@@ -228,12 +222,6 @@ impl RunArgs {
             create2_deployer,
             None,
         )?;
-
-        if let Some(parent_beacon_block_root) = parent_beacon_block_root {
-            let timestamp: u64 = env.evm_env.block_env.timestamp.try_into().wrap_err("failed to convert block timestamp to u64")?;
-            executor.process_beacon_block_root(timestamp, parent_beacon_block_root)?;
-        }
-
         let mut env = Env::new_with_spec_id(
             env.evm_env.cfg_env.clone(),
             env.evm_env.block_env.clone(),
@@ -270,7 +258,9 @@ impl RunArgs {
                         break;
                     }
 
-                    configure_tx_env(&mut env, tx);
+                    if let Some(tx_envelope) = tx.as_envelope() {
+                        env.tx = TxEnv::from_recovered_tx(tx_envelope, tx.from());
+                    }
 
                     env.evm_env.cfg_env.disable_balance_check = true;
 
@@ -311,7 +301,9 @@ impl RunArgs {
         let result = {
             executor.set_trace_printer(self.trace_printer);
 
-            configure_tx_env(&mut env, &tx);
+            if let Some(tx_envelope) = tx.as_envelope() {
+                env.tx = TxEnv::from_recovered_tx(tx_envelope, tx.from());
+            }
             if is_impersonated_tx(tx.as_ref()) {
                 env.evm_env.cfg_env.disable_balance_check = true;
             }
