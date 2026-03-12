@@ -5,10 +5,8 @@
 
 use super::CreateFork;
 use crate::Env;
-use alloy_consensus::BlockHeader;
 use alloy_network::Network;
 use alloy_primitives::{U256, map::HashMap};
-use alloy_provider::network::BlockResponse;
 use foundry_config::Config;
 use foundry_fork_db::{BackendHandler, BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
 use futures::{
@@ -535,17 +533,16 @@ impl<N: Network> Drop for ShutDownMultiFork<N> {
 async fn create_fork<N: Network>(
     mut fork: CreateFork,
 ) -> eyre::Result<(ForkId, CreatedFork<N>, BackendHandler<N>)> {
-    let provider = fork.evm_opts.fork_provider_with_url(&fork.url)?;
+    // Ensure evm_opts reflects the fork URL (may differ from the resolved CreateFork url when
+    // created via cheatcodes, where evm_opts is cloned from the base config).
+    fork.evm_opts.fork_url = Some(fork.url.clone());
+
+    let provider = fork.evm_opts.fork_provider_with_url::<N>(&fork.url)?;
 
     // Initialise the fork environment.
-    let (env, block) =
-        fork.evm_opts.fork_evm_env_with_provider::<_, N>(&fork.url, &provider).await?;
-    fork.env = env;
+    let (evm_env, number) = fork.evm_opts.fork_evm_env(&provider).await?;
+    fork.env.evm_env = evm_env;
     let meta = BlockchainDbMeta::new(fork.env.evm_env.block_env.clone(), fork.url.clone());
-
-    // We need to use the block number from the block because the env's number can be different on
-    // some L2s (e.g. Arbitrum).
-    let number = block.header().number();
 
     // Determine the cache path if caching is enabled.
     let cache_path = if fork.enable_caching {

@@ -38,7 +38,6 @@ use foundry_config::Config;
 use foundry_evm::{
     backend::{BlockchainDb, BlockchainDbMeta, SharedBackend},
     constants::DEFAULT_CREATE2_DEPLOYER,
-    core::AsEnvMut,
     hardfork::{
         FoundryHardfork, OpHardfork, ethereum_hardfork_from_block_tag,
         spec_id_from_ethereum_hardfork,
@@ -1286,10 +1285,10 @@ latest block number: {latest_block}"
 
         env.evm_env.block_env = BlockEnv {
             number: U256::from(fork_block_number),
-            timestamp: U256::from(block.header.timestamp),
-            difficulty: block.header.difficulty,
+            timestamp: U256::from(block.header.timestamp()),
+            difficulty: block.header.difficulty(),
             // ensures prevrandao is set
-            prevrandao: Some(block.header.mix_hash.unwrap_or_default()),
+            prevrandao: Some(block.header.mix_hash().unwrap_or_default()),
             gas_limit,
             // Keep previous `coinbase` and `basefee` value
             beneficiary: env.evm_env.block_env.beneficiary,
@@ -1315,41 +1314,42 @@ latest block number: {latest_block}"
         };
 
         // if not set explicitly we use the base fee of the latest block
-        if self.base_fee.is_none() {
-            if let Some(base_fee) = block.header.base_fee_per_gas {
-                self.base_fee = Some(base_fee);
-                env.evm_env.block_env.basefee = base_fee;
-                // this is the base fee of the current block, but we need the base fee of
-                // the next block
-                let next_block_base_fee = fees.get_next_block_base_fee_per_gas(
-                    block.header.gas_used,
-                    gas_limit,
-                    block.header.base_fee_per_gas.unwrap_or_default(),
-                );
+        if self.base_fee.is_none()
+            && let Some(base_fee) = block.header.base_fee_per_gas()
+        {
+            self.base_fee = Some(base_fee);
+            env.evm_env.block_env.basefee = base_fee;
+            // this is the base fee of the current block, but we need the base fee of
+            // the next block
+            let next_block_base_fee = fees.get_next_block_base_fee_per_gas(
+                block.header.gas_used(),
+                gas_limit,
+                block.header.base_fee_per_gas().unwrap_or_default(),
+            );
 
-                // update next base fee
-                fees.set_base_fee(next_block_base_fee);
-            }
-            if let (Some(blob_excess_gas), Some(blob_gas_used)) =
-                (block.header.excess_blob_gas, block.header.blob_gas_used)
-            {
-                // derive the blobparams that are active at this timestamp
-                let blob_params = get_blob_params(chain_id, block.header.timestamp);
+            // update next base fee
+            fees.set_base_fee(next_block_base_fee);
+        }
 
-                env.evm_env.block_env.blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(
-                    blob_excess_gas,
-                    blob_params.update_fraction as u64,
-                ));
+        if let (Some(blob_excess_gas), Some(blob_gas_used)) =
+            (block.header.excess_blob_gas(), block.header.blob_gas_used())
+        {
+            // Derive blob params using the fork block timestamp regardless of explicit base fee.
+            let blob_params = get_blob_params(chain_id, block.header.timestamp());
 
-                fees.set_blob_params(blob_params);
+            env.evm_env.block_env.blob_excess_gas_and_price = Some(BlobExcessGasAndPrice::new(
+                blob_excess_gas,
+                blob_params.update_fraction as u64,
+            ));
 
-                let next_block_blob_excess_gas =
-                    fees.get_next_block_blob_excess_gas(blob_excess_gas, blob_gas_used);
-                fees.set_blob_excess_gas_and_price(BlobExcessGasAndPrice::new(
-                    next_block_blob_excess_gas,
-                    blob_params.update_fraction as u64,
-                ));
-            }
+            fees.set_blob_params(blob_params);
+
+            let next_block_blob_excess_gas =
+                fees.get_next_block_blob_excess_gas(blob_excess_gas, blob_gas_used);
+            fees.set_blob_excess_gas_and_price(BlobExcessGasAndPrice::new(
+                next_block_blob_excess_gas,
+                blob_params.update_fraction as u64,
+            ));
         }
 
         // use remote gas price
@@ -1365,7 +1365,7 @@ latest block number: {latest_block}"
         let override_chain_id = self.chain_id;
         // apply changes such as difficulty -> prevrandao and chain specifics for current chain id
         apply_chain_and_block_specific_env_changes::<AnyNetwork>(
-            env.as_env_mut(),
+            &mut env.evm_env,
             &block,
             self.networks,
         );
@@ -1394,14 +1394,14 @@ latest block number: {latest_block}"
             provider,
             chain_id,
             override_chain_id,
-            timestamp: block.header.timestamp,
-            base_fee: block.header.base_fee_per_gas.map(|g| g as u128),
+            timestamp: block.header.timestamp(),
+            base_fee: block.header.base_fee_per_gas().map(|g| g as u128),
             timeout: self.fork_request_timeout,
             retries: self.fork_request_retries,
             backoff: self.fork_retry_backoff,
             compute_units_per_second: self.compute_units_per_second,
             total_difficulty: block.header.total_difficulty.unwrap_or_default(),
-            blob_gas_used: block.header.blob_gas_used.map(|g| g as u128),
+            blob_gas_used: block.header.blob_gas_used().map(|g| g as u128),
             blob_excess_gas_and_price: env.evm_env.block_env.blob_excess_gas_and_price,
             force_transactions,
         };
@@ -1468,7 +1468,7 @@ async fn derive_block_and_transactions(
                 .get_transaction_by_hash(transaction_hash.0.into())
                 .await?
                 .ok_or_else(|| eyre::eyre!("failed to get fork transaction by hash"))?;
-            let transaction_block_number = transaction.block_number.ok_or_else(|| {
+            let transaction_block_number = transaction.block_number().ok_or_else(|| {
                 eyre::eyre!("fork transaction is not mined yet (no block number)")
             })?;
 

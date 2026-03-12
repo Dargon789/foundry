@@ -1,17 +1,18 @@
 use alloy_consensus::{
-    Sealed, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope, TxLegacy, TxType,
-    Typed2718,
+    Sealed, SignableTransaction, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope,
+    TxLegacy, TxType, Typed2718,
     crypto::RecoveryError,
     transaction::{
-        TxEip7702,
+        SignerRecoverable, TxEip7702, TxHashRef,
         eip4844::{TxEip4844Variant, TxEip4844WithSidecar},
     },
 };
 use alloy_evm::FromRecoveredTx;
 use alloy_network::{AnyRpcTransaction, AnyTxEnvelope, TransactionResponse};
-use alloy_primitives::{Address, B256};
-use alloy_rlp::Encodable;
+use alloy_primitives::{Address, B256, ChainId, TxHash};
+use alloy_rlp::BufMut;
 use alloy_rpc_types::ConversionError;
+use alloy_signer::Signature;
 use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, OpTransaction as OpTransactionTrait, TxDeposit};
 use op_revm::OpTransaction;
 use revm::context::TxEnv;
@@ -106,16 +107,6 @@ impl FoundryTxEnvelope {
         }
     }
 
-    /// Returns the hash if the transaction is impersonated (using a fake signature)
-    ///
-    /// This appends the `address` before hashing it
-    pub fn impersonated_hash(&self, sender: Address) -> B256 {
-        let mut buffer = Vec::new();
-        Encodable::encode(self, &mut buffer);
-        buffer.extend_from_slice(sender.as_ref());
-        B256::from_slice(alloy_primitives::utils::keccak256(&buffer).as_slice())
-    }
-
     /// Recovers the Ethereum address which was used to sign the transaction.
     pub fn recover(&self) -> Result<Address, RecoveryError> {
         Ok(match self {
@@ -127,6 +118,30 @@ impl FoundryTxEnvelope {
             Self::Deposit(tx) => tx.from,
             Self::Tempo(tx) => tx.signature().recover_signer(&tx.signature_hash())?,
         })
+    }
+}
+
+impl TxHashRef for FoundryTxEnvelope {
+    fn tx_hash(&self) -> &TxHash {
+        match self {
+            Self::Legacy(t) => t.hash(),
+            Self::Eip2930(t) => t.hash(),
+            Self::Eip1559(t) => t.hash(),
+            Self::Eip4844(t) => t.hash(),
+            Self::Eip7702(t) => t.hash(),
+            Self::Deposit(t) => t.hash_ref(),
+            Self::Tempo(t) => t.hash(),
+        }
+    }
+}
+
+impl SignerRecoverable for FoundryTxEnvelope {
+    fn recover_signer(&self) -> Result<Address, RecoveryError> {
+        self.recover()
+    }
+
+    fn recover_signer_unchecked(&self) -> Result<Address, RecoveryError> {
+        self.recover()
     }
 }
 
@@ -181,6 +196,39 @@ impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
 
                 let tx_type = tx.ty();
                 Err(ConversionError::Custom(format!("Unknown transaction type: 0x{tx_type:02X}")))
+            }
+        }
+    }
+}
+
+// TODO: This is tmp implementation, remove it after Cast refactor being finished
+impl From<Signed<FoundryTypedTx>> for FoundryTxEnvelope {
+    fn from(value: Signed<FoundryTypedTx>) -> Self {
+        let (tx, sig, hash) = value.into_parts();
+        match tx {
+            FoundryTypedTx::Legacy(tx_legacy) => {
+                let tx = Signed::new_unchecked(tx_legacy, sig, hash);
+                Self::Legacy(tx)
+            }
+            FoundryTypedTx::Eip2930(tx_eip2930) => {
+                let tx = Signed::new_unchecked(tx_eip2930, sig, hash);
+                Self::Eip2930(tx)
+            }
+            FoundryTypedTx::Eip1559(tx_eip1559) => {
+                let tx = Signed::new_unchecked(tx_eip1559, sig, hash);
+                Self::Eip1559(tx)
+            }
+            FoundryTypedTx::Eip4844(tx_eip4844) => {
+                let tx = Signed::new_unchecked(tx_eip4844, sig, hash);
+                Self::Eip4844(tx)
+            }
+            FoundryTypedTx::Eip7702(tx_eip7702) => {
+                let tx = Signed::new_unchecked(tx_eip7702, sig, hash);
+                Self::Eip7702(tx)
+            }
+            FoundryTypedTx::Deposit(tx) => Self::Deposit(Sealed::new_unchecked(tx, hash)),
+            FoundryTypedTx::Tempo(tempo_transaction) => {
+                Self::Tempo(tempo_transaction.into_signed(sig.into()))
             }
         }
     }
@@ -258,11 +306,149 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
     }
 }
 
+// TODO: This is tmp implementation, remove it after Cast refactor being finished
+impl alloy_consensus::transaction::RlpEcdsaEncodableTx for FoundryTypedTx {
+    fn rlp_encoded_fields_length(&self) -> usize {
+        match self {
+            Self::Legacy(tx) => tx.rlp_encoded_fields_length(),
+            Self::Eip2930(tx) => tx.rlp_encoded_fields_length(),
+            Self::Eip1559(tx) => tx.rlp_encoded_fields_length(),
+            Self::Eip4844(tx) => tx.rlp_encoded_fields_length(),
+            Self::Eip7702(tx) => tx.rlp_encoded_fields_length(),
+            // TxDeposit & TempoTransaction impls are private
+            Self::Deposit(_) => 0,
+            Self::Tempo(_) => 0,
+        }
+    }
+
+    fn rlp_encode_fields(&self, out: &mut dyn BufMut) {
+        match self {
+            Self::Legacy(tx) => tx.rlp_encode_fields(out),
+            Self::Eip2930(tx) => tx.rlp_encode_fields(out),
+            Self::Eip1559(tx) => tx.rlp_encode_fields(out),
+            Self::Eip4844(tx) => tx.rlp_encode_fields(out),
+            Self::Eip7702(tx) => tx.rlp_encode_fields(out),
+            Self::Deposit(_) => {}
+            Self::Tempo(_) => {}
+        }
+    }
+
+    fn eip2718_encode_with_type(&self, signature: &Signature, _ty: u8, out: &mut dyn BufMut) {
+        match self {
+            Self::Legacy(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
+            Self::Eip2930(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
+            Self::Eip1559(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
+            Self::Eip4844(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
+            Self::Eip7702(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
+            Self::Deposit(_) => {}
+            Self::Tempo(_) => {}
+        }
+    }
+
+    fn eip2718_encode(&self, signature: &Signature, out: &mut dyn BufMut) {
+        match self {
+            Self::Legacy(tx) => tx.eip2718_encode(signature, out),
+            Self::Eip2930(tx) => tx.eip2718_encode(signature, out),
+            Self::Eip1559(tx) => tx.eip2718_encode(signature, out),
+            Self::Eip4844(tx) => tx.eip2718_encode(signature, out),
+            Self::Eip7702(tx) => tx.eip2718_encode(signature, out),
+            Self::Deposit(_) => {}
+            Self::Tempo(_) => {}
+        }
+    }
+
+    fn network_encode_with_type(&self, signature: &Signature, _ty: u8, out: &mut dyn BufMut) {
+        match self {
+            Self::Legacy(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
+            Self::Eip2930(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
+            Self::Eip1559(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
+            Self::Eip4844(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
+            Self::Eip7702(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
+            Self::Deposit(_) => {}
+            Self::Tempo(_) => {}
+        }
+    }
+
+    fn network_encode(&self, signature: &Signature, out: &mut dyn BufMut) {
+        match self {
+            Self::Legacy(tx) => tx.network_encode(signature, out),
+            Self::Eip2930(tx) => tx.network_encode(signature, out),
+            Self::Eip1559(tx) => tx.network_encode(signature, out),
+            Self::Eip4844(tx) => tx.network_encode(signature, out),
+            Self::Eip7702(tx) => tx.network_encode(signature, out),
+            Self::Deposit(_) => {}
+            Self::Tempo(_) => {}
+        }
+    }
+
+    fn tx_hash_with_type(&self, signature: &Signature, _ty: u8) -> TxHash {
+        match self {
+            Self::Legacy(tx) => tx.tx_hash_with_type(signature, tx.ty()),
+            Self::Eip2930(tx) => tx.tx_hash_with_type(signature, tx.ty()),
+            Self::Eip1559(tx) => tx.tx_hash_with_type(signature, tx.ty()),
+            Self::Eip4844(tx) => tx.tx_hash_with_type(signature, tx.ty()),
+            Self::Eip7702(tx) => tx.tx_hash_with_type(signature, tx.ty()),
+            Self::Deposit(_) => Default::default(),
+            Self::Tempo(_) => Default::default(),
+        }
+    }
+
+    fn tx_hash(&self, signature: &Signature) -> TxHash {
+        match self {
+            Self::Legacy(tx) => tx.tx_hash(signature),
+            Self::Eip2930(tx) => tx.tx_hash(signature),
+            Self::Eip1559(tx) => tx.tx_hash(signature),
+            Self::Eip4844(tx) => tx.tx_hash(signature),
+            Self::Eip7702(tx) => tx.tx_hash(signature),
+            Self::Deposit(_) => Default::default(),
+            Self::Tempo(_) => Default::default(),
+        }
+    }
+}
+
+impl SignableTransaction<Signature> for FoundryTypedTx {
+    fn set_chain_id(&mut self, chain_id: ChainId) {
+        match self {
+            Self::Legacy(tx) => tx.set_chain_id(chain_id),
+            Self::Eip2930(tx) => tx.set_chain_id(chain_id),
+            Self::Eip1559(tx) => tx.set_chain_id(chain_id),
+            Self::Eip4844(tx) => tx.set_chain_id(chain_id),
+            Self::Eip7702(tx) => tx.set_chain_id(chain_id),
+            Self::Deposit(_) => {}
+            Self::Tempo(tx) => tx.set_chain_id(chain_id),
+        }
+    }
+
+    fn encode_for_signing(&self, out: &mut dyn BufMut) {
+        match self {
+            Self::Legacy(tx) => tx.encode_for_signing(out),
+            Self::Eip2930(tx) => tx.encode_for_signing(out),
+            Self::Eip1559(tx) => tx.encode_for_signing(out),
+            Self::Eip4844(tx) => tx.encode_for_signing(out),
+            Self::Eip7702(tx) => tx.encode_for_signing(out),
+            Self::Deposit(_) => {}
+            Self::Tempo(tx) => tx.encode_for_signing(out),
+        }
+    }
+
+    fn payload_len_for_signature(&self) -> usize {
+        match self {
+            Self::Legacy(tx) => tx.payload_len_for_signature(),
+            Self::Eip2930(tx) => tx.payload_len_for_signature(),
+            Self::Eip1559(tx) => tx.payload_len_for_signature(),
+            Self::Eip4844(tx) => tx.payload_len_for_signature(),
+            Self::Eip7702(tx) => tx.payload_len_for_signature(),
+            Self::Deposit(_) => 0,
+            Self::Tempo(tx) => tx.payload_len_for_signature(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use alloy_primitives::{Bytes, Signature, TxHash, TxKind, U256, b256, hex};
+    use alloy_primitives::{Bytes, TxKind, U256, b256, hex};
     use alloy_rlp::Decodable;
 
     use super::*;

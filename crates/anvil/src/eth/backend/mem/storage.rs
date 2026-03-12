@@ -10,8 +10,9 @@ use crate::eth::{
     },
     pool::transactions::PoolTransaction,
 };
-use alloy_consensus::{Header, constants::EMPTY_WITHDRAWALS};
+use alloy_consensus::{BlockHeader, Header, constants::EMPTY_WITHDRAWALS};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
+use alloy_network::Network;
 use alloy_primitives::{
     B256, Bytes, U256,
     map::{B256HashMap, HashMap},
@@ -31,7 +32,7 @@ use foundry_evm::{
     backend::MemDb,
     traces::{CallKind, ParityTraceBuilder, TracingInspectorConfig},
 };
-use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxReceipt};
+use foundry_primitives::{FoundryNetwork, FoundryTxEnvelope};
 use parking_lot::RwLock;
 use revm::{context::Block as RevmBlock, primitives::hardfork::SpecId};
 use std::{collections::VecDeque, fmt, path::PathBuf, sync::Arc, time::Duration};
@@ -258,7 +259,7 @@ impl Default for InMemoryBlockStates {
 
 /// Stores the blockchain data (blocks, transactions)
 #[derive(Clone, Debug)]
-pub struct BlockchainStorage {
+pub struct BlockchainStorage<N: Network> {
     /// all stored blocks (block hash -> block)
     pub blocks: B256HashMap<Block>,
     /// mapping from block number -> block hash
@@ -271,12 +272,12 @@ pub struct BlockchainStorage {
     pub genesis_hash: B256,
     /// Mapping from the transaction hash to a tuple containing the transaction as well as the
     /// transaction receipt
-    pub transactions: B256HashMap<MinedTransaction>,
+    pub transactions: B256HashMap<MinedTransaction<N>>,
     /// The total difficulty of the chain until this block
     pub total_difficulty: U256,
 }
 
-impl BlockchainStorage {
+impl BlockchainStorage<FoundryNetwork> {
     /// Creates a new storage with a genesis block
     pub fn new(
         env: &Env,
@@ -394,7 +395,7 @@ impl BlockchainStorage {
     }
 }
 
-impl BlockchainStorage {
+impl<N: Network> BlockchainStorage<N> {
     /// Returns the hash for [BlockNumberOrTag]
     pub fn hash(&self, number: BlockNumberOrTag) -> Option<B256> {
         let slots_in_an_epoch = 32;
@@ -419,13 +420,18 @@ impl BlockchainStorage {
             }
         }
     }
+}
 
+impl BlockchainStorage<FoundryNetwork> {
     pub fn serialized_blocks(&self) -> Vec<SerializableBlock> {
         self.blocks.values().map(|block| block.clone().into()).collect()
     }
 
     pub fn serialized_transactions(&self) -> Vec<SerializableTransaction> {
-        self.transactions.values().map(|tx: &MinedTransaction| tx.clone().into()).collect()
+        self.transactions
+            .values()
+            .map(|tx: &MinedTransaction<FoundryNetwork>| tx.clone().into())
+            .collect()
     }
 
     /// Deserialize and add all blocks data to the backend storage
@@ -433,7 +439,7 @@ impl BlockchainStorage {
         for serializable_block in &serializable_blocks {
             let block: Block = serializable_block.clone().into();
             let block_hash = block.header.hash_slow();
-            let block_number = block.header.number;
+            let block_number = block.header.number();
             self.blocks.insert(block_hash, block);
             self.hashes.insert(block_number, block_hash);
 
@@ -449,7 +455,8 @@ impl BlockchainStorage {
     /// Deserialize and add all blocks data to the backend storage
     pub fn load_transactions(&mut self, serializable_transactions: Vec<SerializableTransaction>) {
         for serializable_transaction in &serializable_transactions {
-            let transaction: MinedTransaction = serializable_transaction.clone().into();
+            let transaction: MinedTransaction<FoundryNetwork> =
+                serializable_transaction.clone().into();
             self.transactions.insert(transaction.info.transaction_hash, transaction);
         }
     }
@@ -457,12 +464,12 @@ impl BlockchainStorage {
 
 /// A simple in-memory blockchain
 #[derive(Clone, Debug)]
-pub struct Blockchain {
+pub struct Blockchain<N: Network> {
     /// underlying storage that supports concurrent reads
-    pub storage: Arc<RwLock<BlockchainStorage>>,
+    pub storage: Arc<RwLock<BlockchainStorage<N>>>,
 }
 
-impl Blockchain {
+impl Blockchain<FoundryNetwork> {
     /// Creates a new storage with a genesis block
     pub fn new(
         env: &Env,
@@ -491,7 +498,9 @@ impl Blockchain {
             ))),
         }
     }
+}
 
+impl<N: Network> Blockchain<N> {
     /// returns the header hash of given block
     pub fn hash(&self, id: BlockId) -> Option<B256> {
         match id {
@@ -504,7 +513,7 @@ impl Blockchain {
         self.storage.read().blocks.get(hash).cloned()
     }
 
-    pub fn get_transaction_by_hash(&self, hash: &B256) -> Option<MinedTransaction> {
+    pub fn get_transaction_by_hash(&self, hash: &B256) -> Option<MinedTransaction<N>> {
         self.storage.read().transactions.get(hash).cloned()
     }
 
@@ -515,27 +524,46 @@ impl Blockchain {
 }
 
 /// Represents the outcome of mining a new block
-#[derive(Clone, Debug)]
-pub struct MinedBlockOutcome {
+pub struct MinedBlockOutcome<T = FoundryTxEnvelope> {
     /// The block that was mined
     pub block_number: u64,
     /// All transactions included in the block
-    pub included: Vec<Arc<PoolTransaction>>,
+    pub included: Vec<Arc<PoolTransaction<T>>>,
     /// All transactions that were attempted to be included but were invalid at the time of
     /// execution
-    pub invalid: Vec<Arc<PoolTransaction>>,
+    pub invalid: Vec<Arc<PoolTransaction<T>>>,
+}
+
+impl<T> Clone for MinedBlockOutcome<T> {
+    fn clone(&self) -> Self {
+        Self {
+            block_number: self.block_number,
+            included: self.included.clone(),
+            invalid: self.invalid.clone(),
+        }
+    }
+}
+
+impl<T> fmt::Debug for MinedBlockOutcome<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MinedBlockOutcome")
+            .field("block_number", &self.block_number)
+            .field("included", &self.included.len())
+            .field("invalid", &self.invalid.len())
+            .finish()
+    }
 }
 
 /// Container type for a mined transaction
 #[derive(Clone, Debug)]
-pub struct MinedTransaction {
+pub struct MinedTransaction<N: Network> {
     pub info: TransactionInfo,
-    pub receipt: FoundryReceiptEnvelope,
+    pub receipt: N::ReceiptEnvelope,
     pub block_hash: B256,
     pub block_number: u64,
 }
 
-impl MinedTransaction {
+impl<N: Network> MinedTransaction<N> {
     /// Returns the traces of the transaction for `trace_transaction`
     pub fn parity_traces(&self) -> Vec<LocalizedTransactionTrace> {
         ParityTraceBuilder::new(
@@ -549,6 +577,7 @@ impl MinedTransaction {
             block_hash: Some(self.block_hash),
             block_number: Some(self.block_number),
             base_fee: None,
+            block_timestamp: None,
         })
     }
 
@@ -580,9 +609,9 @@ impl MinedTransaction {
 
 /// Intermediary Anvil representation of a receipt
 #[derive(Clone, Debug)]
-pub struct MinedTransactionReceipt {
+pub struct MinedTransactionReceipt<N: Network> {
     /// The actual json rpc receipt object
-    pub inner: FoundryTxReceipt,
+    pub inner: N::ReceiptResponse,
     /// Output data for the transaction
     pub out: Option<Bytes>,
 }
@@ -593,7 +622,6 @@ mod tests {
     use crate::eth::backend::db::Db;
     use alloy_primitives::{Address, hex};
     use alloy_rlp::Decodable;
-    use foundry_primitives::FoundryTxEnvelope;
     use revm::{database::DatabaseRef, state::AccountInfo};
 
     #[test]
@@ -695,7 +723,7 @@ mod tests {
     // reloaded
     #[test]
     fn test_storage_dump_reload_cycle() {
-        let mut dump_storage = BlockchainStorage::empty();
+        let mut dump_storage = BlockchainStorage::<FoundryNetwork>::empty();
 
         let header = Header { gas_limit: 123456, ..Default::default() };
         let bytes_first = &mut &hex::decode("f86b02843b9aca00830186a094d3e8763675e4c425df46cc3b5c0f6cbdac39604687038d7ea4c68000802ba00eb96ca19e8a77102767a41fc85a36afd5c61ccb09911cec5d3e86e193d9c5aea03a456401896b1b6055311536bf00a718568c744d8c1f9df59879e8350220ca18").unwrap()[..];
@@ -708,13 +736,13 @@ mod tests {
         let serialized_blocks = dump_storage.serialized_blocks();
         let serialized_transactions = dump_storage.serialized_transactions();
 
-        let mut load_storage = BlockchainStorage::empty();
+        let mut load_storage = BlockchainStorage::<FoundryNetwork>::empty();
 
         load_storage.load_blocks(serialized_blocks);
         load_storage.load_transactions(serialized_transactions);
 
         let loaded_block = load_storage.blocks.get(&block_hash).unwrap();
-        assert_eq!(loaded_block.header.gas_limit, { header.gas_limit });
+        assert_eq!(loaded_block.header.gas_limit(), header.gas_limit());
         let loaded_tx = loaded_block.body.transactions.first().unwrap();
         assert_eq!(loaded_tx, &tx);
     }
