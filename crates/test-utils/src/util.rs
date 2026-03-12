@@ -235,25 +235,28 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     // Canonicalize the source once and treat it as the base directory for all traversal.
     let base = src.canonicalize()?;
-    copy_dir_filtered_inner(src, dst, &base, true)
+    // Canonicalize the destination once and treat it as the base directory for all writes.
+    let dst_base = dst.canonicalize()?;
+    copy_dir_filtered_inner(src, dst, &base, &dst_base, true)
 }
 
 fn copy_dir_filtered_inner(
     src: &Path,
     dst: &Path,
-    base: &Path,
+    base_src: &Path,
+    base_dst: &Path,
     is_root: bool,
 ) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         let src_path = entry.path();
-        // Ensure that any path we operate on stays within the original base directory.
+        // Ensure that any path we operate on stays within the original source base directory.
         let canonical_src_path = src_path.canonicalize()?;
-        if !canonical_src_path.starts_with(base) {
+        if !canonical_src_path.starts_with(base_src) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "attempted to access path outside of allowed base directory",
+                "attempted to access path outside of allowed source base directory",
             ));
         }
         let dst_path = dst.join(entry.file_name());
@@ -266,10 +269,58 @@ fn copy_dir_filtered_inner(
             {
                 continue;
             }
+            // Ensure that the destination directory stays within the allowed destination base.
+            let canonical_dst_dir = dst_path.canonicalize().or_else(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    // Directory does not exist yet; ensure its parent is within base_dst.
+                    if let Some(parent) = dst_path.parent() {
+                        let parent_canonical = parent.canonicalize()?;
+                        if !parent_canonical.starts_with(base_dst) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "attempted to create directory outside of allowed destination base directory",
+                            ));
+                        }
+                    }
+                    Ok(dst_path.clone())
+                } else {
+                    Err(err)
+                }
+            })?;
+            if !canonical_dst_dir.starts_with(base_dst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "attempted to create directory outside of allowed destination base directory",
+                ));
+            }
             fs::create_dir_all(&dst_path)?;
-            copy_dir_filtered_inner(&src_path, &dst_path, base, false)?;
+            copy_dir_filtered_inner(&src_path, &dst_path, base_src, base_dst, false)?;
         } else {
-            fs::copy(&canonical_src_path, &dst_path)?;
+            // Ensure that the destination file path stays within the allowed destination base.
+            let canonical_dst_path = dst_path.canonicalize().or_else(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    // File does not exist yet; ensure its parent is within base_dst.
+                    if let Some(parent) = dst_path.parent() {
+                        let parent_canonical = parent.canonicalize()?;
+                        if !parent_canonical.starts_with(base_dst) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "attempted to write file outside of allowed destination base directory",
+                            ));
+                        }
+                    }
+                    Ok(dst_path.clone())
+                } else {
+                    Err(err)
+                }
+            })?;
+            if !canonical_dst_path.starts_with(base_dst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "attempted to write file outside of allowed destination base directory",
+                ));
+            }
+            fs::copy(&canonical_src_path, &canonical_dst_path)?;
         }
     }
     Ok(())
