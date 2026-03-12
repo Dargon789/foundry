@@ -1,5 +1,5 @@
 use crate::{debug::handle_traces, utils::apply_chain_and_block_specific_env_changes};
-use alloy_consensus::Transaction;
+use alloy_consensus::{BlockHeader, Transaction};
 use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::{
     Address, Bytes, U256,
@@ -185,12 +185,12 @@ impl RunArgs {
         let mut parent_beacon_block_root = None;
 
         if let Some(block) = &block {
-            env.evm_env.block_env.timestamp = U256::from(block.header.timestamp);
-            env.evm_env.block_env.beneficiary = block.header.beneficiary;
-            env.evm_env.block_env.difficulty = block.header.difficulty;
-            env.evm_env.block_env.prevrandao = Some(block.header.mix_hash.unwrap_or_default());
-            env.evm_env.block_env.basefee = block.header.base_fee_per_gas.unwrap_or_default();
-            env.evm_env.block_env.gas_limit = block.header.gas_limit;
+            env.evm_env.block_env.timestamp = U256::from(block.header.timestamp());
+            env.evm_env.block_env.beneficiary = block.header.beneficiary();
+            env.evm_env.block_env.difficulty = block.header.difficulty();
+            env.evm_env.block_env.prevrandao = Some(block.header.mix_hash().unwrap_or_default());
+            env.evm_env.block_env.basefee = block.header.base_fee_per_gas().unwrap_or_default();
+            env.evm_env.block_env.gas_limit = block.header.gas_limit();
 
             if env.evm_env.cfg_env.spec >= SpecId::CANCUN {
                 parent_beacon_block_root = block.header.parent_beacon_block_root;
@@ -200,7 +200,7 @@ impl RunArgs {
             // commonly used chains
             if evm_version.is_none() {
                 // if the block has the excess_blob_gas field, we assume it's a Cancun block
-                if block.header.excess_blob_gas.is_some() {
+                if block.header.excess_blob_gas().is_some() {
                     evm_version = Some(EvmVersion::Prague);
                 }
             }
