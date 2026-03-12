@@ -1,5 +1,5 @@
 use crate::{debug::handle_traces, utils::apply_chain_and_block_specific_env_changes};
-use alloy_consensus::Transaction;
+use alloy_consensus::{BlockHeader, Transaction};
 use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::{
     Address, Bytes, U256,
@@ -24,7 +24,6 @@ use foundry_config::{
 };
 use foundry_evm::{
     Env,
-    core::env::AsEnvMut,
     executors::{EvmError, Executor, TracingExecutor},
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode, Traces},
@@ -186,12 +185,12 @@ impl RunArgs {
         let mut parent_beacon_block_root = None;
 
         if let Some(block) = &block {
-            env.evm_env.block_env.timestamp = U256::from(block.header.timestamp);
-            env.evm_env.block_env.beneficiary = block.header.beneficiary;
-            env.evm_env.block_env.difficulty = block.header.difficulty;
-            env.evm_env.block_env.prevrandao = Some(block.header.mix_hash.unwrap_or_default());
-            env.evm_env.block_env.basefee = block.header.base_fee_per_gas.unwrap_or_default();
-            env.evm_env.block_env.gas_limit = block.header.gas_limit;
+            env.evm_env.block_env.timestamp = U256::from(block.header.timestamp());
+            env.evm_env.block_env.beneficiary = block.header.beneficiary();
+            env.evm_env.block_env.difficulty = block.header.difficulty();
+            env.evm_env.block_env.prevrandao = Some(block.header.mix_hash().unwrap_or_default());
+            env.evm_env.block_env.basefee = block.header.base_fee_per_gas().unwrap_or_default();
+            env.evm_env.block_env.gas_limit = block.header.gas_limit();
 
             if env.evm_env.cfg_env.spec >= SpecId::CANCUN {
                 parent_beacon_block_root = block.header.parent_beacon_block_root;
@@ -201,12 +200,12 @@ impl RunArgs {
             // commonly used chains
             if evm_version.is_none() {
                 // if the block has the excess_blob_gas field, we assume it's a Cancun block
-                if block.header.excess_blob_gas.is_some() {
+                if block.header.excess_blob_gas().is_some() {
                     evm_version = Some(EvmVersion::Prague);
                 }
             }
             apply_chain_and_block_specific_env_changes::<AnyNetwork>(
-                env.as_env_mut(),
+                &mut env.evm_env,
                 block,
                 config.networks,
             );
@@ -271,7 +270,7 @@ impl RunArgs {
                         break;
                     }
 
-                    configure_tx_env(&mut env.as_env_mut(), tx);
+                    configure_tx_env(&mut env, tx);
 
                     env.evm_env.cfg_env.disable_balance_check = true;
 
@@ -312,7 +311,7 @@ impl RunArgs {
         let result = {
             executor.set_trace_printer(self.trace_printer);
 
-            configure_tx_env(&mut env.as_env_mut(), &tx);
+            configure_tx_env(&mut env, &tx);
             if is_impersonated_tx(tx.as_ref()) {
                 env.evm_env.cfg_env.disable_balance_check = true;
             }

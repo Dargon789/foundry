@@ -38,7 +38,6 @@ mesc.workspace = true
 unit-prefix = "0.5.2"
 rayon.workspace = true
 regex.workspace = true
-reqwest.workspace = true
 semver = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
 serde.workspace = true
@@ -51,6 +50,9 @@ walkdir.workspace = true
 yansi.workspace = true
 clap = { version = "4", features = ["derive"] }
 
+# schema
+schemars = { version = "1.0", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 path-slash = "0.2"
 
@@ -62,3 +64,4 @@ tempfile.workspace = true
 
 [features]
 isolate-by-default = []
+schema = ["dep:schemars"]
