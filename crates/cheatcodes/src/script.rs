@@ -384,18 +384,13 @@ impl Wallets {
 
     /// Locks inner Mutex and returns all signer addresses in the [MultiWallet].
     pub fn signers(&self) -> Result<Vec<Address>> {
-        let mut wallets = self.inner.lock();
-        let (signers, browser) = wallets.multi_wallet.signers()?;
-        Ok(signers.keys().copied().chain(browser.map(|b| b.address())).collect())
+        Ok(self.inner.lock().multi_wallet.signers()?.keys().copied().collect())
     }
 
     /// Number of signers in the [MultiWallet].
     pub fn len(&self) -> usize {
         let mut inner = self.inner.lock();
-        match inner.multi_wallet.signers() {
-            Ok((signers, browser)) => signers.len() + usize::from(browser.is_some()),
-            Err(_) => 0,
-        }
+        inner.multi_wallet.signers().map_or(0, |signers| signers.len())
     }
 
     /// Whether the [MultiWallet] is empty.
@@ -424,7 +419,7 @@ fn broadcast<CTX: ContextTr<Journal: JournalExt, Db: DatabaseExt>>(
         if let Some(provided_sender) = wallets.provided_sender {
             new_origin = Some(provided_sender);
         } else {
-            let (signers, _) = wallets.multi_wallet.signers()?;
+            let signers = wallets.multi_wallet.signers()?;
             if signers.len() == 1 {
                 let address = signers.keys().next().unwrap();
                 new_origin = Some(*address);

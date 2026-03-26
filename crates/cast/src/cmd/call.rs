@@ -2,7 +2,6 @@ use super::run::fetch_contracts_bytecode_from_trace;
 use crate::{
     Cast,
     debug::handle_traces,
-    rlp_converter::TryIntoRlpEncodable,
     traces::TraceKind,
     tx::{CastTxBuilder, SenderKind},
 };
@@ -22,7 +21,6 @@ use foundry_cli::{
 };
 use foundry_common::{
     abi::{encode_function_args, get_func},
-    fmt::{UIfmt, UIfmtHeaderExt, UIfmtSignatureExt},
     provider::{ProviderBuilder, curl_transport::generate_curl_command},
     sh_println, shell,
 };
@@ -44,7 +42,6 @@ use foundry_wallets::WalletOpts;
 use itertools::Either;
 use regex::Regex;
 use revm::context::TransactionType;
-use serde::Serialize;
 use std::{str::FromStr, sync::LazyLock};
 use tempo_alloy::TempoNetwork;
 
@@ -232,12 +229,7 @@ impl CallArgs {
 
     pub async fn run_with_network<N: Network + Unpin>(self) -> Result<()>
     where
-        N::TxEnvelope: Serialize + UIfmtSignatureExt,
-        N::Header: TryIntoRlpEncodable,
         N::TransactionRequest: FoundryTransactionBuilder<N>,
-        N::TransactionResponse: UIfmt,
-        N::HeaderResponse: UIfmtHeaderExt,
-        N::BlockResponse: UIfmt,
     {
         let figment = self.rpc.clone().into_figment(self.with_local_artifacts).merge(&self);
         let evm_opts = figment.extract::<EvmOpts>()?;
@@ -306,21 +298,21 @@ impl CallArgs {
             }
 
             let create2_deployer = evm_opts.create2_deployer;
-            let (mut env, fork, chain, networks) =
+            let (mut evm_env, tx_env, fork, chain, networks) =
                 TracingExecutor::get_fork_material(&mut config, evm_opts).await?;
 
             // modify settings that usually set in eth_call
-            env.evm_env.cfg_env.disable_block_gas_limit = true;
-            env.evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
-            env.evm_env.block_env.gas_limit = u64::MAX;
+            evm_env.cfg_env.disable_block_gas_limit = true;
+            evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+            evm_env.block_env.gas_limit = u64::MAX;
 
             // Apply the block overrides.
             if let Some(block_overrides) = block_overrides {
                 if let Some(number) = block_overrides.number {
-                    env.evm_env.block_env.number = number.to();
+                    evm_env.block_env.number = number.to();
                 }
                 if let Some(time) = block_overrides.time {
-                    env.evm_env.block_env.timestamp = U256::from(time);
+                    evm_env.block_env.timestamp = U256::from(time);
                 }
             }
 
@@ -333,7 +325,7 @@ impl CallArgs {
                 })
                 .with_state_changes(shell::verbosity() > 4);
             let mut executor = TracingExecutor::new(
-                env,
+                (evm_env, tx_env),
                 fork,
                 evm_version,
                 trace_mode,
@@ -345,7 +337,7 @@ impl CallArgs {
             let value = tx.value().unwrap_or_default();
             let input = tx.input().cloned().unwrap_or_default();
             let tx_kind = tx.kind().expect("set by builder");
-            let env_tx = &mut executor.env_mut().tx;
+            let env_tx = executor.tx_env_mut();
 
             // Set transaction options with --trace
             if let Some(gas_limit) = tx.gas_limit() {
