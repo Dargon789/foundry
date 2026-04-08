@@ -1743,8 +1743,8 @@ yParity              0"
         );
 
         let pretty = pretty_generic_header_response(block.header());
-        assert!(pretty.contains("difficulty           1"), "{pretty}");
-        assert!(pretty.contains("totalDifficulty      163591"), "{pretty}");
+        assert!(pretty.contains("difficulty           1"));
+        assert!(pretty.contains("totalDifficulty      163591"));
     }
 
     #[test]
