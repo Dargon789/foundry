@@ -359,6 +359,20 @@ impl Installer<'_> {
     }
 
     fn remove_nested_git_dirs_inner(root: &Path, dir: &Path) -> Result<()> {
+        // Ensure we never recurse outside of the original root directory.
+        // If canonicalization fails or dir is not under root, stop recursing.
+        let root_canon = match root.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let dir_canon = match dir.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        if !dir_canon.starts_with(&root_canon) {
+            return Ok(());
+        }
+
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(_) => return Ok(()),
