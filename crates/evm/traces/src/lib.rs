@@ -375,7 +375,7 @@ impl TraceMode {
             3..=4 => std::cmp::max(self, Self::Call),
             // Enable step recording and state diff recording when verbosity is 5 or higher.
             // This includes backtraces (JUMP/JUMPDEST steps) and storage changes.
-            _ => std::cmp::max(self, Self::RecordStateDiff),
+            _ => if self == Self::Debug { self } else { std::cmp::max(self, Self::RecordStateDiff) },
         }
     }
 
