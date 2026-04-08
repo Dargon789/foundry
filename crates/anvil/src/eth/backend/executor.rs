@@ -228,7 +228,7 @@ where
         }
 
         let receipt = if tx_type == FoundryTxType::Deposit {
-            let deposit_nonce = state.get(&sender).map(|acc| acc.info.nonce);
+            let deposit_nonce = state.get(&sender).map(|acc| acc.info.nonce.saturating_sub(1));
             let receipt = alloy_consensus::Receipt {
                 status: Eip658Value::Eip658(result.is_success()),
                 cumulative_gas_used: self.gas_used,
