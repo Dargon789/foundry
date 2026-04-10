@@ -41,7 +41,8 @@ use foundry_config::{
 use foundry_debugger::Debugger;
 use foundry_evm::{
     core::evm::{
-        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor,
+        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, OpEvmNetwork, SpecFor, TempoEvmNetwork,
+        TxEnvFor,
     },
     opts::EvmOpts,
     traces::{backtrace::BacktraceBuilder, identifier::TraceIdentifiers, prune_trace_depth},
@@ -353,6 +354,17 @@ impl TestArgs {
                 decode_internal,
             )
             .await?
+        } else if evm_opts.networks.is_optimism() {
+            self.build_and_run_tests::<OpEvmNetwork>(
+                config,
+                evm_opts,
+                output,
+                filter,
+                coverage,
+                should_debug,
+                decode_internal,
+            )
+            .await?
         } else {
             self.build_and_run_tests::<EthEvmNetwork>(
                 config,
@@ -596,7 +608,8 @@ impl TestArgs {
         let mut builder = CallTraceDecoderBuilder::new()
             .with_known_contracts(&known_contracts)
             .with_label_disabled(self.disable_labels)
-            .with_verbosity(verbosity);
+            .with_verbosity(verbosity)
+            .with_chain_id(remote_chain.map(|c| c.id()));
         // Signatures are of no value for gas reports.
         if !self.gas_report {
             builder =

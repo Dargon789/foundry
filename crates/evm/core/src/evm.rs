@@ -6,6 +6,7 @@ use std::{
 
 use crate::{
     FoundryBlock, FoundryContextExt, FoundryInspectorExt, FoundryTransaction,
+    FromAnyRpcTransaction,
     backend::{DatabaseExt, JournaledState},
     constants::{CALLER, DEFAULT_CREATE2_DEPLOYER_CODEHASH, TEST_CONTRACT_ADDRESS},
     tempo::{TEMPO_PRECOMPILE_ADDRESSES, TEMPO_TIP20_TOKENS, initialize_tempo_genesis_inner},
@@ -23,6 +24,7 @@ use alloy_rlp::Decodable;
 use foundry_common::{FoundryReceiptResponse, FoundryTransactionBuilder, fmt::UIfmt};
 use foundry_config::FromEvmVersion;
 use foundry_fork_db::{DatabaseError, ForkBlockEnv};
+use op_alloy_network::Optimism;
 use op_revm::OpHaltReason;
 use revm::{
     Context,
@@ -113,6 +115,14 @@ impl FoundryEvmNetwork for TempoEvmNetwork {
     type EvmFactory = TempoEvmFactory;
 }
 
+// TODO: use `OpEvmFactory` once the FoundryEvmFactory impl is available for it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpEvmNetwork;
+impl FoundryEvmNetwork for OpEvmNetwork {
+    type Network = Optimism;
+    type EvmFactory = EthEvmFactory;
+}
+
 /// Convenience type aliases for accessing associated types through [`FoundryEvmNetwork`].
 pub type EvmFactoryFor<FEN> = <FEN as FoundryEvmNetwork>::EvmFactory;
 pub type FoundryContextFor<'db, FEN> =
@@ -134,7 +144,7 @@ pub trait FoundryEvmFactory:
     EvmFactory<
         Spec: Into<SpecId> + FromEvmVersion + Default + Display + Copy + Unpin + Send + 'static,
         BlockEnv: FoundryBlock + ForkBlockEnv + Default + Unpin,
-        Tx: Clone + Debug + FoundryTransaction + Default + Send + Sync,
+        Tx: Clone + Debug + FoundryTransaction + FromAnyRpcTransaction + Default + Send + Sync,
         HaltReason: IntoInstructionResult,
         Precompiles = PrecompilesMap,
     > + Clone
@@ -1118,6 +1128,22 @@ impl<'db, I: FoundryInspectorExt<TempoContext<&'db mut dyn DatabaseExt<TempoEvmF
     InspectorHandler for TempoFoundryHandler<'db, I>
 {
     type IT = EthInterpreter;
+
+    /// Overrides `inspect_run` to load Tempo fee fields before delegating to the default
+    /// execution pipeline. This is necessary because the default `inspect_run` calls
+    /// `validate` → `validate_against_state_and_deduct_caller` directly, bypassing
+    /// `Handler::run` where `load_fee_fields` is normally invoked.
+    fn inspect_run(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        self.inner.load_fee_fields(evm)?;
+
+        match self.inspect_run_without_catch_error(evm) {
+            Ok(output) => Ok(output),
+            Err(e) => self.catch_error(evm, e),
+        }
+    }
 
     /// Delegates to [`TempoEvmHandler::inspect_execution_with`], injecting the CREATE2 factory
     /// redirect exec loop. AA multi-call dispatch and gas adjustments are handled by the inner
