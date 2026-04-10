@@ -1,12 +1,16 @@
 use crate::eth::{error::PoolError, util::hex_fmt_many};
-use alloy_consensus::{Transaction, Typed2718};
+use alloy_consensus::{
+    Transaction, Typed2718,
+    crypto::RecoveryError,
+    transaction::{SignerRecoverable, TxHashRef},
+};
 use alloy_network::AnyRpcTransaction;
 use alloy_primitives::{
     Address, TxHash,
     map::{HashMap, HashSet},
 };
+use alloy_rlp::Encodable;
 use anvil_core::eth::transaction::PendingTransaction;
-use foundry_primitives::FoundryTxEnvelope;
 use parking_lot::RwLock;
 use std::{cmp::Ordering, collections::BTreeSet, fmt, str::FromStr, sync::Arc, time::Instant};
 
@@ -73,7 +77,7 @@ pub struct TransactionPriority(pub u128);
 
 /// Internal Transaction type
 #[derive(Clone, PartialEq, Eq)]
-pub struct PoolTransaction<T = FoundryTxEnvelope> {
+pub struct PoolTransaction<T> {
     /// the pending eth transaction
     pub pending_transaction: PendingTransaction<T>,
     /// Markers required by the transaction
@@ -128,10 +132,15 @@ impl<T: fmt::Debug> fmt::Debug for PoolTransaction<T> {
     }
 }
 
-impl TryFrom<AnyRpcTransaction> for PoolTransaction {
+impl<T> TryFrom<AnyRpcTransaction> for PoolTransaction<T>
+where
+    T: SignerRecoverable + TxHashRef + Encodable + TryFrom<AnyRpcTransaction>,
+    <T as TryFrom<AnyRpcTransaction>>::Error: Into<eyre::Error>,
+    RecoveryError: Into<eyre::Error>,
+{
     type Error = eyre::Error;
     fn try_from(value: AnyRpcTransaction) -> Result<Self, Self::Error> {
-        let typed_transaction = FoundryTxEnvelope::try_from(value)?;
+        let typed_transaction = T::try_from(value).map_err(Into::into)?;
         let pending_transaction = PendingTransaction::new(typed_transaction)?;
         Ok(Self {
             pending_transaction,
@@ -146,7 +155,7 @@ impl TryFrom<AnyRpcTransaction> for PoolTransaction {
 ///
 /// Keeps a set of transactions that are waiting for other transactions
 #[derive(Clone, Debug)]
-pub struct PendingTransactions<T = FoundryTxEnvelope> {
+pub struct PendingTransactions<T> {
     /// markers that aren't yet provided by any transaction
     required_markers: HashMap<TxMarker, HashSet<TxHash>>,
     /// mapping of the markers of a transaction to the hash of the transaction
@@ -289,7 +298,7 @@ impl<T: Transaction> PendingTransactions<T> {
 
 /// A transaction in the pool
 #[derive(Clone)]
-pub struct PendingPoolTransaction<T = FoundryTxEnvelope> {
+pub struct PendingPoolTransaction<T> {
     pub transaction: Arc<PoolTransaction<T>>,
     /// markers required and have not been satisfied yet by other transactions in the pool
     pub missing_markers: HashSet<TxMarker>,
@@ -337,7 +346,7 @@ impl<T: fmt::Debug> fmt::Debug for PendingPoolTransaction<T> {
     }
 }
 
-pub struct TransactionsIterator<T = FoundryTxEnvelope> {
+pub struct TransactionsIterator<T> {
     all: HashMap<TxHash, ReadyTransaction<T>>,
     awaiting: HashMap<TxHash, (usize, PoolTransactionRef<T>)>,
     independent: BTreeSet<PoolTransactionRef<T>>,
@@ -394,7 +403,7 @@ impl<T> Iterator for TransactionsIterator<T> {
 
 /// transactions that are ready to be included in a block.
 #[derive(Clone, Debug)]
-pub struct ReadyTransactions<T = FoundryTxEnvelope> {
+pub struct ReadyTransactions<T> {
     /// keeps track of transactions inserted in the pool
     ///
     /// this way we can determine when transactions where submitted to the pool
@@ -684,9 +693,8 @@ impl<T: Transaction> ReadyTransactions<T> {
                     {
                         warn!(target: "txpool", "ready replacement transaction underpriced [{:?}]", tx.hash());
                         return Err(PoolError::ReplacementUnderpriced(tx.hash()));
-                    } else {
-                        trace!(target: "txpool", "replacing ready transaction [{:?}] with higher gas price [{:?}]", to_remove.transaction.transaction.hash(), tx.hash());
                     }
+                    trace!(target: "txpool", "replacing ready transaction [{:?}] with higher gas price [{:?}]", to_remove.transaction.transaction.hash(), tx.hash());
                 }
 
                 unlocked_tx.extend(to_remove.unlocks.iter().copied())
@@ -704,7 +712,7 @@ impl<T: Transaction> ReadyTransactions<T> {
 
 /// A reference to a transaction in the pool
 #[derive(Debug)]
-pub struct PoolTransactionRef<T = FoundryTxEnvelope> {
+pub struct PoolTransactionRef<T> {
     /// actual transaction
     pub transaction: Arc<PoolTransaction<T>>,
     /// identifier used to internally compare the transaction in the pool
@@ -741,7 +749,7 @@ impl<T> Ord for PoolTransactionRef<T> {
 }
 
 #[derive(Debug)]
-pub struct ReadyTransaction<T = FoundryTxEnvelope> {
+pub struct ReadyTransaction<T> {
     /// ref to the actual transaction
     pub transaction: PoolTransactionRef<T>,
     /// tracks the transactions that get unlocked by this transaction

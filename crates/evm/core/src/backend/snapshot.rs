@@ -2,35 +2,33 @@ use super::JournaledState;
 use alloy_evm::EvmEnv;
 use alloy_primitives::{
     B256, U256,
-    map::{AddressHashMap, HashMap},
+    map::{AddressHashMap, U256Map},
 };
-use revm::{context::TxEnv, state::AccountInfo};
+use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 
 /// A minimal abstraction of a state at a certain point in time
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub accounts: AddressHashMap<AccountInfo>,
-    pub storage: AddressHashMap<HashMap<U256, U256>>,
-    pub block_hashes: HashMap<U256, B256>,
+    pub storage: AddressHashMap<U256Map<U256>>,
+    pub block_hashes: U256Map<B256>,
 }
 
 /// Represents a state snapshot taken during evm execution
 #[derive(Clone, Debug)]
-pub struct BackendStateSnapshot<T> {
+pub struct BackendStateSnapshot<T, SPEC, BLOCK> {
     pub db: T,
     /// The journaled_state state at a specific point
     pub journaled_state: JournaledState,
     /// Contains the evm env at the time of the snapshot
-    pub snap_evm_env: EvmEnv,
-    /// Contains the tx env at the time of the snapshot
-    pub snap_tx_env: TxEnv,
+    pub snap_evm_env: EvmEnv<SPEC, BLOCK>,
 }
 
-impl<T> BackendStateSnapshot<T> {
+impl<T, SPEC, BLOCK> BackendStateSnapshot<T, SPEC, BLOCK> {
     /// Takes a new state snapshot.
-    pub fn new(db: T, journaled_state: JournaledState, evm_env: EvmEnv, tx_env: TxEnv) -> Self {
-        Self { db, journaled_state, snap_evm_env: evm_env, snap_tx_env: tx_env }
+    pub fn new(db: T, journaled_state: JournaledState, evm_env: EvmEnv<SPEC, BLOCK>) -> Self {
+        Self { db, journaled_state, snap_evm_env: evm_env }
     }
 
     /// Called when this state snapshot is reverted.

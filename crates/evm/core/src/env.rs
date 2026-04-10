@@ -1,47 +1,25 @@
+use std::fmt::Debug;
+
 pub use alloy_evm::EvmEnv;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use op_revm::{
+    OpTransaction,
+    transaction::{OpTxTr, deposit::DEPOSIT_TRANSACTION_TYPE},
+};
 use revm::{
-    Context, Database,
-    context::{Block, BlockEnv, Cfg, CfgEnv, JournalTr, Transaction, TxEnv},
-    context_interface::{ContextTr, transaction::AccessList},
+    Context, Database, Journal,
+    context::{Block, BlockEnv, Cfg, CfgEnv, Transaction, TxEnv},
+    context_interface::{
+        ContextTr,
+        either::Either,
+        transaction::{AccessList, RecoveredAuthorization, SignedAuthorization},
+    },
+    inspector::JournalExt,
     primitives::{TxKind, hardfork::SpecId},
 };
+use tempo_revm::{TempoBlockEnv, TempoTxEnv};
 
-/// Helper container type for [`EvmEnv`] and [`TxEnv`].
-#[derive(Clone, Debug, Default)]
-pub struct Env {
-    pub evm_env: EvmEnv,
-    pub tx: TxEnv,
-}
-
-/// Helper container type for [`EvmEnv`] and [`TxEnv`].
-impl Env {
-    pub fn from(cfg: CfgEnv, block: BlockEnv, tx: TxEnv) -> Self {
-        Self { evm_env: EvmEnv { cfg_env: cfg, block_env: block }, tx }
-    }
-
-    pub fn new_with_spec_id(cfg: CfgEnv, block: BlockEnv, tx: TxEnv, spec_id: SpecId) -> Self {
-        let mut cfg = cfg;
-        cfg.spec = spec_id;
-
-        Self::from(cfg, block, tx)
-    }
-
-    /// Clones the evm env and tx env separately from a [`FoundryContextExt`] context.
-    pub fn clone_evm_and_tx(ecx: &mut impl FoundryContextExt) -> (EvmEnv, TxEnv) {
-        (
-            EvmEnv { cfg_env: ecx.cfg_mut().clone(), block_env: ecx.block_mut().clone() },
-            ecx.tx_mut().clone(),
-        )
-    }
-
-    /// Writes the split evm env and tx env back into a [`FoundryContextExt`] context.
-    pub fn apply_evm_and_tx(ecx: &mut impl FoundryContextExt, evm_env: EvmEnv, tx_env: TxEnv) {
-        *ecx.block_mut() = evm_env.block_env;
-        *ecx.cfg_mut() = evm_env.cfg_env;
-        *ecx.tx_mut() = tx_env;
-    }
-}
+use crate::backend::JournaledState;
 
 /// Extension of [`Block`] with mutable setters, allowing EVM-agnostic mutation of block fields.
 pub trait FoundryBlock: Block {
@@ -72,6 +50,16 @@ pub trait FoundryBlock: Block {
         _excess_blob_gas: u64,
         _base_fee_update_fraction: u64,
     );
+
+    // Tempo methods
+
+    /// Returns the milliseconds portion of the block timestamp.
+    fn timestamp_millis_part(&self) -> u64 {
+        0
+    }
+
+    /// Sets the milliseconds portion of the block timestamp.
+    fn set_timestamp_millis_part(&mut self, _millis: u64) {}
 }
 
 impl FoundryBlock for BlockEnv {
@@ -112,6 +100,51 @@ impl FoundryBlock for BlockEnv {
     }
 }
 
+impl FoundryBlock for TempoBlockEnv {
+    fn set_number(&mut self, number: U256) {
+        self.inner.set_number(number);
+    }
+
+    fn set_beneficiary(&mut self, beneficiary: Address) {
+        self.inner.set_beneficiary(beneficiary);
+    }
+
+    fn set_timestamp(&mut self, timestamp: U256) {
+        self.inner.set_timestamp(timestamp);
+    }
+
+    fn set_gas_limit(&mut self, gas_limit: u64) {
+        self.inner.set_gas_limit(gas_limit);
+    }
+
+    fn set_basefee(&mut self, basefee: u64) {
+        self.inner.set_basefee(basefee);
+    }
+
+    fn set_difficulty(&mut self, difficulty: U256) {
+        self.inner.set_difficulty(difficulty);
+    }
+
+    fn set_prevrandao(&mut self, prevrandao: Option<B256>) {
+        self.inner.set_prevrandao(prevrandao);
+    }
+
+    fn set_blob_excess_gas_and_price(
+        &mut self,
+        _excess_blob_gas: u64,
+        _base_fee_update_fraction: u64,
+    ) {
+    }
+
+    fn timestamp_millis_part(&self) -> u64 {
+        self.timestamp_millis_part
+    }
+
+    fn set_timestamp_millis_part(&mut self, millis: u64) {
+        self.timestamp_millis_part = millis;
+    }
+}
+
 /// Extension of [`Transaction`] with mutable setters, allowing EVM-agnostic mutation of transaction
 /// fields.
 pub trait FoundryTransaction: Transaction {
@@ -145,6 +178,11 @@ pub trait FoundryTransaction: Transaction {
     /// Sets the access list.
     fn set_access_list(&mut self, access_list: AccessList);
 
+    /// Returns a mutable reference to the EIP-7702 authorization list.
+    fn authorization_list_mut(
+        &mut self,
+    ) -> &mut Vec<Either<SignedAuthorization, RecoveredAuthorization>>;
+
     /// Sets the max priority fee per gas.
     fn set_gas_priority_fee(&mut self, gas_priority_fee: Option<u128>);
 
@@ -153,6 +191,68 @@ pub trait FoundryTransaction: Transaction {
 
     /// Sets the max fee per blob gas.
     fn set_max_fee_per_blob_gas(&mut self, max_fee_per_blob_gas: u128);
+
+    /// Sets the EIP-7702 signed authorization list.
+    fn set_signed_authorization(&mut self, auth: Vec<SignedAuthorization>) {
+        *self.authorization_list_mut() = auth.into_iter().map(Either::Left).collect();
+    }
+
+    // `OpTransaction` methods
+
+    /// Enveloped transaction bytes.
+    fn enveloped_tx(&self) -> Option<&Bytes> {
+        None
+    }
+
+    /// Set Enveloped transaction bytes.
+    fn set_enveloped_tx(&mut self, _bytes: Bytes) {}
+
+    /// Source hash of the deposit transaction.
+    fn source_hash(&self) -> Option<B256> {
+        None
+    }
+
+    /// Sets source hash of the deposit transaction.
+    fn set_source_hash(&mut self, _source_hash: B256) {}
+
+    /// Mint of the deposit transaction
+    fn mint(&self) -> Option<u128> {
+        None
+    }
+
+    /// Sets mint of the deposit transaction.
+    fn set_mint(&mut self, _mint: u128) {}
+
+    /// Whether the transaction is a system transaction
+    fn is_system_transaction(&self) -> bool {
+        false
+    }
+
+    /// Sets whether the transaction is a system transaction
+    fn set_system_transaction(&mut self, _is_system_transaction: bool) {}
+
+    /// Returns `true` if transaction is of type [`DEPOSIT_TRANSACTION_TYPE`].
+    fn is_deposit(&self) -> bool {
+        self.tx_type() == DEPOSIT_TRANSACTION_TYPE
+    }
+
+    // Tempo methods
+
+    /// Returns the fee token address for this transaction.
+    fn fee_token(&self) -> Option<Address> {
+        None
+    }
+
+    /// Sets the fee token address for this transaction.
+    fn set_fee_token(&mut self, _token: Option<Address>) {}
+
+    /// Returns the fee payer for this transaction.
+    fn fee_payer(&self) -> Option<Option<Address>> {
+        None
+    }
+
+    /// Sets the fee payer for this transaction.
+    fn set_fee_payer(&mut self, _payer: Option<Option<Address>>) {}
 }
 
 impl FoundryTransaction for TxEnv {
@@ -196,6 +296,12 @@ impl FoundryTransaction for TxEnv {
         self.access_list = access_list;
     }
 
+    fn authorization_list_mut(
+        &mut self,
+    ) -> &mut Vec<Either<SignedAuthorization, RecoveredAuthorization>> {
+        &mut self.authorization_list
+    }
+
     fn set_gas_priority_fee(&mut self, gas_priority_fee: Option<u128>) {
         self.gas_priority_fee = gas_priority_fee;
     }
@@ -209,65 +315,169 @@ impl FoundryTransaction for TxEnv {
     }
 }
 
-/// Extension of [`Cfg`] with mutable setters, allowing EVM-agnostic mutation of EVM configuration
-/// fields.
-pub trait FoundryCfg: Cfg {
-    /// Sets the EVM spec (hardfork).
-    fn set_spec(&mut self, spec: SpecId);
+impl<TX: FoundryTransaction> FoundryTransaction for OpTransaction<TX> {
+    fn set_tx_type(&mut self, tx_type: u8) {
+        self.base.set_tx_type(tx_type);
+    }
 
-    /// Sets the chain ID.
-    fn set_chain_id(&mut self, chain_id: u64);
+    fn set_caller(&mut self, caller: Address) {
+        self.base.set_caller(caller);
+    }
 
-    /// Sets the contract code size limit.
-    fn set_limit_contract_code_size(&mut self, limit: Option<usize>);
+    fn set_gas_limit(&mut self, gas_limit: u64) {
+        self.base.set_gas_limit(gas_limit);
+    }
 
-    /// Sets the contract initcode size limit.
-    fn set_limit_contract_initcode_size(&mut self, limit: Option<usize>);
+    fn set_gas_price(&mut self, gas_price: u128) {
+        self.base.set_gas_price(gas_price);
+    }
 
-    /// Sets whether nonce checks are disabled.
-    fn set_disable_nonce_check(&mut self, disabled: bool);
+    fn set_kind(&mut self, kind: TxKind) {
+        self.base.set_kind(kind);
+    }
 
-    /// Sets the max blobs per transaction.
-    fn set_max_blobs_per_tx(&mut self, max: Option<u64>);
+    fn set_value(&mut self, value: U256) {
+        self.base.set_value(value);
+    }
 
-    /// Sets the blob base fee update fraction.
-    fn set_blob_base_fee_update_fraction(&mut self, fraction: Option<u64>);
+    fn set_data(&mut self, data: Bytes) {
+        self.base.set_data(data);
+    }
 
-    /// Sets the transaction gas limit cap.
-    fn set_tx_gas_limit_cap(&mut self, cap: Option<u64>);
+    fn set_nonce(&mut self, nonce: u64) {
+        self.base.set_nonce(nonce);
+    }
+
+    fn set_chain_id(&mut self, chain_id: Option<u64>) {
+        self.base.set_chain_id(chain_id);
+    }
+
+    fn set_access_list(&mut self, access_list: AccessList) {
+        self.base.set_access_list(access_list);
+    }
+
+    fn authorization_list_mut(
+        &mut self,
+    ) -> &mut Vec<Either<SignedAuthorization, RecoveredAuthorization>> {
+        self.base.authorization_list_mut()
+    }
+
+    fn set_gas_priority_fee(&mut self, gas_priority_fee: Option<u128>) {
+        self.base.set_gas_priority_fee(gas_priority_fee);
+    }
+
+    fn set_blob_hashes(&mut self, _blob_hashes: Vec<B256>) {}
+
+    fn set_max_fee_per_blob_gas(&mut self, _max_fee_per_blob_gas: u128) {}
+
+    fn enveloped_tx(&self) -> Option<&Bytes> {
+        OpTxTr::enveloped_tx(self)
+    }
+
+    fn set_enveloped_tx(&mut self, bytes: Bytes) {
+        self.enveloped_tx = Some(bytes);
+    }
+
+    fn source_hash(&self) -> Option<B256> {
+        OpTxTr::source_hash(self)
+    }
+
+    fn set_source_hash(&mut self, source_hash: B256) {
+        if self.tx_type() == DEPOSIT_TRANSACTION_TYPE {
+            self.deposit.source_hash = source_hash;
+        }
+    }
+
+    fn mint(&self) -> Option<u128> {
+        OpTxTr::mint(self)
+    }
+
+    fn set_mint(&mut self, mint: u128) {
+        if self.tx_type() == DEPOSIT_TRANSACTION_TYPE {
+            self.deposit.mint = Some(mint);
+        }
+    }
+
+    fn is_system_transaction(&self) -> bool {
+        OpTxTr::is_system_transaction(self)
+    }
+
+    fn set_system_transaction(&mut self, is_system_transaction: bool) {
+        if self.tx_type() == DEPOSIT_TRANSACTION_TYPE {
+            self.deposit.is_system_transaction = is_system_transaction;
+        }
+    }
 }
 
-impl FoundryCfg for CfgEnv {
-    fn set_spec(&mut self, spec: SpecId) {
-        self.spec = spec;
+impl FoundryTransaction for TempoTxEnv {
+    fn set_tx_type(&mut self, tx_type: u8) {
+        self.inner.set_tx_type(tx_type);
     }
 
-    fn set_chain_id(&mut self, chain_id: u64) {
-        self.chain_id = chain_id;
+    fn set_caller(&mut self, caller: Address) {
+        self.inner.set_caller(caller);
     }
 
-    fn set_limit_contract_code_size(&mut self, limit: Option<usize>) {
-        self.limit_contract_code_size = limit;
+    fn set_gas_limit(&mut self, gas_limit: u64) {
+        self.inner.set_gas_limit(gas_limit);
     }
 
-    fn set_limit_contract_initcode_size(&mut self, limit: Option<usize>) {
-        self.limit_contract_initcode_size = limit;
+    fn set_gas_price(&mut self, gas_price: u128) {
+        self.inner.set_gas_price(gas_price);
     }
 
-    fn set_disable_nonce_check(&mut self, disabled: bool) {
-        self.disable_nonce_check = disabled;
+    fn set_kind(&mut self, kind: TxKind) {
+        self.inner.set_kind(kind);
     }
 
-    fn set_max_blobs_per_tx(&mut self, max: Option<u64>) {
-        self.max_blobs_per_tx = max;
+    fn set_value(&mut self, value: U256) {
+        self.inner.set_value(value);
     }
 
-    fn set_blob_base_fee_update_fraction(&mut self, fraction: Option<u64>) {
-        self.blob_base_fee_update_fraction = fraction;
+    fn set_data(&mut self, data: Bytes) {
+        self.inner.set_data(data);
     }
 
-    fn set_tx_gas_limit_cap(&mut self, cap: Option<u64>) {
-        self.tx_gas_limit_cap = cap;
+    fn set_nonce(&mut self, nonce: u64) {
+        self.inner.set_nonce(nonce);
+    }
+
+    fn set_chain_id(&mut self, chain_id: Option<u64>) {
+        self.inner.set_chain_id(chain_id);
+    }
+
+    fn set_access_list(&mut self, access_list: AccessList) {
+        self.inner.set_access_list(access_list);
+    }
+
+    fn authorization_list_mut(
+        &mut self,
+    ) -> &mut Vec<Either<SignedAuthorization, RecoveredAuthorization>> {
+        self.inner.authorization_list_mut()
+    }
+
+    fn set_gas_priority_fee(&mut self, gas_priority_fee: Option<u128>) {
+        self.inner.set_gas_priority_fee(gas_priority_fee);
+    }
+
+    fn set_blob_hashes(&mut self, _blob_hashes: Vec<B256>) {}
+
+    fn set_max_fee_per_blob_gas(&mut self, _max_fee_per_blob_gas: u128) {}
+
+    fn fee_token(&self) -> Option<Address> {
+        self.fee_token
+    }
+
+    fn set_fee_token(&mut self, token: Option<Address>) {
+        self.fee_token = token;
+    }
+
+    fn fee_payer(&self) -> Option<Option<Address>> {
+        self.fee_payer
+    }
+
+    fn set_fee_payer(&mut self, payer: Option<Option<Address>>) {
+        self.fee_payer = payer;
     }
 }
 
@@ -276,26 +486,170 @@ impl FoundryCfg for CfgEnv {
 /// [`ContextTr`] only exposes immutable references for block, tx, and cfg.
 /// Cheatcodes like `vm.warp()`, `vm.roll()`, `vm.chainId()` need to mutate these fields.
 pub trait FoundryContextExt:
-    ContextTr<Block: FoundryBlock + Clone, Tx: FoundryTransaction + Clone, Cfg: FoundryCfg + Clone>
+    ContextTr<
+        Block: FoundryBlock + Clone,
+        Tx: FoundryTransaction + Clone,
+        Cfg = CfgEnv<Self::Spec>,
+        Journal: JournalExt,
+    >
 {
+    /// Specification id type
+    ///
+    /// Bubbled-up from `ContextTr::Cfg` for convenience and simplified bounds.
+    type Spec: Into<SpecId> + Copy + Debug;
+
     /// Mutable reference to the block environment.
-    fn block_mut(&mut self) -> &mut BlockEnv;
+    fn block_mut(&mut self) -> &mut Self::Block;
+
     /// Mutable reference to the transaction environment.
-    fn tx_mut(&mut self) -> &mut TxEnv;
+    fn tx_mut(&mut self) -> &mut Self::Tx;
+
     /// Mutable reference to the configuration environment.
-    fn cfg_mut(&mut self) -> &mut CfgEnv;
+    fn cfg_mut(&mut self) -> &mut Self::Cfg;
+
+    /// Mutable reference to the db and the journal inner.
+    fn db_journal_inner_mut(&mut self) -> (&mut Self::Db, &mut JournaledState);
+
+    /// Sets block environment.
+    fn set_block(&mut self, block: Self::Block) {
+        *self.block_mut() = block;
+    }
+
+    /// Sets transaction environment.
+    fn set_tx(&mut self, tx: Self::Tx) {
+        *self.tx_mut() = tx;
+    }
+
+    /// Sets configuration environment.
+    fn set_cfg(&mut self, cfg: Self::Cfg) {
+        *self.cfg_mut() = cfg;
+    }
+
+    /// Sets journal inner.
+    fn set_journal_inner(&mut self, journal_inner: JournaledState) {
+        *self.db_journal_inner_mut().1 = journal_inner;
+    }
+
+    /// Sets EVM environment.
+    fn set_evm(&mut self, evm_env: EvmEnv<Self::Spec, Self::Block>) {
+        *self.cfg_mut() = evm_env.cfg_env;
+        *self.block_mut() = evm_env.block_env;
+    }
+
+    /// Cloned transaction environment.
+    fn tx_clone(&self) -> Self::Tx {
+        self.tx().clone()
+    }
+
+    /// Cloned EVM environment (Cfg + Block).
+    fn evm_clone(&self) -> EvmEnv<Self::Spec, Self::Block> {
+        EvmEnv::new(self.cfg().clone(), self.block().clone())
+    }
 }
 
-impl<DB: Database, J: JournalTr<Database = DB>, C> FoundryContextExt
-    for Context<BlockEnv, TxEnv, CfgEnv, DB, J, C>
+impl<
+    BLOCK: FoundryBlock + Clone,
+    TX: FoundryTransaction + Clone,
+    SPEC: Into<SpecId> + Copy + Debug,
+    DB: Database,
+    C,
+> FoundryContextExt for Context<BLOCK, TX, CfgEnv<SPEC>, DB, Journal<DB>, C>
 {
-    fn block_mut(&mut self) -> &mut BlockEnv {
+    type Spec = <Self::Cfg as Cfg>::Spec;
+
+    fn block_mut(&mut self) -> &mut Self::Block {
         &mut self.block
     }
-    fn tx_mut(&mut self) -> &mut TxEnv {
+
+    fn tx_mut(&mut self) -> &mut Self::Tx {
         &mut self.tx
     }
-    fn cfg_mut(&mut self) -> &mut CfgEnv {
+
+    fn cfg_mut(&mut self) -> &mut Self::Cfg {
         &mut self.cfg
+    }
+
+    fn db_journal_inner_mut(&mut self) -> (&mut Self::Db, &mut JournaledState) {
+        (&mut self.journaled_state.database, &mut self.journaled_state.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_evm::{EthEvmFactory, EvmFactory};
+    use alloy_op_evm::OpEvmFactory;
+    use foundry_evm_hardforks::TempoHardfork;
+    use op_revm::OpSpecId;
+    use revm::database::EmptyDB;
+    use tempo_evm::TempoEvmFactory;
+
+    #[test]
+    fn eth_evm_foundry_context_ext_implementation() {
+        let mut evm = EthEvmFactory::default().create_evm(EmptyDB::default(), EvmEnv::default());
+
+        // Test EVM Context Block mutation
+        evm.ctx_mut().block_mut().set_number(U256::from(123));
+        assert_eq!(evm.ctx().block().number(), U256::from(123));
+
+        // Test EVM Context Tx mutation
+        evm.ctx_mut().tx_mut().set_nonce(99);
+        assert_eq!(evm.ctx().tx().nonce(), 99);
+
+        // Test EVM Context Cfg mutation
+        evm.ctx_mut().cfg_mut().spec = SpecId::AMSTERDAM;
+        assert_eq!(evm.ctx().cfg().spec, SpecId::AMSTERDAM);
+
+        // Round-trip test to ensure no issues with cloning and setting tx_env and evm_env
+        let tx_env = evm.ctx().tx_clone();
+        evm.ctx_mut().set_tx(tx_env);
+        let evm_env = evm.ctx().evm_clone();
+        evm.ctx_mut().set_evm(evm_env);
+    }
+
+    #[test]
+    fn op_evm_foundry_context_ext_implementation() {
+        let mut evm = OpEvmFactory::default().create_evm(EmptyDB::default(), EvmEnv::default());
+
+        // Test EVM Context Block mutation
+        evm.ctx_mut().block_mut().set_number(U256::from(123));
+        assert_eq!(evm.ctx().block().number(), U256::from(123));
+
+        // Test EVM Context Tx mutation
+        evm.ctx_mut().tx_mut().set_nonce(99);
+        assert_eq!(evm.ctx().tx().nonce(), 99);
+
+        // Test EVM Context Cfg mutation
+        evm.ctx_mut().cfg_mut().spec = OpSpecId::JOVIAN;
+        assert_eq!(evm.ctx().cfg().spec, OpSpecId::JOVIAN);
+
+        // Round-trip test to ensure no issues with cloning and setting tx_env and evm_env
+        let tx_env = evm.ctx().tx_clone();
+        evm.ctx_mut().set_tx(tx_env);
+        let evm_env = evm.ctx().evm_clone();
+        evm.ctx_mut().set_evm(evm_env);
+    }
+
+    #[test]
+    fn tempo_evm_foundry_context_ext_implementation() {
+        let mut evm = TempoEvmFactory::default().create_evm(EmptyDB::default(), EvmEnv::default());
+
+        // Test EVM Context Block mutation
+        evm.ctx_mut().block_mut().set_number(U256::from(123));
+        assert_eq!(evm.ctx().block().number(), U256::from(123));
+
+        // Test EVM Context Tx mutation
+        evm.ctx_mut().tx_mut().set_nonce(99);
+        assert_eq!(evm.ctx().tx().nonce(), 99);
+
+        // Test EVM Context Cfg mutation
+        evm.ctx_mut().cfg_mut().spec = TempoHardfork::Genesis;
+        assert_eq!(evm.ctx().cfg().spec, TempoHardfork::Genesis);
+
+        // Round-trip test to ensure no issues with cloning and setting tx_env and evm_env
+        let tx_env = evm.ctx().tx_clone();
+        evm.ctx_mut().set_tx(tx_env);
+        let evm_env = evm.ctx().evm_clone();
+        evm.ctx_mut().set_evm(evm_env);
     }
 }

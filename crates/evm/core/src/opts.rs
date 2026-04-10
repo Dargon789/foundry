@@ -1,6 +1,8 @@
 use crate::{
-    EvmEnv, constants::DEFAULT_CREATE2_DEPLOYER, fork::CreateFork,
-    utils::apply_chain_and_block_specific_env_changes,
+    EvmEnv, FoundryBlock, FoundryTransaction,
+    constants::DEFAULT_CREATE2_DEPLOYER,
+    fork::CreateFork,
+    utils::{apply_chain_and_block_specific_env_changes, block_env_from_header},
 };
 use alloy_consensus::BlockHeader;
 use alloy_network::{AnyNetwork, BlockResponse, Network};
@@ -11,7 +13,7 @@ use eyre::WrapErr;
 use foundry_common::{ALCHEMY_FREE_TIER_CUPS, NON_ARCHIVE_NODE_WARNING, provider::ProviderBuilder};
 use foundry_config::{Chain, Config, GasLimit};
 use foundry_evm_networks::NetworkConfigs;
-use revm::context::{BlockEnv, CfgEnv, TxEnv};
+use revm::{context::CfgEnv, primitives::hardfork::SpecId};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use url::Url;
@@ -127,27 +129,59 @@ impl EvmOpts {
             .build()
     }
 
-    /// Assembles a complete [`Env`]
+    /// Infers the network configuration from the fork chain ID if not already set.
+    ///
+    /// When a fork URL is configured and the network has not been explicitly set,
+    /// this fetches the chain ID from the remote endpoint and calls
+    /// [`NetworkConfigs::with_chain_id`] to auto-enable the correct network
+    /// (e.g. Tempo, OP Stack) based on the chain ID.
+    pub async fn infer_network_from_fork(&mut self) {
+        if !self.networks.is_tempo()
+            && !self.networks.is_optimism()
+            && let Some(ref fork_url) = self.fork_url
+            && let Ok(provider) = self.fork_provider_with_url::<AnyNetwork>(fork_url)
+            && let Ok(chain_id) = provider.get_chain_id().await
+        {
+            self.networks = self.networks.with_chain_id(chain_id);
+        }
+    }
+
+    /// Returns a tuple with [`EvmEnv`], `TxEnv`, and the actual fork block number.
     ///
     /// If a `fork_url` is set, creates a provider and passes it to both `EvmOpts::fork_evm_env`
     /// and `EvmOpts::fork_tx_env`. Falls back to local settings when no fork URL is configured.
-    pub async fn env(&self) -> eyre::Result<crate::Env> {
+    ///
+    /// The fork block number is returned separately because on some L2s (e.g., Arbitrum) the
+    /// `block_env.number` may be remapped (to the L1 block number) and therefore cannot be used
+    /// to pin the fork.
+    pub async fn env<
+        SPEC: Into<SpecId> + Default + Copy,
+        BLOCK: FoundryBlock + Default,
+        TX: FoundryTransaction + Default,
+    >(
+        &self,
+    ) -> eyre::Result<(EvmEnv<SPEC, BLOCK>, TX, Option<BlockNumber>)> {
         if let Some(ref fork_url) = self.fork_url {
             let provider = self.fork_provider_with_url::<AnyNetwork>(fork_url)?;
-            let ((evm_env, _block), tx) =
+            let ((evm_env, block_number), tx) =
                 tokio::try_join!(self.fork_evm_env(&provider), self.fork_tx_env(&provider))?;
-            Ok(crate::Env { evm_env, tx })
+            Ok((evm_env, tx, Some(block_number)))
         } else {
-            Ok(crate::Env { evm_env: self.local_evm_env(), tx: self.local_tx_env() })
+            Ok((self.local_evm_env(), self.local_tx_env(), None))
         }
     }
 
     /// Returns the [`EvmEnv`] (cfg + block) and [`BlockNumber`] fetched from the fork endpoint via
     /// provider
-    pub async fn fork_evm_env<N: Network, P: Provider<N>>(
+    pub async fn fork_evm_env<
+        SPEC: Into<SpecId> + Default + Copy,
+        BLOCK: FoundryBlock + Default,
+        N: Network,
+        P: Provider<N>,
+    >(
         &self,
         provider: &P,
-    ) -> eyre::Result<(EvmEnv, BlockNumber)> {
+    ) -> eyre::Result<(EvmEnv<SPEC, BLOCK>, BlockNumber)> {
         trace!(
             memory_limit = %self.memory_limit,
             override_chain_id = ?self.env.chain_id,
@@ -200,74 +234,64 @@ impl EvmOpts {
         let block_number = block.header().number();
         let mut evm_env = EvmEnv {
             cfg_env: self.cfg_env(chain_id),
-            block_env: BlockEnv {
-                number: U256::from(block_number),
-                timestamp: U256::from(block.header().timestamp()),
-                beneficiary: block.header().beneficiary(),
-                difficulty: block.header().difficulty(),
-                prevrandao: block.header().mix_hash(),
-                basefee: block.header().base_fee_per_gas().unwrap_or_default(),
-                gas_limit: block.header().gas_limit(),
-                ..Default::default()
-            },
+            block_env: block_env_from_header(block.header()),
         };
 
-        apply_chain_and_block_specific_env_changes::<N>(&mut evm_env, &block, self.networks);
+        apply_chain_and_block_specific_env_changes::<N, _, _>(&mut evm_env, &block, self.networks);
 
         Ok((evm_env, block_number))
     }
 
     /// Returns the [`EvmEnv`] configured with only local settings.
-    fn local_evm_env(&self) -> EvmEnv {
-        let gas_limit = self.gas_limit();
-        EvmEnv {
-            cfg_env: self.cfg_env(self.env.chain_id.unwrap_or(foundry_common::DEV_CHAIN_ID)),
-            block_env: BlockEnv {
-                number: self.env.block_number,
-                beneficiary: self.env.block_coinbase,
-                timestamp: self.env.block_timestamp,
-                difficulty: U256::from(self.env.block_difficulty),
-                prevrandao: Some(self.env.block_prevrandao),
-                basefee: self.env.block_base_fee_per_gas,
-                gas_limit,
-                ..Default::default()
-            },
-        }
+    fn local_evm_env<SPEC: Into<SpecId> + Default, BLOCK: FoundryBlock + Default>(
+        &self,
+    ) -> EvmEnv<SPEC, BLOCK> {
+        let cfg_env = self.cfg_env(self.env.chain_id.unwrap_or(foundry_common::DEV_CHAIN_ID));
+        let mut block_env = BLOCK::default();
+        block_env.set_number(self.env.block_number);
+        block_env.set_beneficiary(self.env.block_coinbase);
+        block_env.set_timestamp(self.env.block_timestamp);
+        block_env.set_difficulty(U256::from(self.env.block_difficulty));
+        block_env.set_prevrandao(Some(self.env.block_prevrandao));
+        block_env.set_basefee(self.env.block_base_fee_per_gas);
+        block_env.set_gas_limit(self.gas_limit());
+        EvmEnv::new(cfg_env, block_env)
     }
 
-    /// Returns the [`TxEnv`] with gas price and chain id resolved from provider.
-    async fn fork_tx_env<N: Network, P: Provider<N>>(&self, provider: &P) -> eyre::Result<TxEnv> {
+    /// Returns the `TxEnv` with gas price and chain id resolved from provider.
+    async fn fork_tx_env<TX: FoundryTransaction + Default, N: Network, P: Provider<N>>(
+        &self,
+        provider: &P,
+    ) -> eyre::Result<TX> {
         let (gas_price, chain_id) = tokio::try_join!(
             option_try_or_else(self.env.gas_price.map(|v| v as u128), async || {
                 provider.get_gas_price().await
             }),
             option_try_or_else(self.env.chain_id, async || provider.get_chain_id().await),
         )?;
-        Ok(TxEnv {
-            caller: self.sender,
-            gas_price,
-            chain_id: Some(chain_id),
-            gas_limit: self.gas_limit(),
-            ..Default::default()
-        })
+        let mut tx_env = TX::default();
+        tx_env.set_caller(self.sender);
+        tx_env.set_chain_id(Some(chain_id));
+        tx_env.set_gas_price(gas_price);
+        tx_env.set_gas_limit(self.gas_limit());
+        Ok(tx_env)
     }
 
-    /// Returns the [`TxEnv`] configured from local settings only.
-    fn local_tx_env(&self) -> TxEnv {
-        TxEnv {
-            caller: self.sender,
-            gas_price: self.env.gas_price.unwrap_or_default().into(),
-            gas_limit: self.gas_limit(),
-            ..Default::default()
-        }
+    /// Returns the `TxEnv` configured from local settings only.
+    fn local_tx_env<TX: FoundryTransaction + Default>(&self) -> TX {
+        let mut tx_env = TX::default();
+        tx_env.set_caller(self.sender);
+        tx_env.set_gas_price(self.env.gas_price.unwrap_or_default().into());
+        tx_env.set_gas_limit(self.gas_limit());
+        tx_env
     }
 
     /// Builds a [`CfgEnv`] from the options, using the provided [`ChainId`].
-    fn cfg_env(&self, chain_id: ChainId) -> CfgEnv {
+    fn cfg_env<SPEC: Into<SpecId> + Default>(&self, chain_id: ChainId) -> CfgEnv<SPEC> {
         let mut cfg = CfgEnv::default();
         cfg.chain_id = chain_id;
         cfg.memory_limit = self.memory_limit;
-        cfg.limit_contract_code_size = Some(usize::MAX);
+        cfg.limit_contract_code_size = self.env.code_size_limit.or(Some(usize::MAX));
         // EIP-3607 rejects transactions from senders with deployed code.
         // If EIP-3607 is enabled it can cause issues during fuzz/invariant tests if the caller
         // is a contract. So we disable the check by default.
@@ -295,19 +319,26 @@ impl EvmOpts {
     ///
     /// for `mainnet` and `--fork-block-number 14435000` on mac the corresponding storage cache will
     /// be at `~/.foundry/cache/mainnet/14435000/storage.json`.
-    pub fn get_fork(&self, config: &Config, env: crate::Env) -> Option<CreateFork> {
+    /// `fork_block_number` is the actual block number to pin the fork to. This must be the
+    /// real chain block number, not a remapped value. On some L2s (e.g., Arbitrum)
+    /// `block_env.number` is remapped to the L1 block number, so callers must pass the
+    /// original block number returned by [`EvmOpts::env`] instead.
+    pub fn get_fork(
+        &self,
+        config: &Config,
+        chain_id: u64,
+        fork_block_number: Option<BlockNumber>,
+    ) -> Option<CreateFork> {
         let url = self.fork_url.clone()?;
-        let enable_caching = config.enable_caching(&url, env.evm_env.cfg_env.chain_id);
+        let enable_caching = config.enable_caching(&url, chain_id);
 
         // Pin fork_block_number to the block that was already fetched in env, so subsequent
         // fork operations use the same block. This prevents inconsistencies when forking at
         // "latest" where the chain could advance between calls.
         let mut evm_opts = self.clone();
-        if evm_opts.fork_block_number.is_none() {
-            evm_opts.fork_block_number = Some(env.evm_env.block_env.number.to());
-        }
+        evm_opts.fork_block_number = evm_opts.fork_block_number.or(fork_block_number);
 
-        Some(CreateFork { url, enable_caching, env, evm_opts })
+        Some(CreateFork { url, enable_caching, evm_opts })
     }
 
     /// Returns the gas limit to use
@@ -415,6 +446,8 @@ async fn option_try_or_else<T, E>(
 
 #[cfg(test)]
 mod tests {
+    use revm::context::{BlockEnv, TxEnv};
+
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -428,18 +461,57 @@ mod tests {
         assert!(evm_opts.fork_block_number.is_none());
 
         // Fetch the environment (this resolves "latest" to an actual block number)
-        let env = evm_opts.env().await.unwrap();
-        let resolved_block = env.evm_env.block_env.number;
-        assert!(resolved_block > U256::ZERO, "should have resolved to a real block number");
+        let (evm_env, _, fork_block) = evm_opts.env::<SpecId, BlockEnv, TxEnv>().await.unwrap();
+        assert!(fork_block.is_some(), "should have resolved a fork block number");
+        let resolved_block = fork_block.unwrap();
+        assert!(resolved_block > 0, "should have resolved to a real block number");
 
         // Create the fork - this should pin the block number
-        let fork = evm_opts.get_fork(&Config::default(), env).unwrap();
+        let fork =
+            evm_opts.get_fork(&Config::default(), evm_env.cfg_env.chain_id, fork_block).unwrap();
 
         // The fork's evm_opts should now have fork_block_number set to the resolved block
         assert_eq!(
             fork.evm_opts.fork_block_number,
-            Some(resolved_block.to::<u64>()),
+            Some(resolved_block),
             "get_fork should pin fork_block_number to the block from env"
+        );
+    }
+
+    // Regression test for https://github.com/foundry-rs/foundry/issues/13576
+    // On Arbitrum, `block_env.number` is remapped to the L1 block number by
+    // `apply_chain_and_block_specific_env_changes`. The fork block number returned
+    // by `env()` must be the actual L2 block number, not the remapped L1 value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flaky_get_fork_uses_l2_block_number_on_arbitrum() {
+        let endpoint =
+            foundry_test_utils::rpc::next_rpc_endpoint(foundry_config::NamedChain::Arbitrum);
+
+        let config = Config::figment();
+        let mut evm_opts = config.extract::<EvmOpts>().unwrap();
+        evm_opts.fork_url = Some(endpoint.clone());
+        assert!(evm_opts.fork_block_number.is_none());
+
+        let (evm_env, _, fork_block) = evm_opts.env::<SpecId, BlockEnv, TxEnv>().await.unwrap();
+        let fork_block = fork_block.expect("should have resolved a fork block number");
+
+        // On Arbitrum, block_env.number is the L1 block number (much smaller).
+        // The fork_block should be the actual L2 block number (much larger).
+        let block_env_number: u64 = evm_env.block_env.number.to();
+        assert!(
+            fork_block > block_env_number,
+            "fork_block ({fork_block}) should be the L2 block, which is larger than \
+             block_env.number ({block_env_number}) which is the L1 block on Arbitrum"
+        );
+
+        // Verify get_fork pins to the correct L2 block number
+        let fork = evm_opts
+            .get_fork(&Config::default(), evm_env.cfg_env.chain_id, Some(fork_block))
+            .unwrap();
+        assert_eq!(
+            fork.evm_opts.fork_block_number,
+            Some(fork_block),
+            "get_fork should pin to the L2 block number, not the L1 block number"
         );
     }
 
@@ -453,9 +525,10 @@ mod tests {
         // Set an explicit block number
         evm_opts.fork_block_number = Some(12345678);
 
-        let env = evm_opts.env().await.unwrap();
+        let (evm_env, _, fork_block) = evm_opts.env::<SpecId, BlockEnv, TxEnv>().await.unwrap();
 
-        let fork = evm_opts.get_fork(&Config::default(), env).unwrap();
+        let fork =
+            evm_opts.get_fork(&Config::default(), evm_env.cfg_env.chain_id, fork_block).unwrap();
 
         // Should preserve the explicit block number, not override it
         assert_eq!(

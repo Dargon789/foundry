@@ -1,6 +1,11 @@
-use crate::{debug::handle_traces, utils::apply_chain_and_block_specific_env_changes};
-use alloy_consensus::{BlockHeader, Transaction};
-use alloy_network::{AnyNetwork, TransactionResponse};
+use crate::{
+    debug::handle_traces,
+    utils::{apply_chain_and_block_specific_env_changes, block_env_from_header},
+};
+use alloy_consensus::{BlockHeader, Transaction, transaction::SignerRecoverable};
+
+use alloy_evm::FromRecoveredTx;
+use alloy_network::{BlockResponse, TransactionResponse};
 use alloy_primitives::{
     Address, Bytes, U256,
     map::{AddressSet, HashMap},
@@ -13,7 +18,9 @@ use foundry_cli::{
     opts::{EtherscanOpts, RpcOpts},
     utils::{TraceResult, init_progress},
 };
-use foundry_common::{SYSTEM_TRANSACTION_TYPE, is_impersonated_tx, is_known_system_sender, shell};
+use foundry_common::{
+    SYSTEM_TRANSACTION_TYPE, is_known_system_sender, provider::ProviderBuilder, shell,
+};
 use foundry_compilers::artifacts::EvmVersion;
 use foundry_config::{
     Config,
@@ -23,14 +30,16 @@ use foundry_config::{
     },
 };
 use foundry_evm::{
-    Env,
+    core::{
+        FoundryBlock as _,
+        evm::{EthEvmNetwork, FoundryEvmNetwork, TempoEvmNetwork, TxEnvFor},
+    },
     executors::{EvmError, Executor, TracingExecutor},
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode, Traces},
-    utils::configure_tx_env,
 };
 use futures::TryFutureExt;
-use revm::{DatabaseRef, primitives::hardfork::SpecId};
+use revm::{DatabaseRef, context::Block};
 
 /// CLI arguments for `cast run`.
 #[derive(Clone, Debug, Parser)]
@@ -123,6 +132,20 @@ impl RunArgs {
     /// Note: This executes the transaction(s) as is: Cheatcodes are disabled
     pub async fn run(self) -> Result<()> {
         let figment = self.rpc.clone().into_figment(self.with_local_artifacts).merge(&self);
+        let mut evm_opts = figment.extract::<EvmOpts>()?;
+
+        // Auto-detect network from fork chain ID when not explicitly configured.
+        evm_opts.infer_network_from_fork().await;
+
+        if evm_opts.networks.is_tempo() {
+            self.run_with_evm::<TempoEvmNetwork>().await
+        } else {
+            self.run_with_evm::<EthEvmNetwork>().await
+        }
+    }
+
+    async fn run_with_evm<FEN: FoundryEvmNetwork>(self) -> Result<()> {
+        let figment = self.rpc.clone().into_figment(self.with_local_artifacts).merge(&self);
         let evm_opts = figment.extract::<EvmOpts>()?;
         let mut config = Config::from_provider(figment)?.sanitized();
 
@@ -134,7 +157,7 @@ impl RunArgs {
         let compute_units_per_second =
             if self.no_rate_limit { Some(u64::MAX) } else { self.compute_units_per_second };
 
-        let provider = foundry_cli::utils::get_provider_builder(&config)?
+        let provider = ProviderBuilder::<FEN::Network>::from_config(&config)?
             .compute_units_per_second_opt(compute_units_per_second)
             .build()?;
 
@@ -156,56 +179,46 @@ impl RunArgs {
             ));
         }
 
-        let tx_block_number =
-            tx.block_number.ok_or_else(|| eyre::eyre!("tx may still be pending: {:?}", tx_hash))?;
+        let tx_block_number = tx
+            .block_number()
+            .ok_or_else(|| eyre::eyre!("tx may still be pending: {:?}", tx_hash))?;
 
         // we need to fork off the parent block
         config.fork_block_number = Some(tx_block_number - 1);
 
         let create2_deployer = evm_opts.create2_deployer;
-        let (block, (mut env, fork, chain, networks)) = tokio::try_join!(
+        let (block, (mut evm_env, tx_env, fork, chain, networks)) = tokio::try_join!(
             // fetch the block the transaction was mined in
             provider.get_block(tx_block_number.into()).full().into_future().map_err(Into::into),
-            TracingExecutor::get_fork_material(&mut config, evm_opts)
+            TracingExecutor::<FEN>::get_fork_material(&mut config, evm_opts)
         )?;
 
         let mut evm_version = self.evm_version;
 
-        env.evm_env.cfg_env.disable_block_gas_limit = self.disable_block_gas_limit;
+        evm_env.cfg_env.disable_block_gas_limit = self.disable_block_gas_limit;
 
         // By default do not enforce transaction gas limits imposed by Osaka (EIP-7825).
         // Users can opt-in to enable these limits by setting `enable_tx_gas_limit` to true.
         if !self.enable_tx_gas_limit {
-            env.evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+            evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
         }
 
-        env.evm_env.cfg_env.limit_contract_code_size = None;
-        env.evm_env.block_env.number = U256::from(tx_block_number);
-
-        let mut parent_beacon_block_root = None;
+        evm_env.cfg_env.limit_contract_code_size = None;
+        evm_env.block_env.set_number(U256::from(tx_block_number));
 
         if let Some(block) = &block {
-            env.evm_env.block_env.timestamp = U256::from(block.header.timestamp());
-            env.evm_env.block_env.beneficiary = block.header.beneficiary();
-            env.evm_env.block_env.difficulty = block.header.difficulty();
-            env.evm_env.block_env.prevrandao = Some(block.header.mix_hash().unwrap_or_default());
-            env.evm_env.block_env.basefee = block.header.base_fee_per_gas().unwrap_or_default();
-            env.evm_env.block_env.gas_limit = block.header.gas_limit();
-
-            if env.evm_env.cfg_env.spec >= SpecId::CANCUN {
-                parent_beacon_block_root = block.header.parent_beacon_block_root;
-            }
+            evm_env.block_env = block_env_from_header(block.header());
 
             // TODO: we need a smarter way to map the block to the corresponding evm_version for
             // commonly used chains
             if evm_version.is_none() {
                 // if the block has the excess_blob_gas field, we assume it's a Cancun block
-                if block.header.excess_blob_gas().is_some() {
+                if block.header().excess_blob_gas().is_some() {
                     evm_version = Some(EvmVersion::Prague);
                 }
             }
-            apply_chain_and_block_specific_env_changes::<AnyNetwork>(
-                &mut env.evm_env,
+            apply_chain_and_block_specific_env_changes::<FEN::Network, _, _>(
+                &mut evm_env,
                 block,
                 config.networks,
             );
@@ -219,8 +232,8 @@ impl RunArgs {
                 InternalTraceMode::None
             })
             .with_state_changes(shell::verbosity() > 4);
-        let mut executor = TracingExecutor::new(
-            env.clone(),
+        let mut executor = TracingExecutor::<FEN>::new(
+            (evm_env.clone(), tx_env),
             fork,
             evm_version,
             trace_mode,
@@ -229,17 +242,7 @@ impl RunArgs {
             None,
         )?;
 
-        if let Some(parent_beacon_block_root) = parent_beacon_block_root {
-            let timestamp: u64 = env.evm_env.block_env.timestamp.try_into().wrap_err("failed to convert block timestamp to u64")?;
-            executor.process_beacon_block_root(timestamp, parent_beacon_block_root)?;
-        }
-
-        let mut env = Env::new_with_spec_id(
-            env.evm_env.cfg_env.clone(),
-            env.evm_env.block_env.clone(),
-            env.tx.clone(),
-            executor.spec_id(),
-        );
+        evm_env.cfg_env.set_spec(executor.spec_id());
 
         // Set the state to the moment right before the transaction
         if !self.quick {
@@ -248,10 +251,10 @@ impl RunArgs {
             }
 
             if let Some(block) = block {
-                let pb = init_progress(block.transactions.len() as u64, "tx");
+                let pb = init_progress(block.transactions().len() as u64, "tx");
                 pb.set_position(0);
 
-                let BlockTransactions::Full(ref txs) = block.transactions else {
+                let BlockTransactions::Full(ref txs) = *block.transactions() else {
                     return Err(eyre::eyre!("Could not get block txs"));
                 };
 
@@ -270,22 +273,26 @@ impl RunArgs {
                         break;
                     }
 
-                    configure_tx_env(&mut env, tx);
+                    let tx_env = TxEnvFor::<FEN>::from_recovered_tx(tx.as_ref(), tx.from());
 
-                    env.evm_env.cfg_env.disable_balance_check = true;
+                    evm_env.cfg_env.disable_balance_check = true;
 
                     if let Some(to) = Transaction::to(tx) {
                         trace!(tx=?tx.tx_hash(),?to, "executing previous call transaction");
-                        executor.transact_with_env(env.clone()).wrap_err_with(|| {
-                            format!(
-                                "Failed to execute transaction: {:?} in block {}",
-                                tx.tx_hash(),
-                                env.evm_env.block_env.number
-                            )
-                        })?;
+                        executor.transact_with_env(evm_env.clone(), tx_env.clone()).wrap_err_with(
+                            || {
+                                format!(
+                                    "Failed to execute transaction: {:?} in block {}",
+                                    tx.tx_hash(),
+                                    evm_env.block_env.number()
+                                )
+                            },
+                        )?;
                     } else {
                         trace!(tx=?tx.tx_hash(), "executing previous create transaction");
-                        if let Err(error) = executor.deploy_with_env(env.clone(), None) {
+                        if let Err(error) =
+                            executor.deploy_with_env(evm_env.clone(), tx_env.clone(), None)
+                        {
                             match error {
                                 // Reverted transactions should be skipped
                                 EvmError::Execution(_) => (),
@@ -294,7 +301,7 @@ impl RunArgs {
                                         format!(
                                             "Failed to deploy transaction: {:?} in block {}",
                                             tx.tx_hash(),
-                                            env.evm_env.block_env.number
+                                            evm_env.block_env.number()
                                         )
                                     });
                                 }
@@ -311,17 +318,18 @@ impl RunArgs {
         let result = {
             executor.set_trace_printer(self.trace_printer);
 
-            configure_tx_env(&mut env, &tx);
-            if is_impersonated_tx(tx.as_ref()) {
-                env.evm_env.cfg_env.disable_balance_check = true;
+            let tx_env = TxEnvFor::<FEN>::from_recovered_tx(tx.as_ref(), tx.from());
+
+            if tx.as_ref().recover_signer().is_ok_and(|signer| signer != tx.from()) {
+                evm_env.cfg_env.disable_balance_check = true;
             }
 
             if let Some(to) = Transaction::to(&tx) {
                 trace!(tx=?tx.tx_hash(), to=?to, "executing call transaction");
-                TraceResult::try_from(executor.transact_with_env(env))?
+                TraceResult::from(executor.transact_with_env(evm_env, tx_env)?)
             } else {
                 trace!(tx=?tx.tx_hash(), "executing create transaction");
-                TraceResult::try_from(executor.deploy_with_env(env, None))?
+                TraceResult::try_from(executor.deploy_with_env(evm_env, tx_env, None))?
             }
         };
 
@@ -344,8 +352,8 @@ impl RunArgs {
     }
 }
 
-pub fn fetch_contracts_bytecode_from_trace(
-    executor: &Executor,
+pub fn fetch_contracts_bytecode_from_trace<FEN: FoundryEvmNetwork>(
+    executor: &Executor<FEN>,
     result: &TraceResult,
 ) -> Result<HashMap<Address, Bytes>> {
     let mut contracts_bytecode = HashMap::default();

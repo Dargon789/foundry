@@ -356,7 +356,7 @@ impl WalletSubcommands {
 
                             for i in 0..number {
                                 let name = match number {
-                                    1 => acc_name.to_string(),
+                                    1 => acc_name.clone(),
                                     _ => format!("{}_{}", acc_name, i + 1),
                                 };
                                 let file_path = path.join(&name);
@@ -689,7 +689,7 @@ impl WalletSubcommands {
                         )?;
                     } else {
                         sh_println!(
-                            "Successfully signed!\n   Nonce: {}\n   Chain ID: {}\n   Address: {}\n   Signature: 0x{}",
+                            "Successfully signed!\n   Nonce: {}\n   Chain ID: {}\n   Address: {}\n   Signature: {}",
                             nonce,
                             chain_id,
                             wallet.address(),

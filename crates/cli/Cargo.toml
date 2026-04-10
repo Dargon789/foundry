@@ -25,6 +25,8 @@ solar.workspace = true
 
 alloy-eips.workspace = true
 alloy-dyn-abi.workspace = true
+alloy-network.workspace = true
+alloy-signer.workspace = true
 alloy-json-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
