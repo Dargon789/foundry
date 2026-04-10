@@ -23,9 +23,10 @@ use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use eth::backend::fork::ClientFork;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use foundry_common::provider::{ProviderBuilder, RetryProvider};
 pub use foundry_evm::hardfork::EthereumHardfork;
+use foundry_primitives::FoundryNetwork;
 use futures::{FutureExt, TryFutureExt};
 use parking_lot::Mutex;
 use revm::primitives::hardfork::SpecId;
@@ -111,7 +112,7 @@ extern crate tracing;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn spawn(config: NodeConfig) -> (EthApi, NodeHandle) {
+pub async fn spawn(config: NodeConfig) -> (EthApi<FoundryNetwork>, NodeHandle) {
     try_spawn(config).await.expect("failed to spawn node")
 }
 
@@ -135,11 +136,17 @@ pub async fn spawn(config: NodeConfig) -> (EthApi, NodeHandle) {
 /// # Ok(())
 /// # }
 /// ```
-pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi, NodeHandle)> {
+pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>, NodeHandle)> {
     let logger = if config.enable_tracing { init_tracing() } else { Default::default() };
     logger.set_enabled(!config.silent);
 
-    let backend = Arc::new(config.setup().await?);
+    let backend = config.setup::<FoundryNetwork>().await?;
+
+    if let Some(state) = config.init_state.clone() {
+        backend.load_state(state).await.wrap_err("failed to load init state")?;
+    }
+
+    let backend = Arc::new(backend);
 
     if config.enable_auto_impersonate {
         backend.auto_impersonate_account(true);
@@ -431,9 +438,8 @@ impl Future for NodeHandle {
         if let Some(mut ipc) = pin.ipc_task.take() {
             if let Poll::Ready(res) = ipc.poll_unpin(cx) {
                 return Poll::Ready(res.map(|()| Ok(())));
-            } else {
-                pin.ipc_task = Some(ipc);
             }
+            pin.ipc_task = Some(ipc);
         }
 
         // poll the node service task

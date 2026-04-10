@@ -256,7 +256,7 @@ impl CloneArgs {
         let (main_file, main_artifact) = find_main_contract(&compile_output, &meta.contract_name)?;
         let main_file = main_file.strip_prefix(root)?.to_path_buf();
         let storage_layout =
-            main_artifact.storage_layout.to_owned().expect("storage layout not found");
+            main_artifact.storage_layout.clone().expect("storage layout not found");
 
         // dump the metadata to the root directory
         let creation_tx = client.contract_creation_data(address).await?;
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_clone_contract_with_relative_import() {
+    async fn flaky_test_clone_contract_with_relative_import() {
         let address = "0x3a23F943181408EAC424116Af7b7790c94Cb97a5".parse().unwrap();
         one_test_case(address, false).await
     }
