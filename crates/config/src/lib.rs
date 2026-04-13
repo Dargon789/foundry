@@ -163,7 +163,6 @@ pub use semver;
 ///
 /// Note that these behaviors differ from those of [`Config::figment()`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Config {
     /// The selected profile. **(default: _default_ `default`)**
     ///
@@ -2756,7 +2755,7 @@ impl BasicConfig {
             "\
 [profile.{}]
 {s}
-# See more config options: https://getfoundry.sh/config/reference/default-config\n",
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options\n",
             self.profile
         ))
     }
@@ -4245,6 +4244,7 @@ mod tests {
                 out = "myout"
                 verbosity = 3
                 evm_version = 'berlin'
+
                 [profile.other]
                 src = "other-src"
             "#,
@@ -4876,48 +4876,28 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_basic() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file(
-                "foundry.toml",
-                r#"
-                [profile.default]
-                src = "mysrc"
-                out = "myout"
-                verbosity = 3
-                evm_version = 'berlin'
-                [profile.other]
-                src = "other-src"
-            "#,
-            )?;
-            let loaded = Config::load().unwrap();
-            assert_eq!(loaded.evm_version, EvmVersion::Berlin);
-            let base = loaded.into_basic();
-            let default = Config::default();
-            assert_eq!(
-                base,
+    fn test_parse_with_profile() {
+        let foundry_str = r"
+            [profile.default]
+            src = 'src'
+            out = 'out'
+            libs = ['lib']
+
+            # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+        ";
+        assert_eq!(
+            parse_with_profile::<BasicConfig>(foundry_str).unwrap().unwrap(),
+            (
+                Config::DEFAULT_PROFILE,
                 BasicConfig {
                     profile: Config::DEFAULT_PROFILE,
-                    src: "mysrc".into(),
-                    out: "myout".into(),
-                    libs: default.libs.clone(),
-                    remappings: default.remappings.clone(),
+                    src: "src".into(),
+                    out: "out".into(),
+                    libs: vec!["lib".into()],
+                    remappings: vec![]
                 }
-            );
-            jail.set_env("FOUNDRY_PROFILE", r"other");
-            let base = Config::figment().extract::<BasicConfig>().unwrap();
-            assert_eq!(
-                base,
-                BasicConfig {
-                    profile: Config::DEFAULT_PROFILE,
-                    src: "other-src".into(),
-                    out: "myout".into(),
-                    libs: default.libs.clone(),
-                    remappings: default.remappings,
-                }
-            );
-            Ok(())
-        });
+            )
+        );
     }
 
     #[test]
