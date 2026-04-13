@@ -118,39 +118,35 @@ impl ScriptTester {
     fn copy_testdata(root: &Path) -> Result<()> {
         let testdata = Self::testdata_path();
         let from_dir = testdata.join("utils");
-        let from_dir_canon = from_dir.canonicalize()?;
-        let from_dir_canon = from_dir.canonicalize()?;
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
         for entry in fs::read_dir(&from_dir)? {
             let file = entry?.path();
-
-            // Resolve each entry and ensure it stays within the trusted source directory.
-            let canonical_file = match file.canonicalize() {
-                Ok(path) if path.starts_with(&from_dir_canon) => path,
-                _ => continue,
-            };
-
-            // Only operate on regular files to avoid following symlinks or directories.
-            let metadata = fs::symlink_metadata(&canonical_file)?;
+            // Only operate on regular files to avoid following symlinks or directories
+            let metadata = fs::symlink_metadata(&file)?;
             let ftype = metadata.file_type();
             if !ftype.is_file() {
                 continue;
             }
-
             let name = match file.file_name() {
-            // Verify canonicalized file is in canonicalized from_dir to avoid traversal
-            let canonical_file = match file.canonicalize() {
-                Ok(path) => path,
-                Err(_) => continue,
+                Some(name) => name,
+                None => continue,
             };
-            if !canonical_file.starts_with(&from_dir_canon) {
-                // Skip invalid (potentially dangerous) file names.
+            // Validate file name to avoid path traversal and absolute paths
+            let name_str = name.to_string_lossy();
+            if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
+                // Skip invalid (potentially dangerous) file names
                 continue;
-
-            fs::copy(&canonical_file, to_dir.join(name))?;
-
-            fs::copy(&canonical_file, to_dir.join(name))?;
+            }
+            // Verify canonicalized file is in from_dir to avoid symlink traversal
+            if let Ok(canonical_file) = file.canonicalize() {
+                if !canonical_file.starts_with(&from_dir) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            fs::copy(&file, to_dir.join(name))?;
         }
         Ok(())
     }
@@ -251,11 +247,12 @@ impl ScriptTester {
 
         trace!(target: "tests", "STDOUT\n{stdout}\n\nSTDERR\n{stderr}");
 
-        assert!(
-            !(!stdout.contains(expected.as_str()) && !stderr.contains(expected.as_str())),
-            "--STDOUT--\n{stdout}\n\n--STDERR--\n{stderr}\n\n--EXPECTED--\n{:?} not found in stdout or stderr",
-            expected.as_str()
-        );
+        if !stdout.contains(expected.as_str()) && !stderr.contains(expected.as_str()) {
+            panic!(
+                "--STDOUT--\n{stdout}\n\n--STDERR--\n{stderr}\n\n--EXPECTED--\n{:?} not found in stdout or stderr",
+                expected.as_str()
+            );
+        }
 
         self
     }
@@ -303,7 +300,7 @@ pub enum ScriptOutcome {
 }
 
 impl ScriptOutcome {
-    pub const fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::OkNoEndpoint => "If you wish to simulate on-chain transactions pass a RPC URL.",
             Self::OkSimulation => "SIMULATION COMPLETE. To broadcast these",
@@ -327,7 +324,7 @@ impl ScriptOutcome {
         }
     }
 
-    pub const fn is_err(&self) -> bool {
+    pub fn is_err(&self) -> bool {
         match self {
             Self::OkNoEndpoint
             | Self::OkSimulation
