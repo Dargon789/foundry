@@ -191,12 +191,20 @@ impl TraceIdentifier for ExternalIdentifier {
                         .map(|metadata| self.identify_from_metadata(address, metadata));
                     match self.contracts.entry(address) {
                         Entry::Occupied(mut occupied_entry) => {
-                            // Override if:
-                            // - new is from Etherscan and old is not
-                            // - new is Some and old is None, meaning verified only in one source
-                            if !matches!(occupied_entry.get().0, FetcherKind::Etherscan)
-                                || value.1.is_none()
-                            {
+                            let old = occupied_entry.get();
+                            // Only override when the new result is strictly better:
+                            // - new has metadata and old doesn't, OR
+                            // - both have metadata but new is from Etherscan and old is not.
+                            // Never downgrade a successful lookup to None.
+                            let should_replace = match (&old.1, &value.1) {
+                                (None, Some(_)) => true,
+                                (Some(_), None) => false,
+                                _ => {
+                                    matches!(value.0, FetcherKind::Etherscan)
+                                        && !matches!(old.0, FetcherKind::Etherscan)
+                                }
+                            };
+                            if should_replace {
                                 occupied_entry.insert(value);
                             }
                         }
@@ -317,6 +325,8 @@ impl Stream for ExternalFetcher {
                         }
                         Err(err) => {
                             warn!(target: "evm::traces::external", ?err, "could not get info");
+                            // Cache the failure so we don't re-fetch on subsequent arenas.
+                            return Poll::Ready(Some((addr, (pin.fetcher.kind(), None))));
                         }
                     }
                 }
@@ -350,7 +360,7 @@ struct EtherscanFetcher {
 }
 
 impl EtherscanFetcher {
-    fn new(client: foundry_block_explorers::Client) -> Self {
+    const fn new(client: foundry_block_explorers::Client) -> Self {
         Self { client, invalid_api_key: AtomicBool::new(false) }
     }
 }
@@ -414,7 +424,12 @@ impl ExternalFetcherT for SourcifyFetcher {
 
     async fn fetch(&self, address: Address) -> Result<Option<Metadata>, EtherscanError> {
         let url = format!("{url}/{address}?fields=abi,compilation", url = self.url);
-        let response = self.client.get(url).send().await?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| EtherscanError::Unknown(e.to_string()))?;
         let code = response.status();
         match code.as_u16() {
             // Not verified.
@@ -423,7 +438,8 @@ impl ExternalFetcherT for SourcifyFetcher {
             429 => return Err(EtherscanError::RateLimitExceeded),
             _ => {}
         }
-        let response: SourcifyResponse = response.json().await?;
+        let response: SourcifyResponse =
+            response.json().await.map_err(|e| EtherscanError::Unknown(e.to_string()))?;
         trace!(target: "evm::traces::external", "Sourcify response for {address}: {response:#?}");
         match response {
             SourcifyResponse::Success(metadata) => Ok(Some(metadata.into())),

@@ -7,14 +7,15 @@ use alloy_consensus::{
         eip4844::{TxEip4844Variant, TxEip4844WithSidecar},
     },
 };
-use alloy_evm::FromRecoveredTx;
+use alloy_evm::{FromRecoveredTx, FromTxWithEncoded};
 use alloy_network::{AnyRpcTransaction, AnyTxEnvelope, TransactionResponse};
-use alloy_primitives::{Address, B256, TxHash};
+use alloy_primitives::{Address, B256, Bytes, TxHash};
 use alloy_rpc_types::ConversionError;
 use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, OpTransaction as OpTransactionTrait, TxDeposit};
-use op_revm::OpTransaction;
+use op_revm::{OpTransaction, transaction::deposit::DepositTransactionParts};
 use revm::context::TxEnv;
 use tempo_primitives::{AASigned, TempoTransaction};
+use tempo_revm::TempoTxEnv;
 
 //
 /// Container type for signed, typed transactions.
@@ -77,7 +78,7 @@ impl FoundryTxEnvelope {
         }
     }
 
-    pub fn sidecar(&self) -> Option<&TxEip4844WithSidecar> {
+    pub const fn sidecar(&self) -> Option<&TxEip4844WithSidecar> {
         match self {
             Self::Eip4844(signed_variant) => match signed_variant.tx() {
                 TxEip4844Variant::TxEip4844WithSidecar(with_sidecar) => Some(with_sidecar),
@@ -103,6 +104,11 @@ impl FoundryTxEnvelope {
             Self::Deposit(t) => t.tx_hash(),
             Self::Tempo(t) => *t.hash(),
         }
+    }
+
+    /// Returns `true` if this is a Tempo transaction.
+    pub const fn is_tempo(&self) -> bool {
+        matches!(self, Self::Tempo(_))
     }
 
     /// Recovers the Ethereum address which was used to sign the transaction.
@@ -210,7 +216,7 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
             FoundryTxEnvelope::Deposit(sealed_tx) => {
                 Self::from_recovered_tx(sealed_tx.inner(), caller)
             }
-            FoundryTxEnvelope::Tempo(_) => panic!("unsupported tx type on ethereum"),
+            FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Ethereum context"),
         }
     }
 }
@@ -226,7 +232,81 @@ impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
             FoundryTxEnvelope::Deposit(sealed_tx) => {
                 Self::from_recovered_tx(sealed_tx.inner(), caller)
             }
-            FoundryTxEnvelope::Tempo(_) => panic!("unsupported tx type on optimism"),
+            FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
+        }
+    }
+}
+
+impl FromTxWithEncoded<FoundryTxEnvelope> for TxEnv {
+    fn from_encoded_tx(tx: &FoundryTxEnvelope, sender: Address, _encoded: Bytes) -> Self {
+        Self::from_recovered_tx(tx, sender)
+    }
+}
+
+impl FromRecoveredTx<FoundryTxEnvelope> for TempoTxEnv {
+    fn from_recovered_tx(tx: &FoundryTxEnvelope, caller: Address) -> Self {
+        match tx {
+            FoundryTxEnvelope::Legacy(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip2930(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip1559(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip4844(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Eip7702(signed_tx) => {
+                Self::from(TxEnv::from_recovered_tx(signed_tx, caller))
+            }
+            FoundryTxEnvelope::Deposit(_) => unreachable!("Deposit tx in Tempo context"),
+            FoundryTxEnvelope::Tempo(aa_signed) => Self::from_recovered_tx(aa_signed, caller),
+        }
+    }
+}
+
+impl FromTxWithEncoded<FoundryTxEnvelope> for TempoTxEnv {
+    fn from_encoded_tx(tx: &FoundryTxEnvelope, sender: Address, _encoded: Bytes) -> Self {
+        Self::from_recovered_tx(tx, sender)
+    }
+}
+
+impl FromTxWithEncoded<FoundryTxEnvelope> for OpTransaction<TxEnv> {
+    fn from_encoded_tx(tx: &FoundryTxEnvelope, caller: Address, encoded: Bytes) -> Self {
+        match tx {
+            FoundryTxEnvelope::Legacy(signed_tx) => {
+                let base = TxEnv::from_recovered_tx(signed_tx, caller);
+                Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
+            }
+            FoundryTxEnvelope::Eip2930(signed_tx) => {
+                let base = TxEnv::from_recovered_tx(signed_tx, caller);
+                Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
+            }
+            FoundryTxEnvelope::Eip1559(signed_tx) => {
+                let base = TxEnv::from_recovered_tx(signed_tx, caller);
+                Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
+            }
+            FoundryTxEnvelope::Eip4844(signed_tx) => {
+                let base = TxEnv::from_recovered_tx(signed_tx, caller);
+                Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
+            }
+            FoundryTxEnvelope::Eip7702(signed_tx) => {
+                let base = TxEnv::from_recovered_tx(signed_tx, caller);
+                Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
+            }
+            FoundryTxEnvelope::Deposit(sealed_tx) => {
+                let deposit_tx = sealed_tx.inner();
+                let base = TxEnv::from_recovered_tx(deposit_tx, caller);
+                let deposit = DepositTransactionParts {
+                    source_hash: deposit_tx.source_hash,
+                    mint: Some(deposit_tx.mint),
+                    is_system_transaction: deposit_tx.is_system_transaction,
+                };
+                Self { base, enveloped_tx: Some(encoded), deposit }
+            }
+            FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
         }
     }
 }
@@ -275,8 +355,9 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
 mod tests {
     use std::str::FromStr;
 
-    use alloy_primitives::{Bytes, Signature, TxKind, U256, b256, hex};
+    use alloy_primitives::{TxKind, U256, b256, hex};
     use alloy_rlp::Decodable;
+    use alloy_signer::Signature;
 
     use super::*;
 

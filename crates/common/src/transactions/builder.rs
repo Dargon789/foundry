@@ -1,10 +1,19 @@
 use alloy_consensus::{
     BlobTransactionSidecar, BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant,
 };
+use alloy_eips::{Encodable2718, eip7702::SignedAuthorization};
 use alloy_network::{AnyNetwork, Ethereum, Network, TransactionBuilder};
-use alloy_primitives::{Address, B256, U256};
-use alloy_rpc_types::SignedAuthorization;
-use tempo_alloy::TempoNetwork;
+use alloy_primitives::{Address, B256, Signature, TxKind, U256};
+use alloy_provider::Provider;
+use alloy_signer::Signer;
+use eyre::Result;
+use op_alloy_network::Optimism;
+use op_alloy_rpc_types::OpTransactionRequest;
+use tempo_alloy::{TempoNetwork, provider::TempoProviderExt};
+use tempo_primitives::{
+    TempoSignature,
+    transaction::{Call, KeychainSignature, PrimitiveSignature, SignedKeyAuthorization},
+};
 
 /// Composite transaction builder trait for Foundry transactions.
 ///
@@ -29,6 +38,10 @@ use tempo_alloy::TempoNetwork;
 /// If the Network supports Tempo transactions, implement these methods:
 /// - [`FoundryTransactionBuilder::set_fee_token`]
 /// - [`FoundryTransactionBuilder::set_nonce_key`]
+/// - [`FoundryTransactionBuilder::set_key_id`]
+/// - [`FoundryTransactionBuilder::set_valid_before`]
+/// - [`FoundryTransactionBuilder::set_valid_after`]
+/// - [`FoundryTransactionBuilder::set_fee_payer_signature`]
 pub trait FoundryTransactionBuilder<N: Network>: TransactionBuilder<N> {
     /// Reset gas limit
     fn reset_gas_limit(&mut self);
@@ -127,6 +140,11 @@ pub trait FoundryTransactionBuilder<N: Network>: TransactionBuilder<N> {
         self
     }
 
+    /// Get the fee token for a Tempo transaction.
+    fn fee_token(&self) -> Option<Address> {
+        None
+    }
+
     /// Set the fee token for a Tempo transaction.
     fn set_fee_token(&mut self, _fee_token: Address) {}
 
@@ -136,6 +154,11 @@ pub trait FoundryTransactionBuilder<N: Network>: TransactionBuilder<N> {
         self
     }
 
+    /// Get the 2D nonce key for a Tempo transaction.
+    fn nonce_key(&self) -> Option<U256> {
+        None
+    }
+
     /// Set the 2D nonce key for the Tempo transaction.
     fn set_nonce_key(&mut self, _nonce_key: U256) {}
 
@@ -143,6 +166,112 @@ pub trait FoundryTransactionBuilder<N: Network>: TransactionBuilder<N> {
     fn with_nonce_key(mut self, nonce_key: U256) -> Self {
         self.set_nonce_key(nonce_key);
         self
+    }
+
+    /// Get the access key ID for a Tempo transaction.
+    fn key_id(&self) -> Option<Address> {
+        None
+    }
+
+    /// Set the access key ID for a Tempo transaction.
+    ///
+    /// Used during gas estimation to override the key_id that would normally be
+    /// recovered from the signature.
+    fn set_key_id(&mut self, _key_id: Address) {}
+
+    /// Builder-pattern method for setting the Tempo access key ID.
+    fn with_key_id(mut self, key_id: Address) -> Self {
+        self.set_key_id(key_id);
+        self
+    }
+
+    /// Get the valid_before timestamp for a Tempo expiring nonce transaction.
+    fn valid_before(&self) -> Option<u64> {
+        None
+    }
+
+    /// Set the valid_before timestamp for a Tempo expiring nonce transaction.
+    fn set_valid_before(&mut self, _valid_before: u64) {}
+
+    /// Builder-pattern method for setting the valid_before timestamp.
+    fn with_valid_before(mut self, valid_before: u64) -> Self {
+        self.set_valid_before(valid_before);
+        self
+    }
+
+    /// Get the valid_after timestamp for a Tempo expiring nonce transaction.
+    fn valid_after(&self) -> Option<u64> {
+        None
+    }
+
+    /// Set the valid_after timestamp for a Tempo expiring nonce transaction.
+    fn set_valid_after(&mut self, _valid_after: u64) {}
+
+    /// Builder-pattern method for setting the valid_after timestamp.
+    fn with_valid_after(mut self, valid_after: u64) -> Self {
+        self.set_valid_after(valid_after);
+        self
+    }
+
+    /// Get the fee payer (sponsor) signature for a Tempo sponsored transaction.
+    fn fee_payer_signature(&self) -> Option<Signature> {
+        None
+    }
+
+    /// Set the fee payer (sponsor) signature for a Tempo sponsored transaction.
+    fn set_fee_payer_signature(&mut self, _signature: Signature) {}
+
+    /// Builder-pattern method for setting the fee payer signature.
+    fn with_fee_payer_signature(mut self, signature: Signature) -> Self {
+        self.set_fee_payer_signature(signature);
+        self
+    }
+
+    /// Computes the sponsor (fee payer) signature hash for this transaction.
+    ///
+    /// This builds an unsigned consensus-level transaction from the request and computes
+    /// the hash that a sponsor needs to sign. Returns `None` for networks that don't
+    /// support sponsored transactions.
+    fn compute_sponsor_hash(&self, _from: Address) -> Option<B256> {
+        None
+    }
+
+    /// Set the key authorization for a Tempo transaction.
+    ///
+    /// Embeds a [`SignedKeyAuthorization`] in the transaction body, provisioning the access key
+    /// on-chain as part of this transaction.
+    fn set_key_authorization(&mut self, _key_authorization: SignedKeyAuthorization) {}
+
+    /// Converts a CREATE transaction into an AA-compatible call entry.
+    ///
+    /// Tempo AA transactions use a `calls` list instead of `to`+`input`. Must be
+    /// called before gas estimation so the RPC sees the correct tx structure.
+    /// No-op for non-Tempo networks.
+    fn convert_create_to_call(&mut self) {}
+
+    /// Clears the `to` and `value` fields for batch transactions that use `calls`.
+    ///
+    /// In Tempo AA batch transactions, targets are specified in the `calls` field, not in `to`.
+    /// If `to` is set, `build_aa()` would add a spurious extra call. Must be called after
+    /// `prepare()` sets `kind`/`to` but before gas estimation.
+    /// No-op for non-Tempo networks.
+    fn clear_batch_to(&mut self) {}
+
+    /// Signs the transaction using an access key (keychain mode).
+    ///
+    /// If `key_authorization` is provided and the key is not yet provisioned on-chain,
+    /// embeds the authorization in the transaction before signing.
+    ///
+    /// The default implementation returns an error. Only `TempoNetwork` supports this.
+    fn sign_with_access_key(
+        self,
+        _provider: &impl Provider<N>,
+        _signer: &(impl Signer + Sync),
+        _wallet_address: Address,
+        _key_address: Address,
+        _key_authorization: Option<&SignedKeyAuthorization>,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
+        async { eyre::bail!("access key signing is not supported for this network") }
     }
 }
 
@@ -224,6 +353,20 @@ impl FoundryTransactionBuilder<AnyNetwork> for <AnyNetwork as Network>::Transact
     }
 }
 
+impl FoundryTransactionBuilder<Optimism> for OpTransactionRequest {
+    fn reset_gas_limit(&mut self) {
+        self.as_mut().gas = None;
+    }
+
+    fn authorization_list(&self) -> Option<&Vec<SignedAuthorization>> {
+        self.as_ref().authorization_list.as_ref()
+    }
+
+    fn set_authorization_list(&mut self, authorization_list: Vec<SignedAuthorization>) {
+        self.as_mut().authorization_list = Some(authorization_list);
+    }
+}
+
 impl FoundryTransactionBuilder<TempoNetwork> for <TempoNetwork as Network>::TransactionRequest {
     fn reset_gas_limit(&mut self) {
         self.gas = None;
@@ -237,11 +380,117 @@ impl FoundryTransactionBuilder<TempoNetwork> for <TempoNetwork as Network>::Tran
         self.authorization_list = Some(authorization_list);
     }
 
+    fn fee_token(&self) -> Option<Address> {
+        self.fee_token
+    }
+
     fn set_fee_token(&mut self, fee_token: Address) {
         self.fee_token = Some(fee_token);
     }
 
+    fn nonce_key(&self) -> Option<U256> {
+        self.nonce_key
+    }
+
     fn set_nonce_key(&mut self, nonce_key: U256) {
         self.nonce_key = Some(nonce_key);
+    }
+
+    fn key_id(&self) -> Option<Address> {
+        self.key_id
+    }
+
+    fn set_key_id(&mut self, key_id: Address) {
+        self.key_id = Some(key_id);
+    }
+
+    fn valid_before(&self) -> Option<u64> {
+        self.valid_before
+    }
+
+    fn set_valid_before(&mut self, valid_before: u64) {
+        self.valid_before = Some(valid_before);
+    }
+
+    fn valid_after(&self) -> Option<u64> {
+        self.valid_after
+    }
+
+    fn set_valid_after(&mut self, valid_after: u64) {
+        self.valid_after = Some(valid_after);
+    }
+
+    fn fee_payer_signature(&self) -> Option<Signature> {
+        self.fee_payer_signature
+    }
+
+    fn set_fee_payer_signature(&mut self, signature: Signature) {
+        self.fee_payer_signature = Some(signature);
+    }
+
+    fn compute_sponsor_hash(&self, from: Address) -> Option<B256> {
+        let tx = self.clone().build_aa().ok()?;
+        Some(tx.fee_payer_signature_hash(from))
+    }
+
+    fn set_key_authorization(&mut self, key_authorization: SignedKeyAuthorization) {
+        self.key_authorization = Some(key_authorization);
+    }
+
+    fn convert_create_to_call(&mut self) {
+        if self.calls.is_empty() && self.inner.to.is_some_and(|to| to.is_create()) {
+            let input = self.inner.input.input().cloned().unwrap_or_default();
+            let value = self.inner.value.unwrap_or(U256::ZERO);
+            self.calls.push(Call { to: TxKind::Create, value, input });
+            self.inner.input = Default::default();
+            self.inner.value = None;
+            self.inner.to = None;
+        }
+    }
+
+    fn clear_batch_to(&mut self) {
+        if !self.calls.is_empty() {
+            self.inner.to = None;
+            self.inner.value = None;
+        }
+    }
+
+    fn sign_with_access_key(
+        mut self,
+        provider: &impl Provider<TempoNetwork>,
+        signer: &(impl Signer + Sync),
+        wallet_address: Address,
+        key_address: Address,
+        key_authorization: Option<&SignedKeyAuthorization>,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
+        let auth = key_authorization.cloned();
+        let provisioning_fut = provider.get_keychain_key(wallet_address, key_address);
+
+        async move {
+            if let Some(auth) = auth {
+                let is_provisioned =
+                    provisioning_fut.await.map(|info| info.keyId != Address::ZERO).unwrap_or(false);
+
+                if !is_provisioned {
+                    self.set_key_authorization(auth);
+                }
+            }
+
+            let tempo_tx = self
+                .build_aa()
+                .map_err(|e| eyre::eyre!("failed to build Tempo AA transaction: {e}"))?;
+
+            let sig_hash = tempo_tx.signature_hash();
+            let signing_hash = KeychainSignature::signing_hash(sig_hash, wallet_address);
+            let raw_sig = signer.sign_hash(&signing_hash).await?;
+
+            let keychain_sig =
+                KeychainSignature::new(wallet_address, PrimitiveSignature::Secp256k1(raw_sig));
+            let aa_signed = tempo_tx.into_signed(TempoSignature::Keychain(keychain_sig));
+
+            let mut buf = Vec::new();
+            aa_signed.encode_2718(&mut buf);
+            Ok(buf)
+        }
     }
 }
