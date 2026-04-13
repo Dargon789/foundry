@@ -130,10 +130,20 @@ impl BenchmarkProject {
         for entry in std::fs::read_dir(&root_path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).ok();
+            // Canonicalize the entry to prevent directory traversal
+            let canon = match path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue, // Skip if unable to canonicalize
+            };
+            // Ensure canonicalized path stays strictly within root_path (TempProject root)
+            if !canon.starts_with(&root_path) {
+                sh_eprintln!("⚠️  Skipping suspicious path during cleanup: {:?}", canon);
+                continue;
+            }
+            if canon.is_dir() {
+                std::fs::remove_dir_all(&canon).ok();
             } else {
-                std::fs::remove_file(&path).ok();
+                std::fs::remove_file(&canon).ok();
             }
         }
 
@@ -175,13 +185,13 @@ impl BenchmarkProject {
                 .status()
                 .wrap_err("Failed to run npm install")?;
 
-            if !status.success() {
+            if status.success() {
+                sh_println!("  ✅ npm install completed successfully");
+            } else {
                 sh_println!(
                     "  ⚠️  Warning: npm install failed with exit code: {:?}",
                     status.code()
                 );
-            } else {
-                sh_println!("  ✅ npm install completed successfully");
             }
         }
         Ok(())
