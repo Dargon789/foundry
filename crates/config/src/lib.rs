@@ -40,7 +40,6 @@ use foundry_compilers::{
     solc::{CliSettings, SolcLanguage, SolcSettings},
 };
 use regex::Regex;
-use revm::primitives::hardfork::SpecId;
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
@@ -54,6 +53,7 @@ use std::{
 mod macros;
 
 pub mod utils;
+pub use foundry_evm_hardforks::{FromEvmVersion, evm_spec_id};
 pub use utils::*;
 
 mod endpoints;
@@ -162,8 +162,7 @@ pub use semver;
 ///     the "default" meta-profile.
 ///
 /// Note that these behaviors differ from those of [`Config::figment()`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// The selected profile. **(default: _default_ `default`)**
     ///
@@ -649,7 +648,7 @@ impl From<bool> for DenyLevel {
 
 impl DenyLevel {
     /// Returns `true` if the deny level includes warnings.
-    pub fn warnings(&self) -> bool {
+    pub const fn warnings(&self) -> bool {
         match self {
             Self::Never => false,
             Self::Warnings | Self::Notes => true,
@@ -657,7 +656,7 @@ impl DenyLevel {
     }
 
     /// Returns `true` if the deny level includes notes.
-    pub fn notes(&self) -> bool {
+    pub const fn notes(&self) -> bool {
         match self {
             Self::Never | Self::Warnings => false,
             Self::Notes => true,
@@ -665,7 +664,7 @@ impl DenyLevel {
     }
 
     /// Returns `true` if the deny level is set to never (only errors).
-    pub fn never(&self) -> bool {
+    pub const fn never(&self) -> bool {
         match self {
             Self::Never => true,
             Self::Warnings | Self::Notes => false,
@@ -1010,7 +1009,7 @@ impl Config {
 
     /// Normalizes optimizer settings.
     /// See <https://github.com/foundry-rs/foundry/issues/9665>
-    pub fn normalized_optimizer_settings(mut self) -> Self {
+    pub const fn normalized_optimizer_settings(mut self) -> Self {
         self.normalize_optimizer_settings();
         self
     }
@@ -1024,7 +1023,7 @@ impl Config {
     /// - with default settings, optimizer is set to false and optimizer runs to 200
     /// - if optimizer is set and optimizer runs not specified, then optimizer runs is set to 200
     /// - enable optimizer if not explicitly set and optimizer runs set to a value greater than 0
-    pub fn normalize_optimizer_settings(&mut self) {
+    pub const fn normalize_optimizer_settings(&mut self) {
         match (self.optimizer, self.optimizer_runs) {
             // Default: set the optimizer to false and optimizer runs to 200.
             (None, None) => {
@@ -1068,7 +1067,7 @@ impl Config {
     /// Cleans up any duplicate `Remapping` and sorts them
     ///
     /// On windows this will convert any `\` in the remapping path into a `/`
-    pub fn sanitize_remappings(&mut self) {
+    pub const fn sanitize_remappings(&mut self) {
         #[cfg(target_os = "windows")]
         {
             // force `/` in remappings on windows
@@ -1151,7 +1150,8 @@ impl Config {
         paths: &ProjectPathsConfig,
     ) -> Result<BTreeMap<PathBuf, RestrictionsWithVersion<MultiCompilerRestrictions>>, SolcError>
     {
-        let mut map = BTreeMap::new();
+        let mut map: BTreeMap<PathBuf, RestrictionsWithVersion<MultiCompilerRestrictions>> =
+            BTreeMap::new();
         if self.compilation_restrictions.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -1171,9 +1171,7 @@ impl Config {
             }) {
                 let res: RestrictionsWithVersion<_> =
                     res.clone().try_into().map_err(SolcError::msg)?;
-                if !map.contains_key(source) {
-                    map.insert(source.clone(), res);
-                } else {
+                if map.contains_key(source) {
                     let value = map.remove(source.as_path()).unwrap();
                     if let Some(merged) = value.clone().merge(res) {
                         map.insert(source.clone(), merged);
@@ -1188,6 +1186,8 @@ impl Config {
                         );
                         map.insert(source.clone(), value);
                     }
+                } else {
+                    map.insert(source.clone(), res);
                 }
             }
         }
@@ -1327,8 +1327,8 @@ impl Config {
         Ok(None)
     }
 
-    /// Returns the [SpecId] derived from the configured [EvmVersion]
-    pub fn evm_spec_id(&self) -> SpecId {
+    /// Returns the Spec derived from the configured [EvmVersion]
+    pub fn evm_spec_id<SPEC: FromEvmVersion>(&self) -> SPEC {
         evm_spec_id(self.evm_version)
     }
 
@@ -1336,7 +1336,7 @@ impl Config {
     ///
     /// Returns `false` if `solc_version` is explicitly set, otherwise returns the value of
     /// `auto_detect_solc`
-    pub fn is_auto_detect(&self) -> bool {
+    pub const fn is_auto_detect(&self) -> bool {
         if self.solc.is_some() {
             return false;
         }
@@ -2183,9 +2183,8 @@ impl Config {
             }
             if let Ok(entries) = cache_dir.as_path().read_dir() {
                 for entry in entries.flatten().filter(|x| x.path().is_dir()) {
-                    match Chain::from_str(&entry.file_name().to_string_lossy()) {
-                        Ok(chain) => cache.chains.push(Self::list_foundry_chain_cache(chain)?),
-                        Err(_) => continue,
+                    if let Ok(chain) = Chain::from_str(&entry.file_name().to_string_lossy()) {
+                        cache.chains.push(Self::list_foundry_chain_cache(chain)?);
                     }
                 }
                 Ok(cache)
@@ -2330,7 +2329,7 @@ impl Config {
 
         // Normalize `deny` based on the provided `deny_warnings` value.
         if figment.extract_inner::<bool>("deny_warnings").unwrap_or(false)
-            && let Ok(DenyLevel::Never) = figment.extract_inner("deny")
+            && figment.extract_inner("deny") == Ok(DenyLevel::Never)
         {
             figment = figment.merge(("deny", DenyLevel::Warnings));
         }
@@ -2756,7 +2755,7 @@ impl BasicConfig {
             "\
 [profile.{}]
 {s}
-# See more config options: https://getfoundry.sh/config/reference/default-config\n",
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options\n",
             self.profile
         ))
     }
@@ -4245,6 +4244,7 @@ mod tests {
                 out = "myout"
                 verbosity = 3
                 evm_version = 'berlin'
+
                 [profile.other]
                 src = "other-src"
             "#,
@@ -4876,48 +4876,28 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_basic() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file(
-                "foundry.toml",
-                r#"
-                [profile.default]
-                src = "mysrc"
-                out = "myout"
-                verbosity = 3
-                evm_version = 'berlin'
-                [profile.other]
-                src = "other-src"
-            "#,
-            )?;
-            let loaded = Config::load().unwrap();
-            assert_eq!(loaded.evm_version, EvmVersion::Berlin);
-            let base = loaded.into_basic();
-            let default = Config::default();
-            assert_eq!(
-                base,
+    fn test_parse_with_profile() {
+        let foundry_str = r"
+            [profile.default]
+            src = 'src'
+            out = 'out'
+            libs = ['lib']
+
+            # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+        ";
+        assert_eq!(
+            parse_with_profile::<BasicConfig>(foundry_str).unwrap().unwrap(),
+            (
+                Config::DEFAULT_PROFILE,
                 BasicConfig {
                     profile: Config::DEFAULT_PROFILE,
-                    src: "mysrc".into(),
-                    out: "myout".into(),
-                    libs: default.libs.clone(),
-                    remappings: default.remappings.clone(),
+                    src: "src".into(),
+                    out: "out".into(),
+                    libs: vec!["lib".into()],
+                    remappings: vec![]
                 }
-            );
-            jail.set_env("FOUNDRY_PROFILE", r"other");
-            let base = Config::figment().extract::<BasicConfig>().unwrap();
-            assert_eq!(
-                base,
-                BasicConfig {
-                    profile: Config::DEFAULT_PROFILE,
-                    src: "other-src".into(),
-                    out: "myout".into(),
-                    libs: default.libs.clone(),
-                    remappings: default.remappings,
-                }
-            );
-            Ok(())
-        });
+            )
+        );
     }
 
     #[test]
