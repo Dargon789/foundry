@@ -1,32 +1,23 @@
 use crate::multi_sequence::MultiChainSequence;
-use alloy_network::Network;
 use eyre::Result;
 use forge_script_sequence::{ScriptSequence, TransactionWithMetadata};
 use foundry_cli::utils::Git;
-use foundry_common::{FoundryTransactionBuilder, fmt::UIfmt};
+use foundry_common::fmt::UIfmt;
 use foundry_compilers::ArtifactId;
 use foundry_config::Config;
-use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Error, Write},
     path::Path,
 };
 
 /// Format transaction details for display
-fn format_transaction<N: Network>(
-    index: usize,
-    tx: &TransactionWithMetadata<N>,
-) -> Result<String, Error>
-where
-    N::TxEnvelope: UIfmt,
-    N::TransactionRequest: FoundryTransactionBuilder<N>,
-{
+fn format_transaction(index: usize, tx: &TransactionWithMetadata) -> Result<String, Error> {
     let mut output = String::new();
     writeln!(output, "### Transaction {index} ###")?;
     writeln!(output, "{}", tx.tx().pretty())?;
 
     // Show contract name and address if available
-    if !tx.call_kind.is_any_create()
+    if !tx.opcode.is_any_create()
         && let (Some(name), Some(addr)) = (&tx.contract_name, &tx.contract_address)
     {
         writeln!(output, "contract: {name}({addr})")?;
@@ -54,20 +45,12 @@ pub fn get_commit_hash(root: &Path) -> Option<String> {
     Git::new(root).commit_hash(true, "HEAD").ok()
 }
 
-pub enum ScriptSequenceKind<N: Network>
-where
-    N::TxEnvelope: for<'d> Deserialize<'d> + Serialize,
-    N::TransactionRequest: for<'d> Deserialize<'d> + Serialize,
-{
-    Single(ScriptSequence<N>),
-    Multi(MultiChainSequence<N>),
+pub enum ScriptSequenceKind {
+    Single(ScriptSequence),
+    Multi(MultiChainSequence),
 }
 
-impl<N: Network> ScriptSequenceKind<N>
-where
-    N::TxEnvelope: for<'d> Deserialize<'d> + Serialize,
-    N::TransactionRequest: for<'d> Deserialize<'d> + Serialize,
-{
+impl ScriptSequenceKind {
     pub fn save(&mut self, silent: bool, save_ts: bool) -> Result<()> {
         match self {
             Self::Single(sequence) => sequence.save(silent, save_ts),
@@ -75,14 +58,14 @@ where
         }
     }
 
-    pub fn sequences(&self) -> &[ScriptSequence<N>] {
+    pub fn sequences(&self) -> &[ScriptSequence] {
         match self {
             Self::Single(sequence) => std::slice::from_ref(sequence),
             Self::Multi(sequence) => &sequence.deployments,
         }
     }
 
-    pub fn sequences_mut(&mut self) -> &mut [ScriptSequence<N>] {
+    pub fn sequences_mut(&mut self) -> &mut [ScriptSequence] {
         match self {
             Self::Single(sequence) => std::slice::from_mut(sequence),
             Self::Multi(sequence) => &mut sequence.deployments,
@@ -97,28 +80,19 @@ where
     ) -> Result<()> {
         match self {
             Self::Single(sequence) => {
-                sequence.paths = Some(ScriptSequence::<N>::get_paths(
-                    config,
-                    sig,
-                    target,
-                    sequence.chain,
-                    false,
-                )?);
+                sequence.paths =
+                    Some(ScriptSequence::get_paths(config, sig, target, sequence.chain, false)?);
             }
             Self::Multi(sequence) => {
                 (sequence.path, sequence.sensitive_path) =
-                    MultiChainSequence::<N>::get_paths(config, sig, target, false)?;
+                    MultiChainSequence::get_paths(config, sig, target, false)?;
             }
         };
 
         Ok(())
     }
 
-    pub fn show_transactions(&self) -> Result<()>
-    where
-        N::TxEnvelope: UIfmt,
-        N::TransactionRequest: FoundryTransactionBuilder<N>,
-    {
+    pub fn show_transactions(&self) -> Result<()> {
         for sequence in self.sequences() {
             if !sequence.transactions.is_empty() {
                 sh_println!("\nChain {}\n", sequence.chain)?;
@@ -133,11 +107,7 @@ where
     }
 }
 
-impl<N: Network> Drop for ScriptSequenceKind<N>
-where
-    N::TxEnvelope: for<'d> Deserialize<'d> + Serialize,
-    N::TransactionRequest: for<'d> Deserialize<'d> + Serialize,
-{
+impl Drop for ScriptSequenceKind {
     fn drop(&mut self) {
         if let Err(err) = self.save(false, true) {
             error!(?err, "could not save deployment sequence");
