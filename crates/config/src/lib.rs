@@ -40,7 +40,6 @@ use foundry_compilers::{
     solc::{CliSettings, SolcLanguage, SolcSettings},
 };
 use regex::Regex;
-use revm::primitives::hardfork::SpecId;
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
@@ -54,6 +53,7 @@ use std::{
 mod macros;
 
 pub mod utils;
+pub use foundry_evm_hardforks::{FromEvmVersion, evm_spec_id};
 pub use utils::*;
 
 mod endpoints;
@@ -162,7 +162,7 @@ pub use semver;
 ///     the "default" meta-profile.
 ///
 /// Note that these behaviors differ from those of [`Config::figment()`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// The selected profile. **(default: _default_ `default`)**
     ///
@@ -304,6 +304,8 @@ pub struct Config {
     /// You can also the ETH_RPC_HEADERS env variable like so:
     /// `ETH_RPC_HEADERS="x-custom-header:value x-another-header:another-value"`
     pub eth_rpc_headers: Option<Vec<String>>,
+    /// Print the equivalent curl command instead of making the RPC request.
+    pub eth_rpc_curl: bool,
     /// etherscan API key, or alias for an `EtherscanConfig` in `etherscan` table
     pub etherscan_api_key: Option<String>,
     /// Multiple etherscan api configs and their aliases
@@ -352,6 +354,8 @@ pub struct Config {
     pub invariant: InvariantConfig,
     /// Whether to allow ffi cheatcodes in test
     pub ffi: bool,
+    /// Whether to show `console.log` outputs in realtime during script/test execution
+    pub live_logs: bool,
     /// Whether to allow `expectRevert` for internal functions.
     pub allow_internal_expect_revert: bool,
     /// Use the create 2 factory in all cases including tests and non-broadcasting scripts.
@@ -644,7 +648,7 @@ impl From<bool> for DenyLevel {
 
 impl DenyLevel {
     /// Returns `true` if the deny level includes warnings.
-    pub fn warnings(&self) -> bool {
+    pub const fn warnings(&self) -> bool {
         match self {
             Self::Never => false,
             Self::Warnings | Self::Notes => true,
@@ -652,7 +656,7 @@ impl DenyLevel {
     }
 
     /// Returns `true` if the deny level includes notes.
-    pub fn notes(&self) -> bool {
+    pub const fn notes(&self) -> bool {
         match self {
             Self::Never | Self::Warnings => false,
             Self::Notes => true,
@@ -660,7 +664,7 @@ impl DenyLevel {
     }
 
     /// Returns `true` if the deny level is set to never (only errors).
-    pub fn never(&self) -> bool {
+    pub const fn never(&self) -> bool {
         match self {
             Self::Never => true,
             Self::Warnings | Self::Notes => false,
@@ -1005,7 +1009,7 @@ impl Config {
 
     /// Normalizes optimizer settings.
     /// See <https://github.com/foundry-rs/foundry/issues/9665>
-    pub fn normalized_optimizer_settings(mut self) -> Self {
+    pub const fn normalized_optimizer_settings(mut self) -> Self {
         self.normalize_optimizer_settings();
         self
     }
@@ -1019,7 +1023,7 @@ impl Config {
     /// - with default settings, optimizer is set to false and optimizer runs to 200
     /// - if optimizer is set and optimizer runs not specified, then optimizer runs is set to 200
     /// - enable optimizer if not explicitly set and optimizer runs set to a value greater than 0
-    pub fn normalize_optimizer_settings(&mut self) {
+    pub const fn normalize_optimizer_settings(&mut self) {
         match (self.optimizer, self.optimizer_runs) {
             // Default: set the optimizer to false and optimizer runs to 200.
             (None, None) => {
@@ -1063,7 +1067,7 @@ impl Config {
     /// Cleans up any duplicate `Remapping` and sorts them
     ///
     /// On windows this will convert any `\` in the remapping path into a `/`
-    pub fn sanitize_remappings(&mut self) {
+    pub const fn sanitize_remappings(&mut self) {
         #[cfg(target_os = "windows")]
         {
             // force `/` in remappings on windows
@@ -1146,7 +1150,8 @@ impl Config {
         paths: &ProjectPathsConfig,
     ) -> Result<BTreeMap<PathBuf, RestrictionsWithVersion<MultiCompilerRestrictions>>, SolcError>
     {
-        let mut map = BTreeMap::new();
+        let mut map: BTreeMap<PathBuf, RestrictionsWithVersion<MultiCompilerRestrictions>> =
+            BTreeMap::new();
         if self.compilation_restrictions.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -1166,9 +1171,7 @@ impl Config {
             }) {
                 let res: RestrictionsWithVersion<_> =
                     res.clone().try_into().map_err(SolcError::msg)?;
-                if !map.contains_key(source) {
-                    map.insert(source.clone(), res);
-                } else {
+                if map.contains_key(source) {
                     let value = map.remove(source.as_path()).unwrap();
                     if let Some(merged) = value.clone().merge(res) {
                         map.insert(source.clone(), merged);
@@ -1183,6 +1186,8 @@ impl Config {
                         );
                         map.insert(source.clone(), value);
                     }
+                } else {
+                    map.insert(source.clone(), res);
                 }
             }
         }
@@ -1322,8 +1327,8 @@ impl Config {
         Ok(None)
     }
 
-    /// Returns the [SpecId] derived from the configured [EvmVersion]
-    pub fn evm_spec_id(&self) -> SpecId {
+    /// Returns the Spec derived from the configured [EvmVersion]
+    pub fn evm_spec_id<SPEC: FromEvmVersion>(&self) -> SPEC {
         evm_spec_id(self.evm_version)
     }
 
@@ -1331,7 +1336,7 @@ impl Config {
     ///
     /// Returns `false` if `solc_version` is explicitly set, otherwise returns the value of
     /// `auto_detect_solc`
-    pub fn is_auto_detect(&self) -> bool {
+    pub const fn is_auto_detect(&self) -> bool {
         if self.solc.is_some() {
             return false;
         }
@@ -1863,11 +1868,6 @@ impl Config {
             src: paths.sources.file_name().unwrap().into(),
             out: artifacts.clone(),
             libs: paths.libraries.into_iter().map(|lib| lib.file_name().unwrap().into()).collect(),
-            remappings: paths
-                .remappings
-                .into_iter()
-                .map(|r| RelativeRemapping::new(r, root))
-                .collect(),
             fs_permissions: FsPermissions::new([PathPermission::read(artifacts)]),
             ..Self::default()
         }
@@ -2183,9 +2183,8 @@ impl Config {
             }
             if let Ok(entries) = cache_dir.as_path().read_dir() {
                 for entry in entries.flatten().filter(|x| x.path().is_dir()) {
-                    match Chain::from_str(&entry.file_name().to_string_lossy()) {
-                        Ok(chain) => cache.chains.push(Self::list_foundry_chain_cache(chain)?),
-                        Err(_) => continue,
+                    if let Ok(chain) = Chain::from_str(&entry.file_name().to_string_lossy()) {
+                        cache.chains.push(Self::list_foundry_chain_cache(chain)?);
                     }
                 }
                 Ok(cache)
@@ -2328,9 +2327,9 @@ impl Config {
             figment = figment.merge(("evm_version", version));
         }
 
-        // Normalize `deny` based on the provided `deny_warnings` version.
-        if self.deny_warnings
-            && let Ok(DenyLevel::Never) = figment.extract_inner("deny")
+        // Normalize `deny` based on the provided `deny_warnings` value.
+        if figment.extract_inner::<bool>("deny_warnings").unwrap_or(false)
+            && figment.extract_inner("deny") == Ok(DenyLevel::Never)
         {
             figment = figment.merge(("deny", DenyLevel::Warnings));
         }
@@ -2570,6 +2569,7 @@ impl Default for Config {
             invariant: InvariantConfig::new("cache/invariant".into()),
             always_use_create_2_factory: false,
             ffi: false,
+            live_logs: false,
             allow_internal_expect_revert: false,
             prompt_timeout: 120,
             sender: Self::DEFAULT_SENDER,
@@ -2596,6 +2596,7 @@ impl Default for Config {
             eth_rpc_jwt: None,
             eth_rpc_timeout: None,
             eth_rpc_headers: None,
+            eth_rpc_curl: false,
             etherscan_api_key: None,
             verbosity: 0,
             remappings: vec![],
@@ -6864,6 +6865,156 @@ mod tests {
             assert!(
                 err_msg.contains("selected profile `nonexistent` does not exist"),
                 "Expected error about nonexistent profile, got: {err_msg}"
+            );
+
+            Ok(())
+        });
+    }
+
+    // Test for issue #13316: vyper config keys should not trigger unknown key warnings
+    #[test]
+    fn no_false_warnings_for_vyper_config_keys() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                src = "src"
+
+                [vyper]
+                optimize = "gas"
+                path = "/usr/bin/vyper"
+                experimental_codegen = true
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            // None of the valid vyper keys should trigger warnings
+            let vyper_warnings: Vec<_> = cfg
+                .warnings
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        w,
+                        crate::Warning::UnknownSectionKey { section, .. } if section == "vyper"
+                    )
+                })
+                .collect();
+
+            assert!(
+                vyper_warnings.is_empty(),
+                "Valid vyper keys should not trigger warnings, got: {vyper_warnings:?}"
+            );
+
+            Ok(())
+        });
+    }
+
+    // Test for issue #13316: vyper config in profile should not trigger false warnings
+    #[test]
+    fn no_false_warnings_for_nested_vyper_config_keys() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                src = "src"
+
+                [profile.default.vyper]
+                optimize = "codesize"
+                path = "/opt/vyper/bin/vyper"
+                experimental_codegen = false
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            // None of the valid vyper keys should trigger warnings
+            let vyper_warnings: Vec<_> = cfg
+                .warnings
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        w,
+                        crate::Warning::UnknownSectionKey { section, .. } if section == "vyper"
+                    )
+                })
+                .collect();
+
+            assert!(
+                vyper_warnings.is_empty(),
+                "Valid nested vyper keys should not trigger warnings, got: {vyper_warnings:?}"
+            );
+
+            Ok(())
+        });
+    }
+
+    // Test for issue #13316: inline vyper config format should not trigger false warnings
+    // This matches the exact format used in https://github.com/pcaversaccio/snekmate
+    #[test]
+    fn no_false_warnings_for_inline_vyper_config() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                src = "src"
+                vyper = { optimize = "gas" }
+
+                [profile.default-venom]
+                vyper = { experimental_codegen = true }
+
+                [profile.ci-venom]
+                vyper = { experimental_codegen = true }
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            let vyper_warnings: Vec<_> = cfg
+                .warnings
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        w,
+                        crate::Warning::UnknownSectionKey { section, .. } if section == "vyper"
+                    )
+                })
+                .collect();
+
+            assert!(
+                vyper_warnings.is_empty(),
+                "Valid inline vyper config should not trigger warnings, got: {vyper_warnings:?}"
+            );
+
+            Ok(())
+        });
+    }
+
+    // Test for issue #13316: unknown vyper keys should still warn
+    #[test]
+    fn warns_on_unknown_vyper_keys() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                src = "src"
+
+                [vyper]
+                optimize = "gas"
+                unknown_vyper_option = true
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            assert!(
+                cfg.warnings.iter().any(|w| matches!(
+                    w,
+                    crate::Warning::UnknownSectionKey { key, section, .. }
+                    if key == "unknown_vyper_option" && section == "vyper"
+                )),
+                "Unknown vyper key should trigger warning, got: {:?}",
+                cfg.warnings
             );
 
             Ok(())

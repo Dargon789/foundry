@@ -6,7 +6,10 @@ pub use late::{LateLintPass, LateLintVisitor};
 
 use foundry_common::comments::inline_config::InlineConfig;
 use foundry_compilers::Language;
-use foundry_config::{DenyLevel, lint::Severity};
+use foundry_config::{
+    DenyLevel,
+    lint::{LintSpecificConfig, Severity},
+};
 use solar::{
     interface::{
         Session, Span,
@@ -55,11 +58,11 @@ pub struct LintContext<'s, 'c> {
 
 pub struct LinterConfig<'s> {
     pub inline: &'s InlineConfig<Vec<String>>,
-    pub mixed_case_exceptions: &'s [String],
+    pub lint_specific: &'s LintSpecificConfig,
 }
 
 impl<'s, 'c> LintContext<'s, 'c> {
-    pub fn new(
+    pub const fn new(
         sess: &'s Session,
         with_description: bool,
         with_json_emitter: bool,
@@ -74,7 +77,7 @@ impl<'s, 'c> LintContext<'s, 'c> {
         if self.with_json_emitter { diag.help(help) } else { diag.help(hyperlink(help)) }
     }
 
-    pub fn session(&self) -> &'s Session {
+    pub const fn session(&self) -> &'s Session {
         self.sess
     }
 
@@ -208,14 +211,14 @@ pub struct Suggestion {
 
 impl Suggestion {
     /// Creates a new [`SuggestionKind::Example`] suggestion.
-    pub fn example(content: String) -> Self {
+    pub const fn example(content: String) -> Self {
         Self { desc: None, content, kind: SuggestionKind::Example }
     }
 
     /// Creates a new [`SuggestionKind::Fix`] suggestion.
     ///
     /// When possible, will attempt to inline the suggestion.
-    pub fn fix(content: String, applicability: Applicability) -> Self {
+    pub const fn fix(content: String, applicability: Applicability) -> Self {
         Self {
             desc: None,
             content,
@@ -228,13 +231,13 @@ impl Suggestion {
     }
 
     /// Sets the description for the suggestion.
-    pub fn with_desc(mut self, desc: &'static str) -> Self {
+    pub const fn with_desc(mut self, desc: &'static str) -> Self {
         self.desc = Some(desc);
         self
     }
 
     /// Sets the span for a [`SuggestionKind::Fix`] suggestion.
-    pub fn with_span(mut self, span: Span) -> Self {
+    pub const fn with_span(mut self, span: Span) -> Self {
         if let SuggestionKind::Fix { span: ref mut s, .. } = self.kind {
             *s = Some(span);
         }
@@ -242,7 +245,7 @@ impl Suggestion {
     }
 
     /// Sets the style for a [`SuggestionKind::Fix`] suggestion.
-    pub fn with_style(mut self, style: SuggestionStyle) -> Self {
+    pub const fn with_style(mut self, style: SuggestionStyle) -> Self {
         if let SuggestionKind::Fix { style: ref mut s, .. } = self.kind {
             *s = style;
         }
