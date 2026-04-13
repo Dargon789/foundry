@@ -119,6 +119,7 @@ impl ScriptTester {
         let testdata = Self::testdata_path();
         let from_dir = testdata.join("utils");
         let from_dir_canon = from_dir.canonicalize()?;
+        let from_dir_canon = from_dir.canonicalize()?;
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
         for entry in fs::read_dir(&from_dir)? {
@@ -138,15 +139,16 @@ impl ScriptTester {
             }
 
             let name = match file.file_name() {
-                Some(name) => name,
-                None => continue,
+            // Verify canonicalized file is in canonicalized from_dir to avoid traversal
+            let canonical_file = match file.canonicalize() {
+                Ok(path) => path,
+                Err(_) => continue,
             };
-            // Validate file name to avoid path traversal and absolute paths.
-            let name_str = name.to_string_lossy();
-            if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
+            if !canonical_file.starts_with(&from_dir_canon) {
                 // Skip invalid (potentially dangerous) file names.
                 continue;
-            }
+
+            fs::copy(&canonical_file, to_dir.join(name))?;
 
             fs::copy(&canonical_file, to_dir.join(name))?;
         }
