@@ -486,7 +486,7 @@ impl<'a> InvariantExecutor<'a> {
                         is_last_call
                     } else {
                         self.config.check_interval == 1
-                            || (current_run.depth + 1).is_multiple_of(self.config.check_interval)
+                            || (current_run.depth + 1) % self.config.check_interval as usize == 0
                             || is_last_call
                     };
 
