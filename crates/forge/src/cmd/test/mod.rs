@@ -505,10 +505,11 @@ impl TestArgs {
         let num_filtered = runner.matching_test_functions(filter).count();
 
         if num_filtered == 0 {
-            let mut total_tests = num_filtered;
-            if !filter.is_empty() {
-                total_tests = runner.matching_test_functions(&EmptyTestFilter::default()).count();
-            }
+            let total_tests = if filter.is_empty() {
+                num_filtered
+            } else {
+                runner.matching_test_functions(&EmptyTestFilter::default()).count()
+            };
             if total_tests == 0 {
                 sh_println!(
                     "No tests found in project! Forge looks for functions that start with `test`"
@@ -827,14 +828,9 @@ impl TestArgs {
                                 .iter()
                                 .filter_map(|(k, v)| {
                                     previous_snapshots.get(k).and_then(|previous_snapshot| {
-                                        if previous_snapshot != v {
-                                            Some((
-                                                k.clone(),
-                                                (previous_snapshot.clone(), v.clone()),
-                                            ))
-                                        } else {
-                                            None
-                                        }
+                                        (previous_snapshot != v).then(|| {
+                                            (k.clone(), (previous_snapshot.clone(), v.clone()))
+                                        })
                                     })
                                 })
                                 .collect();
@@ -958,7 +954,7 @@ impl TestArgs {
     }
 
     /// Returns whether `BuildArgs` was configured with `--watch`
-    pub fn is_watch(&self) -> bool {
+    pub const fn is_watch(&self) -> bool {
         self.watch.watch.is_some()
     }
 
@@ -1051,7 +1047,7 @@ fn persist_run_failures(config: &Config, outcome: &TestOutcome) {
         let mut failures = outcome.failures().peekable();
         while let Some((test_name, _)) = failures.next() {
             if test_name.is_any_test()
-                && let Some(test_match) = test_name.split("(").next()
+                && let Some(test_match) = test_name.split('(').next()
             {
                 filter.push_str(test_match);
                 if failures.peek().is_some() {

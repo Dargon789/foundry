@@ -345,14 +345,18 @@ impl<FEN: FoundryEvmNetwork> BundledState<FEN> {
                 .chain(self.browser_wallet.as_ref().map(|b| b.address()))
                 .collect();
 
-            // For addresses without an explicit signer, try Tempo access key lookup.
+            // For addresses without an explicit signer, try Tempo keys.toml fallback.
             let mut access_keys: AddressHashMap<(WalletSigner, TempoAccessKeyConfig)> =
                 AddressHashMap::default();
+            let mut direct_signers: AddressHashMap<WalletSigner> = AddressHashMap::default();
             let mut missing_addresses = Vec::new();
 
             for addr in &required_addresses {
                 if !signers.contains(addr) {
                     match lookup_signer(*addr) {
+                        Ok(TempoLookup::Direct(signer)) => {
+                            direct_signers.insert(*addr, signer);
+                        }
                         Ok(TempoLookup::Keychain(signer, config)) => {
                             access_keys.insert(*addr, (signer, *config));
                         }
@@ -372,8 +376,11 @@ impl<FEN: FoundryEvmNetwork> BundledState<FEN> {
             }
 
             let signers = self.script_wallets.into_multi_wallet().into_signers()?;
-            let eth_wallets =
+            let mut eth_wallets: AddressHashMap<EthereumWallet> =
                 signers.into_iter().map(|(addr, signer)| (addr, signer.into())).collect();
+            for (addr, signer) in direct_signers {
+                eth_wallets.insert(addr, signer.into());
+            }
 
             SendTransactionsKind::Raw { eth_wallets, browser: self.browser_wallet, access_keys }
         };
@@ -486,8 +493,9 @@ impl<FEN: FoundryEvmNetwork> BundledState<FEN> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let estimate_via_rpc =
-                    has_different_gas_calc(sequence.chain) || self.args.skip_simulation;
+                let estimate_via_rpc = has_different_gas_calc(sequence.chain)
+                    || self.script_config.evm_opts.networks.is_tempo()
+                    || self.args.skip_simulation;
 
                 // We only wait for a transaction receipt before sending the next transaction, if
                 // there is more than one signer. There would be no way of assuring

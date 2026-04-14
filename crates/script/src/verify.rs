@@ -78,7 +78,7 @@ impl VerifyBundle {
             cache_path: Some(project.paths.cache.clone()),
             lib_paths: project.paths.libraries.clone(),
             hardhat: config.profile == Config::HARDHAT_PROFILE,
-            config_path: if config_path.exists() { Some(config_path) } else { None },
+            config_path: config_path.exists().then_some(config_path),
         };
 
         let via_ir = config.via_ir;
@@ -201,14 +201,14 @@ async fn verify_contracts<FEN: FoundryEvmNetwork>(
 
         for (receipt, tx) in sequence.receipts.iter_mut().zip(sequence.transactions.iter()) {
             // create2 hash offset
-            let mut offset = 0;
-
-            if tx.is_create2()
+            let offset = if tx.is_create2()
                 && let Some(contract_address) = tx.contract_address
             {
                 receipt.set_contract_address(contract_address);
-                offset = 32;
-            }
+                32
+            } else {
+                0
+            };
 
             // Verify contract created directly from the transaction
             if let (Some(address), Some(data)) = (receipt.contract_address(), tx.tx().input()) {
