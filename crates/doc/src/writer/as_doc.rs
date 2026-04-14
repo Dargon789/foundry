@@ -1,13 +1,14 @@
 use crate::{
-    document::{read_context, DocumentContent},
+    CONTRACT_INHERITANCE_ID, CommentTag, Comments, CommentsRef, DEPLOYMENTS_ID, Document,
+    GIT_SOURCE_ID, INHERITDOC_ID, Markdown, PreprocessorOutput,
+    document::{DocumentContent, read_context},
+    helpers::function_signature,
     parser::ParseSource,
+    solang_ext::SafeUnwrap,
     writer::BufWriter,
-    CommentTag, Comments, CommentsRef, Document, Markdown, PreprocessorOutput,
-    CONTRACT_INHERITANCE_ID, DEPLOYMENTS_ID, GIT_SOURCE_ID, INHERITDOC_ID,
 };
-use forge_fmt::solang_ext::SafeUnwrap;
 use itertools::Itertools;
-use solang_parser::pt::{Base, FunctionDefinition};
+use solang_parser::pt::{Base, FunctionDefinition, VariableAttribute};
 use std::path::Path;
 
 /// The result of [`AsDoc::as_doc`].
@@ -62,7 +63,7 @@ impl AsDoc for CommentsRef<'_> {
         // Write dev tags
         let devs = self.include_tag(CommentTag::Dev);
         for d in devs.iter() {
-            writer.write_italic(&d.value)?;
+            writer.write_dev_content(&d.value)?;
             writer.writeln()?;
         }
 
@@ -87,7 +88,7 @@ impl AsDoc for CommentsRef<'_> {
 
 impl AsDoc for Base {
     fn as_doc(&self) -> AsDocResult {
-        Ok(self.name.identifiers.iter().map(|ident| ident.name.to_owned()).join("."))
+        Ok(self.name.identifiers.iter().map(|ident| ident.name.clone()).join("."))
     }
 }
 
@@ -106,16 +107,7 @@ impl AsDoc for Document {
 
                 for item in items {
                     let func = item.as_function().unwrap();
-                    let mut heading = item.source.ident();
-                    if !func.params.is_empty() {
-                        heading.push_str(&format!(
-                            "({})",
-                            func.params
-                                .iter()
-                                .map(|p| p.1.as_ref().map(|p| p.ty.to_string()).unwrap_or_default())
-                                .join(", ")
-                        ));
-                    }
+                    let heading = function_signature(func).replace(',', ", ");
                     writer.write_heading(&heading)?;
                     writer.write_section(&item.comments, &item.code)?;
                 }
@@ -181,18 +173,45 @@ impl AsDoc for Document {
 
                         writer.writeln_doc(&item.comments)?;
 
-                        if let Some(state_vars) = item.variables() {
-                            writer.write_subtitle("State Variables")?;
-                            state_vars.into_iter().try_for_each(|(item, comments, code)| {
-                                let comments = comments.merge_inheritdoc(
-                                    &item.name.safe_unwrap().name,
-                                    read_context!(self, INHERITDOC_ID, Inheritdoc),
-                                );
+                        if let Some(all_vars) = item.variables() {
+                            let (constants, state_vars): (Vec<_>, Vec<_>) =
+                                all_vars.into_iter().partition(|(item, _, _)| {
+                                    item.attrs.iter().any(|attr| {
+                                        matches!(
+                                            attr,
+                                            VariableAttribute::Constant(_)
+                                                | VariableAttribute::Immutable(_)
+                                        )
+                                    })
+                                });
 
-                                writer.write_heading(&item.name.safe_unwrap().name)?;
-                                writer.write_section(&comments, code)?;
-                                writer.writeln()
-                            })?;
+                            if !constants.is_empty() {
+                                writer.write_subtitle("Constants")?;
+                                constants.into_iter().try_for_each(|(item, comments, code)| {
+                                    let comments = comments.merge_inheritdoc(
+                                        &item.name.safe_unwrap().name,
+                                        read_context!(self, INHERITDOC_ID, Inheritdoc),
+                                    );
+
+                                    writer.write_heading(&item.name.safe_unwrap().name)?;
+                                    writer.write_section(&comments, code)?;
+                                    writer.writeln()
+                                })?;
+                            }
+
+                            if !state_vars.is_empty() {
+                                writer.write_subtitle("State Variables")?;
+                                state_vars.into_iter().try_for_each(|(item, comments, code)| {
+                                    let comments = comments.merge_inheritdoc(
+                                        &item.name.safe_unwrap().name,
+                                        read_context!(self, INHERITDOC_ID, Inheritdoc),
+                                    );
+
+                                    writer.write_heading(&item.name.safe_unwrap().name)?;
+                                    writer.write_section(&comments, code)?;
+                                    writer.writeln()
+                                })?;
+                            }
                         }
 
                         if let Some(funcs) = item.functions() {
@@ -234,15 +253,7 @@ impl AsDoc for Document {
                             writer.write_subtitle("Enums")?;
                             enums.into_iter().try_for_each(|(item, comments, code)| {
                                 writer.write_heading(&item.name.safe_unwrap().name)?;
-
-                                let filtered_comments: Comments = (*comments)
-                                    .iter()
-                                    .filter(|c| c.tag != CommentTag::Custom("variant".to_string()))
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .into();
-
-                                writer.write_section(&filtered_comments, code)?;
+                                writer.write_section(comments, code)?;
                                 writer.try_write_variant_table(item, comments)
                             })?;
                         }
@@ -308,9 +319,10 @@ impl Document {
         comments: &Comments,
         code: &str,
     ) -> Result<(), std::fmt::Error> {
-        let func_name = func.name.as_ref().map_or(func.ty.to_string(), |n| n.name.to_owned());
+        let func_sign = function_signature(func);
+        let func_name = func.name.as_ref().map_or(func.ty.to_string(), |n| n.name.clone());
         let comments =
-            comments.merge_inheritdoc(&func_name, read_context!(self, INHERITDOC_ID, Inheritdoc));
+            comments.merge_inheritdoc(&func_sign, read_context!(self, INHERITDOC_ID, Inheritdoc));
 
         // Write function name
         writer.write_heading(&func_name)?;
