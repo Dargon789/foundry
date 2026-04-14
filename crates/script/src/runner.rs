@@ -1,19 +1,13 @@
 use super::{ScriptConfig, ScriptResult};
 use crate::build::ScriptPredeployLibraries;
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_evm::revm::context::Transaction;
-use alloy_network::TransactionBuilder;
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_rpc_types::TransactionRequest;
 use eyre::Result;
 use foundry_cheatcodes::BroadcastableTransaction;
-use foundry_common::{FoundryTransactionBuilder, TransactionMaybeSigned};
 use foundry_config::Config;
 use foundry_evm::{
     constants::CALLER,
-    core::{
-        FoundryTransaction,
-        evm::{FoundryEvmNetwork, TransactionRequestFor},
-    },
     executors::{DeployResult, EvmError, ExecutionErr, Executor, RawCallResult},
     opts::EvmOpts,
     revm::interpreter::{InstructionResult, return_ok},
@@ -23,13 +17,13 @@ use std::collections::VecDeque;
 
 /// Drives script execution
 #[derive(Debug)]
-pub struct ScriptRunner<FEN: FoundryEvmNetwork> {
-    pub executor: Executor<FEN>,
+pub struct ScriptRunner {
+    pub executor: Executor,
     pub evm_opts: EvmOpts,
 }
 
-impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
-    pub const fn new(executor: Executor<FEN>, evm_opts: EvmOpts) -> Self {
+impl ScriptRunner {
+    pub fn new(executor: Executor, evm_opts: EvmOpts) -> Self {
         Self { executor, evm_opts }
     }
 
@@ -39,9 +33,9 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
         libraries: &ScriptPredeployLibraries,
         code: Bytes,
         setup: bool,
-        script_config: &ScriptConfig<FEN>,
+        script_config: &ScriptConfig,
         is_broadcast: bool,
-    ) -> Result<(Address, ScriptResult<FEN::Network>)> {
+    ) -> Result<(Address, ScriptResult)> {
         trace!(target: "script", "executing setUP()");
 
         if !is_broadcast {
@@ -77,18 +71,15 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
                     traces.push((TraceKind::Deployment, deploy_traces));
                 }
 
-                let mut tx_req = TransactionRequestFor::<FEN>::default()
-                    .with_from(self.evm_opts.sender)
-                    .with_input(code.clone())
-                    .with_nonce(sender_nonce + library_transactions.len() as u64);
-
-                if let Some(fee_token) = script_config.fee_token {
-                    tx_req.set_fee_token(fee_token);
-                }
-
                 library_transactions.push_back(BroadcastableTransaction {
                     rpc: self.evm_opts.fork_url.clone(),
-                    transaction: TransactionMaybeSigned::new(tx_req),
+                    transaction: TransactionRequest {
+                        from: Some(self.evm_opts.sender),
+                        input: code.clone().into(),
+                        nonce: Some(sender_nonce + library_transactions.len() as u64),
+                        ..Default::default()
+                    }
+                    .into(),
                 })
             }),
             ScriptPredeployLibraries::Create2(libraries, salt) => {
@@ -114,19 +105,16 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
                         traces.push((TraceKind::Deployment, deploy_traces));
                     }
 
-                    let mut tx_req = TransactionRequestFor::<FEN>::default()
-                        .with_from(self.evm_opts.sender)
-                        .with_input(calldata)
-                        .with_nonce(sender_nonce + library_transactions.len() as u64)
-                        .with_to(create2_deployer);
-
-                    if let Some(fee_token) = script_config.fee_token {
-                        tx_req.set_fee_token(fee_token);
-                    }
-
                     library_transactions.push_back(BroadcastableTransaction {
                         rpc: self.evm_opts.fork_url.clone(),
-                        transaction: TransactionMaybeSigned::new(tx_req),
+                        transaction: TransactionRequest {
+                            from: Some(self.evm_opts.sender),
+                            input: calldata.into(),
+                            nonce: Some(sender_nonce + library_transactions.len() as u64),
+                            to: Some(TxKind::Call(create2_deployer)),
+                            ..Default::default()
+                        }
+                        .into(),
                     });
                 }
 
@@ -177,7 +165,10 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
         traces.extend(constructor_traces.map(|traces| (TraceKind::Deployment, traces)));
 
         // Optionally call the `setUp` function
-        let (success, gas_used, labeled_addresses, transactions) = if setup {
+        let (success, gas_used, labeled_addresses, transactions) = if !setup {
+            self.executor.backend_mut().set_test_contract(address);
+            (true, 0, Default::default(), Some(library_transactions))
+        } else {
             match self.executor.setup(Some(self.evm_opts.sender), address, None) {
                 Ok(RawCallResult {
                     reverted,
@@ -218,9 +209,6 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
                 }
                 Err(e) => return Err(e.into()),
             }
-        } else {
-            self.executor.backend_mut().set_test_contract(address);
-            (true, 0, Default::default(), Some(library_transactions))
         };
 
         Ok((
@@ -240,11 +228,7 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
     }
 
     /// Executes the method that will collect all broadcastable transactions.
-    pub fn script(
-        &mut self,
-        address: Address,
-        calldata: Bytes,
-    ) -> Result<ScriptResult<FEN::Network>> {
+    pub fn script(&mut self, address: Address, calldata: Bytes) -> Result<ScriptResult> {
         self.call(self.evm_opts.sender, address, calldata, U256::ZERO, None, false)
     }
 
@@ -256,7 +240,7 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
         calldata: Option<Bytes>,
         value: Option<U256>,
         authorization_list: Option<Vec<SignedAuthorization>>,
-    ) -> Result<ScriptResult<FEN::Network>> {
+    ) -> Result<ScriptResult> {
         if let Some(to) = to {
             self.call(
                 from,
@@ -312,7 +296,7 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
         value: U256,
         authorization_list: Option<Vec<SignedAuthorization>>,
         commit: bool,
-    ) -> Result<ScriptResult<FEN::Network>> {
+    ) -> Result<ScriptResult> {
         let mut res = if let Some(authorization_list) = &authorization_list {
             self.executor.call_raw_with_authorization(
                 from,
@@ -376,7 +360,7 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
     /// it might be problematic when using `ffi`.
     fn search_optimal_gas_usage(
         &mut self,
-        res: &RawCallResult<FEN>,
+        res: &RawCallResult,
         from: Address,
         to: Address,
         calldata: &Bytes,
@@ -385,21 +369,19 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
         let mut gas_used = res.gas_used;
         if matches!(res.exit_reason, Some(return_ok!())) {
             // Store the current gas limit and reset it later.
-            let init_gas_limit = self.executor.tx_env().gas_limit();
+            let init_gas_limit = self.executor.env().tx.gas_limit;
 
             let mut highest_gas_limit = gas_used * 3;
             let mut lowest_gas_limit = gas_used;
             let mut last_highest_gas_limit = highest_gas_limit;
             while (highest_gas_limit - lowest_gas_limit) > 1 {
                 let mid_gas_limit = (highest_gas_limit + lowest_gas_limit) / 2;
-                self.executor.tx_env_mut().set_gas_limit(mid_gas_limit);
+                self.executor.env_mut().tx.gas_limit = mid_gas_limit;
                 let res = self.executor.call_raw(from, to, calldata.0.clone().into(), value)?;
                 match res.exit_reason {
-                    Some(
-                        InstructionResult::Revert
-                        | InstructionResult::OutOfGas
-                        | InstructionResult::OutOfFunds,
-                    ) => {
+                    Some(InstructionResult::Revert)
+                    | Some(InstructionResult::OutOfGas)
+                    | Some(InstructionResult::OutOfFunds) => {
                         lowest_gas_limit = mid_gas_limit;
                     }
                     _ => {
@@ -420,7 +402,7 @@ impl<FEN: FoundryEvmNetwork> ScriptRunner<FEN> {
                 }
             }
             // Reset gas limit in the executor.
-            self.executor.tx_env_mut().set_gas_limit(init_gas_limit);
+            self.executor.env_mut().tx.gas_limit = init_gas_limit;
         }
         Ok(gas_used)
     }

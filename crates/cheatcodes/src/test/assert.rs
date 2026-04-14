@@ -1,10 +1,9 @@
-use crate::{CheatcodesExecutor, CheatsCtxt, Result, Vm::*};
+use crate::{CheatcodesExecutor, CheatsCtxExt, CheatsCtxt, Result, Vm::*};
 use alloy_primitives::{I256, U256, U512};
 use foundry_evm_core::{
     abi::console::{format_units_int, format_units_uint},
-    backend::GLOBAL_FAIL_SLOT,
+    backend::{DatabaseExt, GLOBAL_FAIL_SLOT},
     constants::CHEATCODE_ADDRESS,
-    evm::FoundryEvmNetwork,
 };
 use itertools::Itertools;
 use revm::context::{ContextTr, JournalTr};
@@ -29,7 +28,7 @@ enum AssertionKind {
 }
 
 impl AssertionKind {
-    const fn inverse(self) -> Self {
+    fn inverse(self) -> Self {
         match self {
             Self::Eq => Self::Ne,
             Self::Ne => Self::Eq,
@@ -40,7 +39,7 @@ impl AssertionKind {
         }
     }
 
-    const fn to_str(self) -> &'static str {
+    fn to_str(self) -> &'static str {
         match self {
             Self::Eq => "==",
             Self::Ne => "!=",
@@ -188,9 +187,9 @@ impl EqRelAssertionError<I256> {
 type ComparisonResult<'a, T> = Result<(), ComparisonAssertionError<'a, T>>;
 
 #[cold]
-fn handle_assertion_result<FEN: FoundryEvmNetwork, E>(
-    ccx: &mut CheatsCtxt<'_, '_, FEN>,
-    executor: &mut dyn CheatcodesExecutor<FEN>,
+fn handle_assertion_result<CTX: ContextTr<Db: DatabaseExt>, E>(
+    ccx: &mut CheatsCtxt<'_, CTX>,
+    executor: &mut dyn CheatcodesExecutor<CTX>,
     err: E,
     error_formatter: Option<&dyn Fn(&E) -> String>,
     error_msg: Option<&str>,
@@ -204,15 +203,15 @@ fn handle_assertion_result<FEN: FoundryEvmNetwork, E>(
     handle_assertion_result_mono(ccx, executor, msg)
 }
 
-fn handle_assertion_result_mono<FEN: FoundryEvmNetwork>(
-    ccx: &mut CheatsCtxt<'_, '_, FEN>,
-    executor: &mut dyn CheatcodesExecutor<FEN>,
+fn handle_assertion_result_mono<CTX: ContextTr<Db: DatabaseExt>>(
+    ccx: &mut CheatsCtxt<'_, CTX>,
+    executor: &mut dyn CheatcodesExecutor<CTX>,
     msg: Cow<'_, str>,
 ) -> Result {
     if ccx.state.config.assertions_revert {
         Err(msg.into_owned().into())
     } else {
-        executor.console_log(&msg);
+        executor.console_log(ccx.state, &msg);
         ccx.ecx.journal_mut().sstore(CHEATCODE_ADDRESS, GLOBAL_FAIL_SLOT, U256::from(1))?;
         Ok(Default::default())
     }
@@ -247,10 +246,10 @@ macro_rules! impl_assertions {
 
     (@impl $no_error:ident, $with_error:ident, ($($arg:ident),*), $body:expr, $error_formatter:expr) => {
         impl crate::Cheatcode for $no_error {
-            fn apply_full<FEN: FoundryEvmNetwork>(
+            fn apply_full<CTX: CheatsCtxExt>(
                 &self,
-                ccx: &mut CheatsCtxt<'_, '_, FEN>,
-                executor: &mut dyn CheatcodesExecutor<FEN>,
+                ccx: &mut CheatsCtxt<'_, CTX>,
+                executor: &mut dyn CheatcodesExecutor<CTX>,
             ) -> Result {
                 let Self { $($arg),* } = self;
                 match $body {
@@ -261,10 +260,10 @@ macro_rules! impl_assertions {
         }
 
         impl crate::Cheatcode for $with_error {
-            fn apply_full<FEN: FoundryEvmNetwork>(
+            fn apply_full<CTX: CheatsCtxExt>(
                 &self,
-                ccx: &mut CheatsCtxt<'_, '_, FEN>,
-                executor: &mut dyn CheatcodesExecutor<FEN>,
+                ccx: &mut CheatsCtxt<'_, CTX>,
+                executor: &mut dyn CheatcodesExecutor<CTX>,
             ) -> Result {
                 let Self { $($arg,)* error } = self;
                 match $body {
@@ -450,11 +449,11 @@ impl_assertions! {
     (assertApproxEqRelDecimal_2Call, assertApproxEqRelDecimal_3Call),
 }
 
-const fn assert_true(condition: bool) -> Result<(), ()> {
+fn assert_true(condition: bool) -> Result<(), ()> {
     if condition { Ok(()) } else { Err(()) }
 }
 
-const fn assert_false(condition: bool) -> Result<(), ()> {
+fn assert_false(condition: bool) -> Result<(), ()> {
     assert_true(!condition)
 }
 
@@ -467,10 +466,10 @@ fn assert_eq<'a, T: PartialEq>(left: &'a T, right: &'a T) -> ComparisonResult<'a
 }
 
 fn assert_not_eq<'a, T: PartialEq>(left: &'a T, right: &'a T) -> ComparisonResult<'a, T> {
-    if left == right {
-        Err(ComparisonAssertionError { kind: AssertionKind::Ne, left, right })
-    } else {
+    if left != right {
         Ok(())
+    } else {
+        Err(ComparisonAssertionError { kind: AssertionKind::Ne, left, right })
     }
 }
 
@@ -562,13 +561,14 @@ fn uint_assert_approx_eq_rel(
     if right.is_zero() {
         if left.is_zero() {
             return Ok(());
-        }
-        return Err(EqRelAssertionError::Failure(Box::new(EqRelAssertionFailure {
-            left,
-            right,
-            max_delta,
-            real_delta: EqRelDelta::Undefined,
-        })));
+        } else {
+            return Err(EqRelAssertionError::Failure(Box::new(EqRelAssertionFailure {
+                left,
+                right,
+                max_delta,
+                real_delta: EqRelDelta::Undefined,
+            })));
+        };
     }
 
     let delta = calc_delta_full::<U256>(left.abs_diff(right), right)?;
@@ -593,13 +593,14 @@ fn int_assert_approx_eq_rel(
     if right.is_zero() {
         if left.is_zero() {
             return Ok(());
+        } else {
+            return Err(EqRelAssertionError::Failure(Box::new(EqRelAssertionFailure {
+                left,
+                right,
+                max_delta,
+                real_delta: EqRelDelta::Undefined,
+            })));
         }
-        return Err(EqRelAssertionError::Failure(Box::new(EqRelAssertionFailure {
-            left,
-            right,
-            max_delta,
-            real_delta: EqRelDelta::Undefined,
-        })));
     }
 
     let delta = calc_delta_full::<I256>(get_delta_int(left, right), right.unsigned_abs())?;

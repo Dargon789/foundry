@@ -2,7 +2,6 @@ use alloy_primitives::{Address, hex};
 use alloy_rlp::Decodable;
 use eyre::Result;
 use std::path::PathBuf;
-use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::{WalletSigner, utils};
 
