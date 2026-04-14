@@ -1,18 +1,17 @@
 //! Test outcomes.
 
 use crate::{
-    MultiContractRunner,
     fuzz::{BaseCounterExample, FuzzedCases},
     gas_report::GasReport,
 };
 use alloy_primitives::{
-    Address, I256, Log,
+    Address, I256, Log, U256,
     map::{AddressHashMap, HashMap},
 };
 use eyre::Report;
-use foundry_common::{get_contract_name, get_file_name, shell};
+use foundry_common::{ContractsByArtifact, get_contract_name, get_file_name, shell};
 use foundry_evm::{
-    core::Breakpoints,
+    core::{Breakpoints, evm::FoundryEvmNetwork},
     coverage::HitMaps,
     decode::SkipReason,
     executors::{RawCallResult, invariant::InvariantMetrics},
@@ -44,23 +43,33 @@ pub struct TestOutcome {
     pub last_run_decoder: Option<CallTraceDecoder>,
     /// The gas report, if requested.
     pub gas_report: Option<GasReport>,
-    /// The runner used to execute the tests.
-    pub runner: Option<MultiContractRunner>,
+    /// Known contracts from the test run (used for coverage).
+    pub known_contracts: Option<ContractsByArtifact>,
+    /// The fuzz seed used for the test run.
+    pub fuzz_seed: Option<U256>,
 }
 
 impl TestOutcome {
     /// Creates a new test outcome with the given results.
-    pub fn new(
-        runner: Option<MultiContractRunner>,
+    pub const fn new(
+        known_contracts: Option<ContractsByArtifact>,
         results: BTreeMap<String, SuiteResult>,
         allow_failure: bool,
+        fuzz_seed: Option<U256>,
     ) -> Self {
-        Self { results, allow_failure, last_run_decoder: None, gas_report: None, runner }
+        Self {
+            results,
+            allow_failure,
+            last_run_decoder: None,
+            gas_report: None,
+            known_contracts,
+            fuzz_seed,
+        }
     }
 
     /// Creates a new empty test outcome.
-    pub fn empty(runner: Option<MultiContractRunner>, allow_failure: bool) -> Self {
-        Self::new(runner, BTreeMap::new(), allow_failure)
+    pub const fn empty(known_contracts: Option<ContractsByArtifact>, allow_failure: bool) -> Self {
+        Self::new(known_contracts, BTreeMap::new(), allow_failure, None)
     }
 
     /// Returns an iterator over all individual succeeding tests and their names.
@@ -128,6 +137,11 @@ impl TestOutcome {
     /// Returns the number of tests that failed.
     pub fn failed(&self) -> usize {
         self.failures().count()
+    }
+
+    /// Returns `true` if any fuzz or invariant test failed.
+    pub fn has_fuzz_failures(&self) -> bool {
+        self.failures().any(|(_, t)| t.kind.is_fuzz() || t.kind.is_invariant())
     }
 
     /// Sums up all the durations of all individual test suites.
@@ -199,6 +213,17 @@ impl TestOutcome {
             failures,
             test_word
         )?;
+
+        // Print seed for fuzz/invariant test failures to enable reproduction.
+        if let Some(seed) = self.fuzz_seed
+            && outcome.has_fuzz_failures()
+        {
+            sh_println!(
+                "\nFuzz seed: {} (use {} to reproduce)",
+                format!("{seed:#x}").cyan(),
+                "`--fuzz-seed`".cyan()
+            )?;
+        }
 
         std::process::exit(1);
     }
@@ -366,19 +391,19 @@ pub enum TestStatus {
 impl TestStatus {
     /// Returns `true` if the test was successful.
     #[inline]
-    pub fn is_success(self) -> bool {
+    pub const fn is_success(self) -> bool {
         matches!(self, Self::Success)
     }
 
     /// Returns `true` if the test failed.
     #[inline]
-    pub fn is_failure(self) -> bool {
+    pub const fn is_failure(self) -> bool {
         matches!(self, Self::Failure)
     }
 
     /// Returns `true` if the test was skipped.
     #[inline]
-    pub fn is_skipped(self) -> bool {
+    pub const fn is_skipped(self) -> bool {
         matches!(self, Self::Skipped)
     }
 }
@@ -573,11 +598,11 @@ impl TestResult {
 
     /// Returns the result for single test. Merges execution results (logs, labeled addresses,
     /// traces and coverages) in initial setup results.
-    pub fn single_result(
+    pub fn single_result<FEN: FoundryEvmNetwork>(
         &mut self,
         success: bool,
         reason: Option<String>,
-        raw_call_result: RawCallResult,
+        raw_call_result: RawCallResult<FEN>,
     ) {
         self.kind = TestKind::Unit {
             gas: raw_call_result.gas_used.saturating_sub(raw_call_result.stipend),
@@ -662,6 +687,7 @@ impl TestResult {
         &mut self,
         replayed_entirely: bool,
         invariant_name: &String,
+        replay_reason: Option<String>,
         call_sequence: Vec<BaseCounterExample>,
     ) {
         self.kind = TestKind::Invariant {
@@ -673,11 +699,13 @@ impl TestResult {
             optimization_best_value: None,
         };
         self.status = TestStatus::Failure;
-        self.reason = if replayed_entirely {
-            Some(format!("{invariant_name} replay failure"))
-        } else {
-            Some(format!("{invariant_name} persisted failure revert"))
-        };
+        self.reason = replay_reason.or_else(|| {
+            if replayed_entirely {
+                Some(format!("{invariant_name} replay failure"))
+            } else {
+                Some(format!("{invariant_name} persisted failure revert"))
+            }
+        });
         self.counterexample = Some(CounterExample::Sequence(call_sequence.len(), call_sequence));
     }
 
@@ -756,7 +784,7 @@ impl TestResult {
     }
 
     /// Returns `true` if this is the result of a fuzz test
-    pub fn is_fuzz(&self) -> bool {
+    pub const fn is_fuzz(&self) -> bool {
         matches!(self.kind, TestKind::Fuzz { .. })
     }
 
@@ -766,7 +794,7 @@ impl TestResult {
     }
 
     /// Merges the given raw call result into `self`.
-    pub fn extend(&mut self, call_result: RawCallResult) {
+    pub fn extend<FEN: FoundryEvmNetwork>(&mut self, call_result: RawCallResult<FEN>) {
         extend!(self, call_result, TraceKind::Execution);
     }
 
@@ -849,7 +877,7 @@ impl fmt::Display for TestKindReport {
 
 impl TestKindReport {
     /// Returns the main gas value to compare against
-    pub fn gas(&self) -> u64 {
+    pub const fn gas(&self) -> u64 {
         match *self {
             Self::Unit { gas } => gas,
             // We use the median for comparisons
@@ -895,6 +923,16 @@ impl Default for TestKind {
 }
 
 impl TestKind {
+    /// Returns `true` if this is a fuzz test.
+    pub const fn is_fuzz(&self) -> bool {
+        matches!(self, Self::Fuzz { .. })
+    }
+
+    /// Returns `true` if this is an invariant test.
+    pub const fn is_invariant(&self) -> bool {
+        matches!(self, Self::Invariant { .. })
+    }
+
     /// The gas consumed by this test
     pub fn report(&self) -> TestKindReport {
         match self {
@@ -968,7 +1006,11 @@ impl TestSetup {
         Self { reason: Some(reason), skipped: true, ..Default::default() }
     }
 
-    pub fn extend(&mut self, raw: RawCallResult, trace_kind: TraceKind) {
+    pub fn extend<FEN: FoundryEvmNetwork>(
+        &mut self,
+        raw: RawCallResult<FEN>,
+        trace_kind: TraceKind,
+    ) {
         extend!(self, raw, trace_kind);
     }
 
