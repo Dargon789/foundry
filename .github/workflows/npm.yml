@@ -112,6 +112,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate Trusted Artifact Source
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]] || { echo "ERROR: Upstream workflow_run did not succeed."; exit 1; }
+            [[ "${{ github.event.workflow_run.head_repository.full_name }}" == "${{ github.repository }}" ]] || { echo "ERROR: Upstream run repository mismatch."; exit 1; }
+            [[ "${{ github.event.workflow_run.event }}" != "pull_request" ]] || { echo "ERROR: Refusing artifacts from pull_request-triggered upstream runs."; exit 1; }
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            [[ -n "${{ inputs.run_id }}" ]] || { echo "ERROR: inputs.run_id is required for workflow_dispatch."; exit 1; }
+            [[ "${{ inputs.run_id }}" =~ ^[0-9]+$ ]] || { echo "ERROR: inputs.run_id must be numeric."; exit 1; }
+          else
+            echo "ERROR: Unsupported event: ${{ github.event_name }}"
+            exit 1
+          fi
+
       - name: Set Isolated Artifact Directory
         id: paths
         run: |
