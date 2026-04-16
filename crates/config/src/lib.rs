@@ -1335,7 +1335,7 @@ impl Config {
     ///
     /// Returns `false` if `solc_version` is explicitly set, otherwise returns the value of
     /// `auto_detect_solc`
-    pub fn is_auto_detect(&self) -> bool {
+    pub const fn is_auto_detect(&self) -> bool {
         if self.solc.is_some() {
             return false;
         }
