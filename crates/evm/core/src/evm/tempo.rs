@@ -67,6 +67,9 @@ impl FoundryEvmFactory for TempoEvmFactory {
         let mut inner = tempo_evm.into_inner();
         inner.ctx.cfg.gas_params = tempo_gas_params(spec);
         inner.ctx.cfg.tx_chain_id_check = true;
+        if inner.ctx.cfg.tx_gas_limit_cap.is_none() {
+            inner.ctx.cfg.tx_gas_limit_cap = spec.tx_gas_limit_cap();
+        }
 
         let mut evm = TempoFoundryEvm { inner };
         let networks = Evm::inspector(&evm).get_networks();
@@ -191,6 +194,7 @@ pub(crate) fn map_tempo_error(
         EVMError::Database(db) => EVMError::Database(db),
         EVMError::Header(h) => EVMError::Header(h),
         EVMError::Custom(s) => EVMError::Custom(s),
+        EVMError::CustomAny(custom_any_error) => EVMError::CustomAny(custom_any_error),
         EVMError::Transaction(t) => match t {
             TempoInvalidTransaction::EthInvalidTransaction(eth) => EVMError::Transaction(eth),
             t => EVMError::Custom(format!("tempo transaction error: {t}")),
@@ -408,8 +412,9 @@ fn handle_create2_frame<
 
         if inspector.should_use_create2_factory(ctx.journal().depth(), inputs) {
             let gas_limit = inputs.gas_limit();
-            let create2_deployer = evm.inspector().create2_deployer();
-            let call_inputs = get_create2_factory_call_inputs(salt, inputs, create2_deployer);
+            let create2_deployer = inspector.create2_deployer();
+            let call_inputs =
+                get_create2_factory_call_inputs(salt, inputs, create2_deployer, ctx.journal_mut())?;
 
             create2_overrides.push((evm.journal().depth(), call_inputs.clone()));
 
@@ -484,22 +489,6 @@ impl<'db, I: FoundryInspectorExt<TempoContext<&'db mut dyn DatabaseExt<TempoEvmF
     InspectorHandler for TempoFoundryHandler<'db, I>
 {
     type IT = EthInterpreter;
-
-    /// Overrides `inspect_run` to load Tempo fee fields before delegating to the default
-    /// execution pipeline. This is necessary because the default `inspect_run` calls
-    /// `validate` → `validate_against_state_and_deduct_caller` directly, bypassing
-    /// `Handler::run` where `load_fee_fields` is normally invoked.
-    fn inspect_run(
-        &mut self,
-        evm: &mut Self::Evm,
-    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        self.inner.load_fee_fields(evm)?;
-
-        match self.inspect_run_without_catch_error(evm) {
-            Ok(output) => Ok(output),
-            Err(e) => self.catch_error(evm, e),
-        }
-    }
 
     /// Delegates to [`TempoEvmHandler::inspect_execution_with`], injecting the CREATE2 factory
     /// redirect exec loop. AA multi-call dispatch and gas adjustments are handled by the inner

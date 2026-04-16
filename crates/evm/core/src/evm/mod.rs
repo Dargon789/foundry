@@ -19,7 +19,7 @@ use alloy_evm::{
     precompiles::PrecompilesMap,
 };
 use alloy_network::{Ethereum, Network};
-use alloy_op_evm::OpEvmFactory;
+use alloy_op_evm::{OpEvmFactory, OpTx};
 use alloy_primitives::{Address, Bytes, Signature, U256};
 use alloy_rlp::Decodable;
 use foundry_common::{FoundryReceiptResponse, FoundryTransactionBuilder, fmt::UIfmt};
@@ -27,14 +27,18 @@ use foundry_config::FromEvmVersion;
 use foundry_fork_db::{DatabaseError, ForkBlockEnv};
 use op_alloy_network::Optimism;
 use op_revm::{
-    DefaultOp, OpBuilder, OpContext, OpHaltReason, OpSpecId, OpTransaction, handler::OpHandler,
+    L1BlockInfo, OpEvm, OpHaltReason, OpSpecId, OpTransaction, handler::OpHandler,
     precompiles::OpPrecompiles, transaction::error::OpTransactionError,
 };
 use revm::{
-    Context,
+    Context, Database, Journal, MainContext,
     context::{
-        BlockEnv, ContextTr, CreateScheme, Evm as RevmEvm, JournalTr, LocalContextTr, TxEnv,
-        result::{EVMError, ExecResultAndState, ExecutionResult, HaltReason, ResultAndState},
+        BlockEnv, CfgEnv, ContextTr, CreateScheme, Evm as RevmEvm, JournalTr, LocalContextTr,
+        TxEnv,
+        result::{
+            EVMError, ExecResultAndState, ExecutionResult, HaltReason, InvalidTransaction,
+            ResultAndState,
+        },
     },
     handler::{
         EthFrame, EvmTr, FrameResult, FrameTr, Handler, ItemOrResult, instructions::EthInstructions,
@@ -57,6 +61,9 @@ use tempo_revm::{
     TempoBlockEnv, TempoHaltReason, TempoInvalidTransaction, TempoTxEnv, evm::TempoContext,
     gas_params::tempo_gas_params, handler::TempoEvmHandler,
 };
+
+// Modified revm's OpContext with `OpTx`
+pub type OpContext<DB> = Context<BlockEnv, OpTx, CfgEnv<OpSpecId>, DB, Journal<DB>, L1BlockInfo>;
 
 pub mod eth;
 pub mod op;
@@ -251,24 +258,27 @@ pub fn with_cloned_context<CTX: FoundryContextExt>(
 }
 
 /// Get the call inputs for the CREATE2 factory.
-pub(crate) fn get_create2_factory_call_inputs(
+pub(crate) fn get_create2_factory_call_inputs<T: JournalTr>(
     salt: U256,
     inputs: &CreateInputs,
     deployer: Address,
-) -> CallInputs {
+    journal: &mut T,
+) -> Result<CallInputs, <T::Database as Database>::Error> {
     let calldata = [&salt.to_be_bytes::<32>()[..], &inputs.init_code()[..]].concat();
-    CallInputs {
+    let account = journal.load_account_with_code(deployer)?;
+    Ok(CallInputs {
         caller: inputs.caller(),
         bytecode_address: deployer,
-        known_bytecode: None,
+        known_bytecode: (account.info.code_hash, account.info.code.clone().unwrap_or_default()),
         target_address: deployer,
         scheme: CallScheme::Call,
         value: CallValue::Transfer(inputs.value()),
         input: CallInput::Bytes(calldata.into()),
         gas_limit: inputs.gas_limit(),
+        reservoir: inputs.reservoir(),
         is_static: false,
         return_memory_offset: 0..0,
-    }
+    })
 }
 
 /// Converts a network-specific halt reason into an [`InstructionResult`].
