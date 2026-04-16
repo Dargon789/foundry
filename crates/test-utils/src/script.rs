@@ -120,6 +120,7 @@ impl ScriptTester {
         let from_dir = testdata.join("utils");
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
+        let from_dir = from_dir.canonicalize()?;
         for entry in fs::read_dir(&from_dir)? {
             let file = entry?.path();
             // Only operate on regular files to avoid following symlinks or directories
