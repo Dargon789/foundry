@@ -1,6 +1,7 @@
-use alloy_consensus::{BlobTransactionSidecar, EthereumTypedTransaction};
+use alloy_consensus::{BlobTransactionSidecarVariant, EthereumTypedTransaction};
 use alloy_network::{
-    BuildResult, NetworkWallet, TransactionBuilder, TransactionBuilder4844, TransactionBuilderError,
+    BuildResult, NetworkTransactionBuilder, NetworkWallet, TransactionBuilder,
+    TransactionBuilder4844, TransactionBuilderError,
 };
 use alloy_primitives::{Address, B256, ChainId, TxKind, U256};
 use alloy_rpc_types::{AccessList, TransactionInputKind, TransactionRequest};
@@ -152,10 +153,7 @@ impl FoundryTransactionRequest {
             Ok(FoundryTypedTx::Tempo(
                 tx_req.build_aa().map_err(|e| Self::Tempo(Box::new(e.into_value())))?,
             ))
-        } else if self.as_ref().has_eip4844_fields()
-            && self.blob_sidecar().is_none()
-            && alloy_network::TransactionBuilder7594::blob_sidecar_7594(self.as_ref()).is_none()
-        {
+        } else if self.as_ref().has_eip4844_fields() && self.blob_sidecar().is_none() {
             // if request has eip4844 fields but no blob sidecar (neither eip4844 nor eip7594
             // format), try to build to eip4844 without sidecar
             self.into_inner()
@@ -210,7 +208,7 @@ impl AsRef<TransactionRequest> for FoundryTransactionRequest {
         match self {
             Self::Ethereum(tx) => tx,
             Self::Op(tx) => tx,
-            Self::Tempo(tx) => tx,
+            Self::Tempo(tx) => tx.as_ref(),
         }
     }
 }
@@ -220,7 +218,7 @@ impl AsMut<TransactionRequest> for FoundryTransactionRequest {
         match self {
             Self::Ethereum(tx) => tx,
             Self::Op(tx) => tx,
-            Self::Tempo(tx) => tx,
+            Self::Tempo(tx) => tx.as_mut(),
         }
     }
 }
@@ -299,8 +297,14 @@ impl From<FoundryTxEnvelope> for FoundryTransactionRequest {
     }
 }
 
+impl From<op_alloy_rpc_types::Transaction<FoundryTxEnvelope>> for FoundryTransactionRequest {
+    fn from(tx: op_alloy_rpc_types::Transaction<FoundryTxEnvelope>) -> Self {
+        tx.inner.into_inner().into()
+    }
+}
+
 // TransactionBuilder trait implementation for FoundryNetwork
-impl TransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
+impl TransactionBuilder for FoundryTransactionRequest {
     fn chain_id(&self) -> Option<ChainId> {
         self.as_ref().chain_id
     }
@@ -413,7 +417,9 @@ impl TransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
     fn set_access_list(&mut self, access_list: AccessList) {
         self.as_mut().access_list = Some(access_list);
     }
+}
 
+impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
     fn complete_type(&self, ty: FoundryTxType) -> Result<(), Vec<&'static str>> {
         match ty {
             FoundryTxType::Legacy => self.as_ref().complete_legacy(),
@@ -521,11 +527,11 @@ impl TransactionBuilder4844 for FoundryTransactionRequest {
         self.as_mut().set_max_fee_per_blob_gas(max_fee_per_blob_gas);
     }
 
-    fn blob_sidecar(&self) -> Option<&BlobTransactionSidecar> {
+    fn blob_sidecar(&self) -> Option<&BlobTransactionSidecarVariant> {
         self.as_ref().blob_sidecar()
     }
 
-    fn set_blob_sidecar(&mut self, sidecar: BlobTransactionSidecar) {
+    fn set_blob_sidecar(&mut self, sidecar: BlobTransactionSidecarVariant) {
         self.as_mut().set_blob_sidecar(sidecar);
     }
 }

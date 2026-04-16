@@ -111,6 +111,7 @@ create2_deployer = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
 assertions_revert = true
 legacy_assertions = false
 celo = false
+tempo = false
 bypass_prevrandao = false
 transaction_timeout = 120
 additional_compiler_profiles = []
@@ -156,6 +157,8 @@ severity = [
 exclude_lints = []
 ignore = []
 lint_on_build = true
+
+[lint.lint_specific]
 mixed_case_exceptions = [
     "ERC",
     "URI",
@@ -168,6 +171,7 @@ mixed_case_exceptions = [
     "HTTP",
     "HTTPS",
 ]
+multi_contract_file_exceptions = []
 
 [doc]
 out = "docs"
@@ -191,6 +195,8 @@ corpus_gzip = true
 corpus_min_mutations = 5
 corpus_min_size = 0
 show_edge_coverage = false
+sancov_edges = false
+sancov_trace_cmp = false
 failure_persist_dir = "cache/fuzz"
 show_logs = false
 
@@ -212,6 +218,8 @@ corpus_gzip = true
 corpus_min_mutations = 5
 corpus_min_size = 0
 show_edge_coverage = false
+sancov_edges = false
+sancov_trace_cmp = false
 failure_persist_dir = "cache/invariant"
 show_metrics = true
 show_solidity = false
@@ -251,6 +259,7 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         broadcast: "broadcast".into(),
         force: true,
         evm_version: EvmVersion::Byzantium,
+        hardfork: None,
         gas_reports: vec!["Contract".to_string()],
         gas_reports_ignore: vec![],
         gas_reports_include_tests: false,
@@ -1214,6 +1223,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
   "skip": [],
   "force": false,
   "evm_version": "osaka",
+  "hardfork": null,
   "gas_reports": [
     "*"
   ],
@@ -1272,6 +1282,8 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "corpus_min_mutations": 5,
     "corpus_min_size": 0,
     "show_edge_coverage": false,
+    "sancov_edges": false,
+    "sancov_trace_cmp": false,
     "failure_persist_dir": "cache/fuzz",
     "show_logs": false,
     "timeout": null
@@ -1295,6 +1307,8 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "corpus_min_mutations": 5,
     "corpus_min_size": 0,
     "show_edge_coverage": false,
+    "sancov_edges": false,
+    "sancov_trace_cmp": false,
     "failure_persist_dir": "cache/invariant",
     "show_metrics": true,
     "timeout": null,
@@ -1374,18 +1388,21 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "exclude_lints": [],
     "ignore": [],
     "lint_on_build": true,
-    "mixed_case_exceptions": [
-      "ERC",
-      "URI",
-      "ID",
-      "URL",
-      "API",
-      "JSON",
-      "XML",
-      "HTML",
-      "HTTP",
-      "HTTPS"
-    ]
+    "lint_specific": {
+      "mixed_case_exceptions": [
+        "ERC",
+        "URI",
+        "ID",
+        "URL",
+        "API",
+        "JSON",
+        "XML",
+        "HTML",
+        "HTTP",
+        "HTTPS"
+      ],
+      "multi_contract_file_exceptions": []
+    }
   },
   "doc": {
     "out": "docs",
@@ -1418,6 +1435,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
   "assertions_revert": true,
   "legacy_assertions": false,
   "celo": false,
+  "tempo": false,
   "bypass_prevrandao": false,
   "transaction_timeout": 120,
   "additional_compiler_profiles": [],
