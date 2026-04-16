@@ -657,7 +657,7 @@ impl DenyLevel {
 
     /// Returns `true` if the deny level includes notes.
     pub fn notes(&self) -> bool {
-        match self {
+    pub const fn notes(&self) -> bool {
             Self::Never | Self::Warnings => false,
             Self::Notes => true,
         }
