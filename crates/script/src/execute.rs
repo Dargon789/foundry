@@ -6,13 +6,13 @@ use crate::{
 };
 use alloy_dyn_abi::FunctionExt;
 use alloy_json_abi::{Function, InternalType, JsonAbi};
-use alloy_network::{AnyNetwork, Network, TransactionBuilder};
+use alloy_network::AnyNetwork;
 use alloy_primitives::{
     Address, Bytes,
     map::{HashMap, HashSet},
 };
 use alloy_provider::Provider;
-use alloy_rpc_types::TransactionInputKind;
+use alloy_rpc_types::TransactionInput;
 use eyre::{OptionExt, Result};
 use foundry_cheatcodes::Wallets;
 use foundry_cli::utils::{ensure_clean_constructor, needs_setup};
@@ -24,7 +24,6 @@ use foundry_common::{
 use foundry_config::NamedChain;
 use foundry_debugger::Debugger;
 use foundry_evm::{
-    core::evm::FoundryEvmNetwork,
     decode::decode_console_logs,
     inspectors::cheatcodes::BroadcastableTransactions,
     traces::{
@@ -33,7 +32,6 @@ use foundry_evm::{
         render_trace_arena,
     },
 };
-use foundry_wallets::wallet_browser::signer::BrowserSigner;
 use futures::future::join_all;
 use itertools::Itertools;
 use std::path::Path;
@@ -41,11 +39,10 @@ use yansi::Paint;
 
 /// State after linking, contains the linked build data along with library addresses and optional
 /// array of libraries that need to be predeployed.
-pub struct LinkedState<FEN: FoundryEvmNetwork> {
+pub struct LinkedState {
     pub args: ScriptArgs,
-    pub script_config: ScriptConfig<FEN>,
+    pub script_config: ScriptConfig,
     pub script_wallets: Wallets,
-    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
     pub build_data: LinkedBuildData,
 }
 
@@ -62,11 +59,11 @@ pub struct ExecutionData {
     pub abi: JsonAbi,
 }
 
-impl<FEN: FoundryEvmNetwork> LinkedState<FEN> {
+impl LinkedState {
     /// Given linked and compiled artifacts, prepares data we need for execution.
     /// This includes the function to call and the calldata to pass to it.
-    pub async fn prepare_execution(self) -> Result<PreExecutionState<FEN>> {
-        let Self { args, script_config, script_wallets, browser_wallet, build_data } = self;
+    pub async fn prepare_execution(self) -> Result<PreExecutionState> {
+        let Self { args, script_config, script_wallets, build_data } = self;
 
         let target_contract = build_data.get_target_contract()?;
 
@@ -80,7 +77,6 @@ impl<FEN: FoundryEvmNetwork> LinkedState<FEN> {
             args,
             script_config,
             script_wallets,
-            browser_wallet,
             execution_data: ExecutionData {
                 func,
                 calldata,
@@ -94,19 +90,18 @@ impl<FEN: FoundryEvmNetwork> LinkedState<FEN> {
 
 /// Same as [LinkedState], but also contains [ExecutionData].
 #[derive(Debug)]
-pub struct PreExecutionState<FEN: FoundryEvmNetwork> {
+pub struct PreExecutionState {
     pub args: ScriptArgs,
-    pub script_config: ScriptConfig<FEN>,
+    pub script_config: ScriptConfig,
     pub script_wallets: Wallets,
-    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
     pub build_data: LinkedBuildData,
     pub execution_data: ExecutionData,
 }
 
-impl<FEN: FoundryEvmNetwork> PreExecutionState<FEN> {
+impl PreExecutionState {
     /// Executes the script and returns the state after execution.
     /// Might require executing script twice in cases when we determine sender from execution.
-    pub async fn execute(mut self) -> Result<ExecutedState<FEN>> {
+    pub async fn execute(mut self) -> Result<ExecutedState> {
         let mut runner = self
             .script_config
             .get_runner_with_cheatcodes(
@@ -128,7 +123,6 @@ impl<FEN: FoundryEvmNetwork> PreExecutionState<FEN> {
                 args: self.args,
                 script_config: self.script_config,
                 script_wallets: self.script_wallets,
-                browser_wallet: self.browser_wallet,
                 build_data: self.build_data.build_data,
             };
 
@@ -139,7 +133,6 @@ impl<FEN: FoundryEvmNetwork> PreExecutionState<FEN> {
             args: self.args,
             script_config: self.script_config,
             script_wallets: self.script_wallets,
-            browser_wallet: self.browser_wallet,
             build_data: self.build_data,
             execution_data: self.execution_data,
             execution_result: result,
@@ -147,10 +140,7 @@ impl<FEN: FoundryEvmNetwork> PreExecutionState<FEN> {
     }
 
     /// Executes the script using the provided runner and returns the [ScriptResult].
-    pub async fn execute_with_runner(
-        &self,
-        runner: &mut ScriptRunner<FEN>,
-    ) -> Result<ScriptResult<FEN::Network>> {
+    pub async fn execute_with_runner(&self, runner: &mut ScriptRunner) -> Result<ScriptResult> {
         let (address, mut setup_result) = runner.setup(
             &self.build_data.predeploy_libraries,
             self.execution_data.bytecode.clone(),
@@ -190,7 +180,7 @@ impl<FEN: FoundryEvmNetwork> PreExecutionState<FEN> {
     /// them instead.
     fn maybe_new_sender(
         &self,
-        transactions: Option<&BroadcastableTransactions<FEN::Network>>,
+        transactions: Option<&BroadcastableTransactions>,
     ) -> Result<Option<Address>> {
         let mut new_sender = None;
 
@@ -230,9 +220,10 @@ pub struct RpcData {
 
 impl RpcData {
     /// Iterates over script transactions and collects RPC urls.
-    fn from_transactions<N: Network>(txs: &BroadcastableTransactions<N>) -> Self {
+    fn from_transactions(txs: &BroadcastableTransactions) -> Self {
         let missing_rpc = txs.iter().any(|tx| tx.rpc.is_none());
-        let total_rpcs = txs.iter().filter_map(|tx| tx.rpc.clone()).collect::<HashSet<_>>();
+        let total_rpcs =
+            txs.iter().filter_map(|tx| tx.rpc.as_ref().cloned()).collect::<HashSet<_>>();
 
         Self { total_rpcs, missing_rpc }
     }
@@ -281,33 +272,30 @@ pub struct ExecutionArtifacts {
 }
 
 /// State after the script has been executed.
-pub struct ExecutedState<FEN: FoundryEvmNetwork> {
+pub struct ExecutedState {
     pub args: ScriptArgs,
-    pub script_config: ScriptConfig<FEN>,
+    pub script_config: ScriptConfig,
     pub script_wallets: Wallets,
-    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
     pub build_data: LinkedBuildData,
     pub execution_data: ExecutionData,
-    pub execution_result: ScriptResult<FEN::Network>,
+    pub execution_result: ScriptResult,
 }
 
-impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
+impl ExecutedState {
     /// Collects the data we need for simulation and various post-execution tasks.
-    pub async fn prepare_simulation(self) -> Result<PreSimulationState<FEN>> {
+    pub async fn prepare_simulation(self) -> Result<PreSimulationState> {
         let returns = self.get_returns()?;
 
         let decoder = self.build_trace_decoder(&self.build_data.known_contracts).await?;
 
-        let mut txs: BroadcastableTransactions<FEN::Network> =
-            self.execution_result.transactions.clone().unwrap_or_default();
+        let mut txs = self.execution_result.transactions.clone().unwrap_or_default();
 
         // Ensure that unsigned transactions have both `data` and `input` populated to avoid
         // issues with eth_estimateGas and eth_sendTransaction requests.
         for tx in &mut txs {
-            if let Some(req) = tx.transaction.as_unsigned_mut()
-                && let Some(input) = req.input().cloned()
-            {
-                *req = req.clone().with_input_kind(input, TransactionInputKind::Both);
+            if let Some(req) = tx.transaction.as_unsigned_mut() {
+                req.input =
+                    TransactionInput::maybe_both(std::mem::take(&mut req.input).into_input());
             }
         }
         let rpc_data = RpcData::from_transactions(&txs);
@@ -326,7 +314,6 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
             args: self.args,
             script_config: self.script_config,
             script_wallets: self.script_wallets,
-            browser_wallet: self.browser_wallet,
             build_data: self.build_data,
             execution_data: self.execution_data,
             execution_result: self.execution_result,
@@ -339,8 +326,6 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
         &self,
         known_contracts: &ContractsByArtifact,
     ) -> Result<CallTraceDecoder> {
-        let chain_id = self.script_config.evm_opts.get_remote_chain_id().await;
-
         let mut decoder = CallTraceDecoderBuilder::new()
             .with_labels(self.execution_result.labeled_addresses.clone())
             .with_verbosity(self.script_config.evm_opts.verbosity)
@@ -349,12 +334,12 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
                 &self.script_config.config,
             )?)
             .with_label_disabled(self.args.disable_labels)
-            .with_chain_id(chain_id.map(|c| c.id()))
             .build();
 
-        let mut identifier = TraceIdentifiers::new()
-            .with_local(known_contracts)
-            .with_external(&self.script_config.config, chain_id)?;
+        let mut identifier = TraceIdentifiers::new().with_local(known_contracts).with_external(
+            &self.script_config.config,
+            self.script_config.evm_opts.get_remote_chain_id().await,
+        )?;
 
         for (_, trace) in &self.execution_result.traces {
             decoder.identify(trace, &mut identifier);
@@ -378,10 +363,10 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
                             ty: "unknown".to_string(),
                         });
 
-                    let label = if output.name.is_empty() {
-                        index.to_string()
+                    let label = if !output.name.is_empty() {
+                        output.name.to_string()
                     } else {
-                        output.name.clone()
+                        index.to_string()
                     };
 
                     returns.insert(
@@ -402,7 +387,7 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
     }
 }
 
-impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
+impl PreSimulationState {
     pub async fn show_json(&self) -> Result<()> {
         let mut result = self.execution_result.clone();
 
@@ -476,10 +461,10 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
                                 ty: "unknown".to_string(),
                             });
 
-                        let label = if output.name.is_empty() {
-                            index.to_string()
+                        let label = if !output.name.is_empty() {
+                            output.name.to_string()
                         } else {
-                            output.name.clone()
+                            index.to_string()
                         };
                         sh_println!(
                             "{label}: {internal_type} {value}",
