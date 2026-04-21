@@ -1,4 +1,4 @@
-use crate::{AsDoc, CommentTag, Comments, Deployment, Markdown, writer::traits::ParamLike};
+use crate::{writer::traits::ParamLike, AsDoc, CommentTag, Comments, Deployment, Markdown};
 use itertools::Itertools;
 use solang_parser::pt::{
     EnumDefinition, ErrorParameter, EventParameter, Parameter, VariableDeclaration,
@@ -87,17 +87,6 @@ impl BufWriter {
     /// Writes text in italics to the buffer formatted as [Markdown::Italic].
     pub fn write_italic(&mut self, text: &str) -> fmt::Result {
         writeln!(self.buf, "{}", Markdown::Italic(text))
-    }
-
-    /// Writes dev content to the buffer, handling markdown lists properly.
-    /// If the content contains markdown lists, it formats them correctly.
-    /// Otherwise, it writes the content in italics.
-    pub fn write_dev_content(&mut self, text: &str) -> fmt::Result {
-        for line in text.lines() {
-            writeln!(self.buf, "{line}")?;
-        }
-
-        Ok(())
     }
 
     /// Writes bold text to the buffer formatted as [Markdown::Bold].
@@ -202,7 +191,8 @@ impl BufWriter {
         params: &EnumDefinition,
         comments: &Comments,
     ) -> fmt::Result {
-        let comments = comments.include_tags(&[CommentTag::Param]);
+        let comments =
+            comments.include_tags(&[CommentTag::Param, CommentTag::Custom("variant".to_string())]);
 
         // There is nothing to write.
         if comments.is_empty() {
@@ -215,7 +205,7 @@ impl BufWriter {
         self.write_piped(&VARIANTS_TABLE_HEADERS.join("|"))?;
         self.write_piped(&VARIANTS_TABLE_SEPARATOR)?;
 
-        for value in &params.values {
+        for value in params.values.iter() {
             let param_name = value.as_ref().map(|v| v.name.clone());
 
             let comment = param_name.as_ref().and_then(|name| {
@@ -223,7 +213,7 @@ impl BufWriter {
             });
 
             let row = [
-                Markdown::Code(&param_name.unwrap_or("<none>".to_string())).as_doc()?,
+                Markdown::Code(param_name.as_deref().unwrap_or("<none>")).as_doc()?,
                 comment.unwrap_or_default().replace('\n', " "),
             ];
             self.write_piped(&row.join("|"))?;
