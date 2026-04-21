@@ -350,7 +350,7 @@ foundry-compilers = { version = "0.19.14", default-features = false, features = 
     "rustls",
     "svm-solc",
 ] }
-foundry-fork-db = "0.24.1"
+foundry-fork-db = "0.25.0"
 solang-parser = { version = "=0.3.9", package = "foundry-solang-parser" }
 solar = { package = "solar-compiler", version = "=0.1.8", default-features = false }
 svm = { package = "svm-rs", version = "0.5", default-features = false, features = [
@@ -421,7 +421,7 @@ revm-inspectors = { version = "0.38.1", features = ["serde"] }
 op-revm = { version = "18.0.0", default-features = false }
 
 ## cli
-anstream = "0.6"
+anstream = "1.0"
 anstyle = "1.0"
 dialoguer = { version = "0.12", default-features = false, features = [
     "password",
@@ -510,15 +510,21 @@ flate2 = "1.1"
 ethereum_ssz = "0.10"
 
 # Tempo
-tempo-chainspec = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033", default-features = false }
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033", default-features = false, features = [
-    "serde",
+mpp = { git = "https://github.com/tempoxyz/mpp-rs", rev = "310c9a1f3fe485fa9c7a877fd4da6b7a6ab34815", default-features = false, features = [
+    "tempo",
+    "client",
+    "reqwest-rustls-tls",
 ] }
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033", default-features = false }
-tempo-evm = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033", default-features = false }
-tempo-revm = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033", default-features = false }
-tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033" }
-tempo-precompiles = { git = "https://github.com/tempoxyz/tempo", rev = "f69d033" }
+tempo-chainspec = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9", default-features = false }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9", default-features = false, features = [
+    "serde",
+    "reth-codec",
+] }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9", default-features = false }
+tempo-evm = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9", default-features = false }
+tempo-revm = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9", default-features = false, features = ["serde"] }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9" }
+tempo-precompiles = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9" }
 
 ## Pinned dependencies. Enabled for the workspace in crates/test-utils.
 
@@ -602,7 +608,12 @@ alloy-op-hardforks = { git = "https://github.com/foundry-rs/optimism", branch = 
 # revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors.git", rev = "22dcee2" }
 
 ## foundry-fork-db
-foundry-fork-db = { git = "https://github.com/foundry-rs/foundry-fork-db", branch = "main" }
+# foundry-fork-db = { git = "https://github.com/foundry-rs/foundry-fork-db", rev = "b139c57c2b54bc06a9e4c9783941f5bbd4bd3a1f" }
+
+## tempo — unify crates.io versions (pulled by mpp) with git rev
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9" }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9" }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "bb08bb9" }
 
 # solar
 solar = { package = "solar-compiler", git = "https://github.com/paradigmxyz/solar", rev = "530f129" }
