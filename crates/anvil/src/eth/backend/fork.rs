@@ -370,24 +370,8 @@ impl<N: Network> ClientFork<N> {
         number: u64,
         index: usize,
     ) -> Result<Option<N::TransactionResponse>, TransportError> {
-        if let Some(block) = self.block_by_number(number).await? {
-            #[allow(clippy::collapsible_match)]
-            match block.transactions() {
-                BlockTransactions::Full(txs) => {
-                    if let Some(tx) = txs.get(index) {
-                        return Ok(Some(tx.clone()));
-                    }
-                }
-                BlockTransactions::Hashes(hashes) => {
-                    if let Some(tx_hash) = hashes.get(index) {
-                        return self.transaction_by_hash(*tx_hash).await;
-                    }
-                }
-                // TODO(evalir): Is it possible to reach this case? Should we support it
-                BlockTransactions::Uncle => panic!("Uncles not supported"),
-            }
-        }
-        Ok(None)
+        let block = self.block_by_number(number).await?;
+        self.transaction_at_block_index(block, index).await
     }
 
     pub async fn transaction_by_block_hash_and_index(
@@ -395,8 +379,16 @@ impl<N: Network> ClientFork<N> {
         hash: B256,
         index: usize,
     ) -> Result<Option<N::TransactionResponse>, TransportError> {
-        if let Some(block) = self.block_by_hash(hash).await? {
-            #[allow(clippy::collapsible_match)]
+        let block = self.block_by_hash(hash).await?;
+        self.transaction_at_block_index(block, index).await
+    }
+
+    async fn transaction_at_block_index(
+        &self,
+        block: Option<N::BlockResponse>,
+        index: usize,
+    ) -> Result<Option<N::TransactionResponse>, TransportError> {
+        if let Some(block) = block {
             match block.transactions() {
                 BlockTransactions::Full(txs) => {
                     if let Some(tx) = txs.get(index) {
@@ -408,8 +400,7 @@ impl<N: Network> ClientFork<N> {
                         return self.transaction_by_hash(*tx_hash).await;
                     }
                 }
-                // TODO(evalir): Is it possible to reach this case? Should we support it
-                BlockTransactions::Uncle => panic!("Uncles not supported"),
+                BlockTransactions::Uncle => {}
             }
         }
         Ok(None)
@@ -451,8 +442,10 @@ impl<N: Network> ClientFork<N> {
         &self,
         hash: B256,
     ) -> Result<Option<N::BlockResponse>, TransportError> {
-        if let Some(block) = self.storage_read().blocks.get(&hash).cloned() {
-            return Ok(Some(self.convert_to_full_block(block)));
+        if let Some(block) = self.storage_read().blocks.get(&hash).cloned()
+            && let Some(block) = self.convert_to_full_block(block)
+        {
+            return Ok(Some(block));
         }
         self.fetch_full_block(hash).await
     }
@@ -488,8 +481,9 @@ impl<N: Network> ClientFork<N> {
             .get(&block_number)
             .copied()
             .and_then(|hash| self.storage_read().blocks.get(&hash).cloned())
+            && let Some(block) = self.convert_to_full_block(block)
         {
-            return Ok(Some(self.convert_to_full_block(block)));
+            return Ok(Some(block));
         }
 
         self.fetch_full_block(block_number).await
@@ -518,15 +512,15 @@ impl<N: Network> ClientFork<N> {
     }
 
     /// Converts a block of hashes into a full block
-    fn convert_to_full_block(&self, mut block: N::BlockResponse) -> N::BlockResponse {
+    fn convert_to_full_block(&self, mut block: N::BlockResponse) -> Option<N::BlockResponse> {
         let storage = self.storage.read();
         let transactions = block
             .transactions()
             .hashes()
-            .filter_map(|hash| storage.transactions.get(&hash).cloned())
-            .collect();
+            .map(|hash| storage.transactions.get(&hash).cloned())
+            .collect::<Option<Vec<_>>>()?;
         *block.transactions_mut() = BlockTransactions::Full(transactions);
-        block
+        Some(block)
     }
 }
 

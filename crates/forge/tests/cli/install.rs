@@ -619,25 +619,21 @@ forgetest!(flaky_install_no_git_cleans_nested_submodules, |prj, cmd| {
     }
 
     // There should be no .git file or directory anywhere under the installed dependency.
-    fn assert_no_git(dir: &Path, root: &Path) {
-        let canonical_root = root.canonicalize().unwrap();
+    fn assert_no_git(dir: &Path) {
         for entry in fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
-            if path.file_name() == Some(".git".as_ref()) {
-                panic!("found leftover .git at {}", path.display());
-            }
-
-            let metadata = fs::symlink_metadata(&path).unwrap();
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                let canonical_path = path.canonicalize().unwrap();
-                if canonical_path.starts_with(&canonical_root) {
-                    assert_no_git(&path, root);
-                }
+            assert!(
+                path.file_name() != Some(".git".as_ref()),
+                "found leftover .git at {}",
+                path.display()
+            );
+            if path.is_dir() {
+                assert_no_git(&path);
             }
         }
     }
-    assert_no_git(&dep_dir, &dep_dir);
+    assert_no_git(&dep_dir);
 });
 
 forgetest_init!(sync_on_forge_update, |prj, cmd| {

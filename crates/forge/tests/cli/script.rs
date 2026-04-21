@@ -1050,9 +1050,8 @@ forgetest_async!(check_broadcast_log, |prj, cmd| {
     let run_log = re.replace_all(&run_log, "");
 
     // Clean up carriage return OS differences
-    let re = Regex::new(r"\r\n").unwrap();
-    let fixtures_log = re.replace_all(&fixtures_log, "\n");
-    let run_log = re.replace_all(&run_log, "\n");
+    let fixtures_log = fixtures_log.replace("\r\n", "\n");
+    let run_log = run_log.replace("\r\n", "\n");
 
     similar_asserts::assert_eq!(fixtures_log, run_log);
 });
@@ -3201,7 +3200,7 @@ contract CounterScript is Script {
 error: the following required arguments were not provided:
   --broadcast
 
-Usage: [..] script --broadcast --verify --fork-url <URL> <PATH> [ARGS]...
+Usage: [..] script --broadcast --verify --rpc-url <RPC_URL> <PATH> [ARGS]...
 
 For more information, try '--help'.
 
@@ -3492,4 +3491,61 @@ Script ran successfully.
 [GAS]
 
 "#]]);
+});
+
+// Regression test for https://github.com/foundry-rs/foundry/issues/13576
+// On Arbitrum, `block.number` is remapped to the L1 block number. Previously,
+// fork block pinning used the remapped L1 block number, causing the fork to
+// fetch state from an ancient block where contracts did not exist.
+forgetest_init!(
+    #[ignore]
+    flaky_can_call_arbitrum_contract_in_script,
+    |prj, cmd| {
+        let script = prj.add_source(
+            "ArbScript",
+            r#"
+import "forge-std/Script.sol";
+
+interface IERC20 {
+    function name() external view returns (string memory);
+}
+
+contract ArbScript is Script {
+    function run() external view {
+        // USDC on Arbitrum — a contract with zero ETH balance.
+        // Before the fix, the fork pinned to the L1 block number, fetching state from
+        // an ancient block (Sept 2022) where USDC did not exist, causing
+        // "call to non-contract address".
+        IERC20 usdc = IERC20(0xaf88d065e77c8cC2239327C5EDb3A432268e5831);
+        string memory n = usdc.name();
+        require(bytes(n).length > 0, "name should not be empty");
+    }
+}
+    "#,
+        );
+
+        let rpc = foundry_test_utils::rpc::next_rpc_endpoint(alloy_chains::NamedChain::Arbitrum);
+
+        cmd.arg("script").arg(script).args(["--fork-url", rpc.as_str(), "-vvvv"]).assert_success();
+    }
+);
+
+// Tests that `forge script` works in Tempo mode without CreateCollision.
+// Tempo genesis pre-deploys the Arachnid CREATE2 factory at the same address as the default
+// CREATE2 deployer, so `deploy_create2_deployer` must be skipped to avoid a collision.
+forgetest!(can_execute_script_command_with_tempo, |prj, cmd| {
+    prj.wipe();
+
+    // Initialize a Tempo project (installs forge-std, tempo-std, generates Mail template).
+    cmd.args(["init", "--network", "tempo"]).arg(prj.root()).assert_success();
+
+    // Run the generated Mail.s.sol script with a salt argument.
+    cmd.forge_fuse()
+        .arg("script")
+        .arg("script/Mail.s.sol")
+        .arg("temposalt")
+        .arg("--tempo")
+        .arg("--root")
+        .arg(prj.root())
+        .assert_success();
 });

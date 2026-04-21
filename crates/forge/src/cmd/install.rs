@@ -197,7 +197,7 @@ impl DependencyInstallOpts {
                         let rev = git.get_rev(tag_or_branch, &path)?;
 
                         dep_id = Some(DepIdentifier::Branch {
-                            name: tag_or_branch.to_string(),
+                            name: tag_or_branch.clone(),
                             rev,
                             r#override: false,
                         });
@@ -359,20 +359,6 @@ impl Installer<'_> {
     }
 
     fn remove_nested_git_dirs_inner(root: &Path, dir: &Path) -> Result<()> {
-        // Ensure we never recurse outside of the original root directory.
-        // If canonicalization fails or dir is not under root, stop recursing.
-        let root_canon = match root.canonicalize() {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
-        let dir_canon = match dir.canonicalize() {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
-        if !dir_canon.starts_with(&root_canon) {
-            return Ok(());
-        }
-
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(_) => return Ok(()),
@@ -581,7 +567,7 @@ impl Installer<'_> {
                     sh_println!("[{i}] {c} selected")?;
                     return Ok(c.clone());
                 }
-                _ => continue,
+                _ => {}
             }
         }
     }
