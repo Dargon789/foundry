@@ -28,6 +28,7 @@ foundry-evm-traces.workspace = true
 
 alloy-dyn-abi = { workspace = true, features = ["arbitrary", "eip712"] }
 alloy-json-abi.workspace = true
+alloy-network.workspace = true
 alloy-primitives = { workspace = true, features = [
     "serde",
     "getrandom",
@@ -48,6 +49,7 @@ revm = { workspace = true, default-features = false, features = [
 ] }
 revm-inspectors.workspace = true
 tempo-precompiles.workspace = true
+tempo-primitives.workspace = true
 
 eyre.workspace = true
 parking_lot.workspace = true

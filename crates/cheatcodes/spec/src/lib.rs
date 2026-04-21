@@ -19,7 +19,7 @@ mod vm;
 pub use vm::Vm;
 
 // The `cheatcodes.json` schema.
-/// Foundry cheatcodes. Learn more: <https://book.getfoundry.sh/cheatcodes/>
+/// Foundry cheatcodes. Learn more: <https://getfoundry.sh/forge/tests/cheatcodes#cheatcodes>
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -178,7 +178,7 @@ interface Vm {{
 
         eprintln!("\n\x1b[31;1merror\x1b[0m: {} was not up-to-date, updating\n", file.display());
         if std::env::var("CI").is_ok() {
-            eprintln!("    NOTE: run `cargo cheats` locally and commit the updated files\n");
+            eprintln!("    NOTE: run `cargo spec-cheats` locally and commit the updated files\n");
         }
         if let Some(parent) = file.parent() {
             let _ = fs::create_dir_all(parent);
