@@ -1314,19 +1314,42 @@ impl Config {
         }
 
         // Remove last test run failures file.
-        if let Err(err) = fs::remove_file(&self.test_failures_file)
-            && err.kind() != io::ErrorKind::NotFound
-        {
+        let test_failures_path = if self.test_failures_file.is_absolute() {
+            self.test_failures_file.clone()
+        } else {
+            project.root().join(&self.test_failures_file)
+        };
+        if test_failures_path.starts_with(project.root()) {
+            if let Err(err) = fs::remove_file(&test_failures_path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                warnings.push(format!(
+                    "failed to remove test failures file {}: {err}",
+                    test_failures_path.display()
+                ));
+            }
+        } else {
             warnings.push(format!(
-                "failed to remove test failures file {}: {err}",
-                self.test_failures_file.display()
+                "skipping removal of test failures file outside project root: {}",
+                test_failures_path.display()
             ));
         }
 
         // Remove fuzz and invariant cache directories.
         let mut remove_test_dir = |test_dir: &Option<PathBuf>| {
             if let Some(test_dir) = test_dir {
-                let path = project.root().join(test_dir);
+                let path = if test_dir.is_absolute() {
+                    test_dir.clone()
+                } else {
+                    project.root().join(test_dir)
+                };
+                if !path.starts_with(project.root()) {
+                    warnings.push(format!(
+                        "skipping removal of test cache directory outside project root: {}",
+                        path.display()
+                    ));
+                    return;
+                }
                 if let Err(err) = fs::remove_dir_all(&path)
                     && err.kind() != io::ErrorKind::NotFound
                 {
