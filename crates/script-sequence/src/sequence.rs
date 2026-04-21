@@ -1,6 +1,7 @@
 use crate::transaction::TransactionWithMetadata;
-use alloy_network::{Network, ReceiptResponse};
+use alloy_network::ReceiptResponse;
 use alloy_primitives::{TxHash, hex, map::HashMap};
+use alloy_rpc_types_eth::TransactionReceipt;
 use eyre::{ContextCompat, Result, WrapErr};
 use foundry_common::{SELECTOR_LEN, TransactionMaybeSigned, fs, shell};
 use foundry_compilers::ArtifactId;
@@ -11,13 +12,31 @@ use std::{
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
+#
 pub const DRY_RUN_DIR: &str = "dry-run";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NestedValue {
     pub internal_type: String,
     pub value: String,
+}
+#
+/// Helper that saves the transactions sequence and its state on which transactions have been
+/// broadcasted
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ScriptSequence {
+    pub transactions: VecDeque<TransactionWithMetadata>,
+    pub receipts: Vec<TransactionReceipt>,
+    pub libraries: Vec<String>,
+    pub pending: Vec<TxHash>,
+    #[serde(skip)]
+    /// Contains paths to the sequence files
+    /// None if sequence should not be saved to disk (e.g. part of a multi-chain sequence)
+    pub paths: Option<(PathBuf, PathBuf)>,
+    pub returns: HashMap<String, NestedValue>,
+    pub timestamp: u128,
+    pub chain: u64,
+    pub commit: Option<String>,
 }
 
 /// Sensitive values from the transactions in a script sequence
@@ -32,46 +51,8 @@ pub struct SensitiveScriptSequence {
     pub transactions: VecDeque<SensitiveTransactionMetadata>,
 }
 
-/// Helper that saves the transactions sequence and its state on which transactions have been
-/// broadcasted
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "N::TransactionRequest: Serialize, N::TxEnvelope: Serialize",
-    deserialize = "N::TransactionRequest: for<'de2> Deserialize<'de2>, N::TxEnvelope: for<'de2> Deserialize<'de2>"
-))]
-pub struct ScriptSequence<N: Network> {
-    pub transactions: VecDeque<TransactionWithMetadata<N>>,
-    pub receipts: Vec<N::ReceiptResponse>,
-    pub libraries: Vec<String>,
-    pub pending: Vec<TxHash>,
-    #[serde(skip)]
-    /// Contains paths to the sequence files
-    /// None if sequence should not be saved to disk (e.g. part of a multi-chain sequence)
-    pub paths: Option<(PathBuf, PathBuf)>,
-    pub returns: HashMap<String, NestedValue>,
-    pub timestamp: u128,
-    pub chain: u64,
-    pub commit: Option<String>,
-}
-
-impl<N: Network> Default for ScriptSequence<N> {
-    fn default() -> Self {
-        Self {
-            transactions: Default::default(),
-            receipts: Default::default(),
-            libraries: Default::default(),
-            pending: Default::default(),
-            paths: Default::default(),
-            returns: Default::default(),
-            timestamp: Default::default(),
-            chain: Default::default(),
-            commit: Default::default(),
-        }
-    }
-}
-
-impl<N: Network> From<&ScriptSequence<N>> for SensitiveScriptSequence {
-    fn from(sequence: &ScriptSequence<N>) -> Self {
+impl From<&ScriptSequence> for SensitiveScriptSequence {
+    fn from(sequence: &ScriptSequence) -> Self {
         Self {
             transactions: sequence
                 .transactions
@@ -82,7 +63,7 @@ impl<N: Network> From<&ScriptSequence<N>> for SensitiveScriptSequence {
     }
 }
 
-impl<N: Network> ScriptSequence<N> {
+impl ScriptSequence {
     /// Loads The sequence for the corresponding json file
     pub fn load(
         config: &Config,
@@ -90,10 +71,7 @@ impl<N: Network> ScriptSequence<N> {
         target: &ArtifactId,
         chain_id: u64,
         dry_run: bool,
-    ) -> Result<Self>
-    where
-        N::TxEnvelope: for<'d> Deserialize<'d>,
-    {
+    ) -> Result<Self> {
         let (path, sensitive_path) = Self::get_paths(config, sig, target, chain_id, dry_run)?;
 
         let mut script_sequence: Self = fs::read_json_file(&path)
@@ -114,10 +92,7 @@ impl<N: Network> ScriptSequence<N> {
     /// Saves the transactions as file if it's a standalone deployment.
     /// `save_ts` should be set to true for checkpoint updates, which might happen many times and
     /// could result in us saving many identical files.
-    pub fn save(&mut self, silent: bool, save_ts: bool) -> Result<()>
-    where
-        N::TxEnvelope: Serialize,
-    {
+    pub fn save(&mut self, silent: bool, save_ts: bool) -> Result<()> {
         self.sort_receipts();
 
         if self.transactions.is_empty() {
@@ -166,10 +141,10 @@ impl<N: Network> ScriptSequence<N> {
         Ok(())
     }
 
-    pub fn add_receipt(&mut self, receipt: N::ReceiptResponse) {
+    pub fn add_receipt(&mut self, receipt: TransactionReceipt) {
         self.receipts.push(receipt);
     }
-
+    #
     /// Sorts all receipts with ascending transaction index
     pub fn sort_receipts(&mut self) {
         self.receipts.sort_by_key(|r| (r.block_number(), r.transaction_index()));
@@ -185,7 +160,7 @@ impl<N: Network> ScriptSequence<N> {
     pub fn remove_pending(&mut self, tx_hash: TxHash) {
         self.pending.retain(|element| element != &tx_hash);
     }
-
+    #
     /// Gets paths in the formats
     /// `./broadcast/[contract_filename]/[chain_id]/[sig]-latest.json` and
     /// `./cache/[contract_filename]/[chain_id]/[sig]-latest.json`.
@@ -196,8 +171,8 @@ impl<N: Network> ScriptSequence<N> {
         chain_id: u64,
         dry_run: bool,
     ) -> Result<(PathBuf, PathBuf)> {
-        let mut broadcast = config.broadcast.clone();
-        let mut cache = config.cache_path.clone();
+        let mut broadcast = config.broadcast.to_path_buf();
+        let mut cache = config.cache_path.to_path_buf();
         let mut common = PathBuf::new();
 
         let target_fname = target.source.file_name().wrap_err("No filename.")?;
@@ -229,7 +204,7 @@ impl<N: Network> ScriptSequence<N> {
     }
 
     /// Returns the list of the transactions without the metadata.
-    pub fn transactions(&self) -> impl Iterator<Item = &TransactionMaybeSigned<N>> {
+    pub fn transactions(&self) -> impl Iterator<Item = &TransactionMaybeSigned> {
         self.transactions.iter().map(|tx| tx.tx())
     }
 
@@ -240,7 +215,7 @@ impl<N: Network> ScriptSequence<N> {
             .for_each(|(i, tx)| tx.rpc.clone_from(&sensitive.transactions[i].rpc));
     }
 }
-
+#
 /// Converts the `sig` argument into the corresponding file path.
 ///
 /// This accepts either the signature of the function or the raw calldata.
