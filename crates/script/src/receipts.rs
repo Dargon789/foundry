@@ -1,9 +1,10 @@
 use alloy_chains::{Chain, NamedChain};
-use alloy_network::{Network, ReceiptResponse};
+use alloy_network::{Ethereum, ReceiptResponse};
 use alloy_primitives::{TxHash, U256, utils::format_units};
 use alloy_provider::{
     PendingTransactionBuilder, PendingTransactionError, Provider, RootProvider, WatchTxError,
 };
+use alloy_rpc_types::TransactionReceipt;
 use eyre::{Result, eyre};
 use forge_script_sequence::ScriptSequence;
 use foundry_common::{retry, retry::RetryError, shell};
@@ -19,25 +20,25 @@ pub struct PendingReceiptError {
 }
 
 /// Convenience enum for internal signalling of transaction status
-pub enum TxStatus<R: ReceiptResponse> {
+pub enum TxStatus {
     Dropped,
-    Success(R),
-    Revert(R),
+    Success(TransactionReceipt),
+    Revert(TransactionReceipt),
 }
 
-impl<R: ReceiptResponse> From<R> for TxStatus<R> {
-    fn from(receipt: R) -> Self {
-        if receipt.status() { Self::Success(receipt) } else { Self::Revert(receipt) }
+impl From<TransactionReceipt> for TxStatus {
+    fn from(receipt: TransactionReceipt) -> Self {
+        if !receipt.status() { Self::Revert(receipt) } else { Self::Success(receipt) }
     }
 }
 
 /// Checks the status of a txhash by first polling for a receipt, then for
 /// mempool inclusion. Returns the tx hash, and a status
-pub async fn check_tx_status<N: Network>(
-    provider: &RootProvider<N>,
+pub async fn check_tx_status(
+    provider: &RootProvider<Ethereum>,
     hash: TxHash,
     timeout: u64,
-) -> (TxHash, Result<TxStatus<N::ReceiptResponse>, eyre::Report>) {
+) -> (TxHash, Result<TxStatus, eyre::Report>) {
     let result = retry::Retry::new_no_delay(3)
         .run_async_until_break(|| async {
             match PendingTransactionBuilder::new(provider.clone(), hash)
@@ -88,10 +89,10 @@ pub async fn check_tx_status<N: Network>(
 }
 
 /// Prints parts of the receipt to stdout
-pub fn format_receipt<N: Network>(
+pub fn format_receipt(
     chain: Chain,
-    receipt: &N::ReceiptResponse,
-    sequence: Option<&ScriptSequence<N>>,
+    receipt: &TransactionReceipt,
+    sequence: Option<&ScriptSequence>,
 ) -> String {
     let gas_used = receipt.gas_used();
     let gas_price = receipt.effective_gas_price();
@@ -181,9 +182,7 @@ pub fn format_receipt<N: Network>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_network::Ethereum;
     use alloy_primitives::B256;
-    use alloy_rpc_types::TransactionReceipt;
     use std::collections::VecDeque;
 
     fn mock_receipt(tx_hash: B256, success: bool) -> TransactionReceipt {
@@ -199,11 +198,7 @@ mod tests {
         .unwrap()
     }
 
-    fn mock_sequence(
-        tx_hash: B256,
-        contract: Option<&str>,
-        func: Option<&str>,
-    ) -> ScriptSequence<Ethereum> {
+    fn mock_sequence(tx_hash: B256, contract: Option<&str>, func: Option<&str>) -> ScriptSequence {
         let tx = serde_json::from_value(serde_json::json!({
             "hash": tx_hash, "transactionType": "CALL",
             "contractName": contract, "contractAddress": null, "function": func,
@@ -233,7 +228,7 @@ mod tests {
     #[test]
     fn format_receipt_without_sequence_omits_metadata() {
         let hash = B256::repeat_byte(0x42);
-        let out = format_receipt::<Ethereum>(Chain::mainnet(), &mock_receipt(hash, true), None);
+        let out = format_receipt(Chain::mainnet(), &mock_receipt(hash, true), None);
 
         assert!(!out.contains("Contract:"));
         assert!(!out.contains("Function:"));

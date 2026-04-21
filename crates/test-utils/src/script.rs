@@ -304,7 +304,7 @@ pub enum ScriptOutcome {
 }
 
 impl ScriptOutcome {
-    pub const fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::OkNoEndpoint => "If you wish to simulate on-chain transactions pass a RPC URL.",
             Self::OkSimulation => "SIMULATION COMPLETE. To broadcast these",
@@ -328,7 +328,7 @@ impl ScriptOutcome {
         }
     }
 
-    pub const fn is_err(&self) -> bool {
+    pub fn is_err(&self) -> bool {
         match self {
             Self::OkNoEndpoint
             | Self::OkSimulation
