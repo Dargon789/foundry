@@ -6,7 +6,7 @@
 
 // Use localStorage to store data about the tree's state: whether or not
 // the tree is visible and which directories are expanded. Unless the state
-var sidebarVisible = (window.localStorage && window.localStorage.docker_showSidebar) ?
+let sidebarVisible = (window.localStorage && window.localStorage.docker_showSidebar) ?
                         window.localStorage.docker_showSidebar == 'yes' :
                         defaultSidebar;
 
