@@ -4,7 +4,7 @@ use std::{
     env,
     fs::{self, File},
     io::{Read, Seek, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::LazyLock,
 };
@@ -257,7 +257,33 @@ fn copy_dir_filtered_inner(
                 "attempted to access path outside of allowed source base directory",
             ));
         }
-        let dst_path = dst.join(entry.file_name());
+        let relative_src_path = canonical_src_path.strip_prefix(base_src).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "failed to derive relative path within source base directory",
+            )
+        })?;
+        for component in relative_src_path.components() {
+            match component {
+                Component::Normal(name) => {
+                    let name = name.to_string_lossy();
+                    if name.contains("..") || name.contains('/') || name.contains('\\') {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "invalid path component in source entry",
+                        ));
+                    }
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "attempted to access path outside of allowed source base directory",
+                    ));
+                }
+            }
+        }
+        let dst_path = base_dst.join(relative_src_path);
 
         if ty.is_dir() {
             // Skip build artifact directories at the root level

@@ -23,7 +23,7 @@ use foundry_cli::{
 use foundry_common::{EmptyTestFilter, TestFunctionExt, compile::ProjectCompiler, fs, shell};
 use foundry_compilers::{
     ProjectCompileOutput,
-    artifacts::{Libraries, output_selection::OutputSelection},
+    artifacts::output_selection::OutputSelection,
     compilers::{
         Language,
         multi::{MultiCompiler, MultiCompilerLanguage},
@@ -40,16 +40,11 @@ use foundry_config::{
 };
 use foundry_debugger::Debugger;
 use foundry_evm::{
-    core::evm::{
-        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, OpEvmNetwork, SpecFor, TempoEvmNetwork,
-        TxEnvFor,
-    },
     opts::EvmOpts,
     traces::{backtrace::BacktraceBuilder, identifier::TraceIdentifiers, prune_trace_depth},
 };
 use rand::Rng;
 use regex::Regex;
-use revm::context::Transaction;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write,
@@ -320,10 +315,13 @@ impl TestArgs {
         let should_debug = self.debug;
         let should_draw = self.flamegraph || self.flamechart;
 
-        // Determine executor verbosity.
+        // Determine print verbosity and executor verbosity.
+        let verbosity = evm_opts.verbosity;
         if (self.gas_report && evm_opts.verbosity < 3) || self.flamegraph || self.flamechart {
             evm_opts.verbosity = 3;
         }
+
+        let env = evm_opts.env().await?;
 
         // Enable internal tracing for more informative flamegraph.
         if should_draw && !self.decode_internal {
@@ -339,44 +337,23 @@ impl TestArgs {
             InternalTraceMode::None
         };
 
-        // Auto-detect network from fork chain ID when not explicitly configured.
-        evm_opts.infer_network_from_fork().await;
+        // Prepare the test builder.
+        let config = Arc::new(config);
+        let runner = MultiContractRunnerBuilder::new(config.clone())
+            .set_debug(should_debug)
+            .set_decode_internal(decode_internal)
+            .initial_balance(evm_opts.initial_balance)
+            .evm_spec(config.evm_spec_id())
+            .sender(evm_opts.sender)
+            .with_fork(evm_opts.get_fork(&config, env.evm_env.clone()))
+            .enable_isolation(evm_opts.isolate)
+            .networks(evm_opts.networks)
+            .fail_fast(self.fail_fast)
+            .set_coverage(coverage)
+            .build::<MultiCompiler>(output, env, evm_opts)?;
 
-        // Dispatch based on network type.
-        let (libraries, mut outcome) = if evm_opts.networks.is_tempo() {
-            self.build_and_run_tests::<TempoEvmNetwork>(
-                config,
-                evm_opts,
-                output,
-                filter,
-                coverage,
-                should_debug,
-                decode_internal,
-            )
-            .await?
-        } else if evm_opts.networks.is_optimism() {
-            self.build_and_run_tests::<OpEvmNetwork>(
-                config,
-                evm_opts,
-                output,
-                filter,
-                coverage,
-                should_debug,
-                decode_internal,
-            )
-            .await?
-        } else {
-            self.build_and_run_tests::<EthEvmNetwork>(
-                config,
-                evm_opts,
-                output,
-                filter,
-                coverage,
-                should_debug,
-                decode_internal,
-            )
-            .await?
-        };
+        let libraries = runner.libraries.clone();
+        let mut outcome = self.run_tests_inner(runner, config, verbosity, filter, output).await?;
 
         if should_draw {
             let (suite_name, test_name, mut test_result) =
@@ -450,43 +427,10 @@ impl TestArgs {
         Ok(outcome)
     }
 
-    /// Build the test runner and execute tests for a specific network type.
-    #[allow(clippy::too_many_arguments)]
-    async fn build_and_run_tests<FEN: FoundryEvmNetwork>(
-        &self,
-        config: Config,
-        evm_opts: EvmOpts,
-        output: &ProjectCompileOutput,
-        filter: &ProjectPathsAwareFilter,
-        coverage: bool,
-        should_debug: bool,
-        decode_internal: InternalTraceMode,
-    ) -> eyre::Result<(Libraries, TestOutcome)> {
-        let verbosity = evm_opts.verbosity;
-        let (evm_env, tx_env, fork_block) =
-            evm_opts.env::<SpecFor<FEN>, BlockEnvFor<FEN>, TxEnvFor<FEN>>().await?;
-
-        let config = Arc::new(config);
-        let runner = MultiContractRunnerBuilder::new(config.clone())
-            .set_debug(should_debug)
-            .set_decode_internal(decode_internal)
-            .initial_balance(evm_opts.initial_balance)
-            .sender(evm_opts.sender)
-            .with_fork(evm_opts.get_fork(&config, evm_env.cfg_env.chain_id, fork_block))
-            .enable_isolation(evm_opts.isolate)
-            .fail_fast(self.fail_fast)
-            .set_coverage(coverage)
-            .build::<FEN, MultiCompiler>(output, evm_env, tx_env, evm_opts)?;
-
-        let libraries = runner.libraries.clone();
-        let outcome = self.run_tests_inner(runner, config, verbosity, filter, output).await?;
-        Ok((libraries, outcome))
-    }
-
     /// Run all tests that matches the filter predicate from a test runner
-    async fn run_tests_inner<FEN: FoundryEvmNetwork>(
+    async fn run_tests_inner(
         &self,
-        mut runner: MultiContractRunner<FEN>,
+        mut runner: MultiContractRunner,
         config: Arc<Config>,
         verbosity: u8,
         filter: &ProjectPathsAwareFilter,
@@ -505,11 +449,10 @@ impl TestArgs {
         let num_filtered = runner.matching_test_functions(filter).count();
 
         if num_filtered == 0 {
-            let total_tests = if filter.is_empty() {
-                num_filtered
-            } else {
-                runner.matching_test_functions(&EmptyTestFilter::default()).count()
-            };
+            let mut total_tests = num_filtered;
+            if !filter.is_empty() {
+                total_tests = runner.matching_test_functions(&EmptyTestFilter::default()).count();
+            }
             if total_tests == 0 {
                 sh_println!(
                     "No tests found in project! Forge looks for functions that start with `test`"
@@ -527,7 +470,7 @@ impl TestArgs {
                 }
                 sh_warn!("{msg}")?;
             }
-            return Ok(TestOutcome::empty(Some(runner.known_contracts.clone()), false));
+            return Ok(TestOutcome::empty(Some(runner), false));
         }
 
         if num_filtered != 1 && (self.debug || self.flamegraph || self.flamechart) {
@@ -569,19 +512,17 @@ impl TestArgs {
                 }
             }
             sh_println!("{}", serde_json::to_string(&results)?)?;
-            let kc = runner.known_contracts.clone();
-            return Ok(TestOutcome::new(Some(kc), results, self.allow_failure, fuzz_seed));
+            return Ok(TestOutcome::new(Some(runner), results, self.allow_failure, fuzz_seed));
         }
 
         if self.junit {
             let results = runner.test_collect(filter)?;
             sh_println!("{}", junit_xml_report(&results, verbosity).to_string()?)?;
-            let kc = runner.known_contracts.clone();
-            return Ok(TestOutcome::new(Some(kc), results, self.allow_failure, fuzz_seed));
+            return Ok(TestOutcome::new(Some(runner), results, self.allow_failure, fuzz_seed));
         }
 
         let remote_chain =
-            if runner.fork.is_some() { runner.tx_env.chain_id().map(Into::into) } else { None };
+            if runner.fork.is_some() { runner.env.tx.chain_id.map(Into::into) } else { None };
         let known_contracts = runner.known_contracts.clone();
 
         let libraries = runner.libraries.clone();
@@ -609,8 +550,7 @@ impl TestArgs {
         let mut builder = CallTraceDecoderBuilder::new()
             .with_known_contracts(&known_contracts)
             .with_label_disabled(self.disable_labels)
-            .with_verbosity(verbosity)
-            .with_chain_id(remote_chain.map(|c| c.id()));
+            .with_verbosity(verbosity);
         // Signatures are of no value for gas reports.
         if !self.gas_report {
             builder =
@@ -742,9 +682,7 @@ impl TestArgs {
                     }
                 }
 
-                // Extract and display backtrace for failed tests when verbosity >= 3.
-                // At verbosity 3-4 backtraces show contract/function names only.
-                // At verbosity 5 backtraces include source file locations.
+                // Extract and display backtrace for failed tests when verbosity >= 3
                 if !silent
                     && result.status.is_failure()
                     && verbosity >= 3
@@ -828,9 +766,14 @@ impl TestArgs {
                                 .iter()
                                 .filter_map(|(k, v)| {
                                     previous_snapshots.get(k).and_then(|previous_snapshot| {
-                                        (previous_snapshot != v).then(|| {
-                                            (k.clone(), (previous_snapshot.clone(), v.clone()))
-                                        })
+                                        if previous_snapshot != v {
+                                            Some((
+                                                k.clone(),
+                                                (previous_snapshot.clone(), v.clone()),
+                                            ))
+                                        } else {
+                                            None
+                                        }
                                     })
                                 })
                                 .collect();
@@ -920,10 +863,7 @@ impl TestArgs {
 
         // Reattach the task.
         match handle.await {
-            Ok(result) => {
-                let runner = result?;
-                outcome.known_contracts = Some(runner.known_contracts);
-            }
+            Ok(result) => outcome.runner = Some(result?),
             Err(e) => match e.try_into_panic() {
                 Ok(payload) => std::panic::resume_unwind(payload),
                 Err(e) => return Err(e.into()),
@@ -954,7 +894,7 @@ impl TestArgs {
     }
 
     /// Returns whether `BuildArgs` was configured with `--watch`
-    pub const fn is_watch(&self) -> bool {
+    pub fn is_watch(&self) -> bool {
         self.watch.watch.is_some()
     }
 
@@ -993,7 +933,7 @@ impl Provider for TestArgs {
         if let Some(etherscan_api_key) =
             self.etherscan_api_key.as_ref().filter(|s| !s.trim().is_empty())
         {
-            dict.insert("etherscan_api_key".to_string(), etherscan_api_key.clone().into());
+            dict.insert("etherscan_api_key".to_string(), etherscan_api_key.to_string().into());
         }
 
         if self.show_progress {
@@ -1005,10 +945,7 @@ impl Provider for TestArgs {
 }
 
 /// Lists all matching tests
-fn list<FEN: FoundryEvmNetwork>(
-    runner: MultiContractRunner<FEN>,
-    filter: &ProjectPathsAwareFilter,
-) -> Result<TestOutcome> {
+fn list(runner: MultiContractRunner, filter: &ProjectPathsAwareFilter) -> Result<TestOutcome> {
     let results = runner.list(filter);
 
     if shell::is_json() {
@@ -1022,7 +959,7 @@ fn list<FEN: FoundryEvmNetwork>(
             }
         }
     }
-    Ok(TestOutcome::empty(Some(runner.known_contracts), false))
+    Ok(TestOutcome::empty(Some(runner), false))
 }
 
 /// Load persisted filter (with last test run failures) from file.
@@ -1047,7 +984,7 @@ fn persist_run_failures(config: &Config, outcome: &TestOutcome) {
         let mut failures = outcome.failures().peekable();
         while let Some((test_name, _)) = failures.next() {
             if test_name.is_any_test()
-                && let Some(test_match) = test_name.split('(').next()
+                && let Some(test_match) = test_name.split("(").next()
             {
                 filter.push_str(test_match);
                 if failures.peek().is_some() {

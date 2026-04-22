@@ -18,9 +18,8 @@ use foundry_compilers::{
     info::ContractInfo,
     utils::source_files_iter,
 };
-use foundry_evm::{core::evm::FoundryEvmNetwork, traces::debug::ContractSources};
+use foundry_evm::traces::debug::ContractSources;
 use foundry_linking::Linker;
-use foundry_wallets::wallet_browser::signer::BrowserSigner;
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 /// Container for the compiled contracts.
@@ -41,10 +40,7 @@ impl BuildData {
 
     /// Links contracts. Uses CREATE2 linking when possible, otherwise falls back to
     /// default linking with sender nonce and address.
-    pub async fn link<FEN: FoundryEvmNetwork>(
-        self,
-        script_config: &ScriptConfig<FEN>,
-    ) -> Result<LinkedBuildData> {
+    pub async fn link(self, script_config: &ScriptConfig) -> Result<LinkedBuildData> {
         let create2_deployer = script_config.evm_opts.create2_deployer;
         let can_use_create2 = if let Some(fork_url) = &script_config.evm_opts.fork_url {
             let provider = ProviderBuilder::<AnyNetwork>::new(fork_url).build()?;
@@ -107,7 +103,7 @@ pub enum ScriptPredeployLibraries {
 }
 
 impl ScriptPredeployLibraries {
-    pub const fn libraries_count(&self) -> usize {
+    pub fn libraries_count(&self) -> usize {
         match self {
             Self::Default(libs) => libs.len(),
             Self::Create2(libs, _) => libs.len(),
@@ -157,18 +153,17 @@ impl LinkedBuildData {
 }
 
 /// First state basically containing only inputs of the user.
-pub struct PreprocessedState<FEN: FoundryEvmNetwork> {
+pub struct PreprocessedState {
     pub args: ScriptArgs,
-    pub script_config: ScriptConfig<FEN>,
+    pub script_config: ScriptConfig,
     pub script_wallets: Wallets,
-    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
 }
 
-impl<FEN: FoundryEvmNetwork> PreprocessedState<FEN> {
+impl PreprocessedState {
     /// Parses user input and compiles the contracts depending on script target.
     /// After compilation, finds exact [ArtifactId] of the target contract.
-    pub fn compile(self) -> Result<CompiledState<FEN>> {
-        let Self { args, script_config, script_wallets, browser_wallet } = self;
+    pub fn compile(self) -> Result<CompiledState> {
+        let Self { args, script_config, script_wallets } = self;
         let project = script_config.config.project()?;
 
         let mut target_name = args.target_contract.clone();
@@ -188,11 +183,12 @@ impl<FEN: FoundryEvmNetwork> PreprocessedState<FEN> {
             }
         };
 
+        #[expect(clippy::redundant_clone)]
         let sources_to_compile = source_files_iter(
             project.paths.sources.as_path(),
             MultiCompilerLanguage::FILE_EXTENSIONS,
         )
-        .chain([target_path.clone()]);
+        .chain([target_path.to_path_buf()]);
 
         let output = ProjectCompiler::new().files(sources_to_compile).compile(&project)?;
 
@@ -236,33 +232,31 @@ impl<FEN: FoundryEvmNetwork> PreprocessedState<FEN> {
             args,
             script_config,
             script_wallets,
-            browser_wallet,
             build_data: BuildData { output, target, project_root: project.root().to_path_buf() },
         })
     }
 }
 
 /// State after we have determined and compiled target contract to be executed.
-pub struct CompiledState<FEN: FoundryEvmNetwork> {
+pub struct CompiledState {
     pub args: ScriptArgs,
-    pub script_config: ScriptConfig<FEN>,
+    pub script_config: ScriptConfig,
     pub script_wallets: Wallets,
-    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
     pub build_data: BuildData,
 }
 
-impl<FEN: FoundryEvmNetwork> CompiledState<FEN> {
+impl CompiledState {
     /// Uses provided sender address to compute library addresses and link contracts with them.
-    pub async fn link(self) -> Result<LinkedState<FEN>> {
-        let Self { args, script_config, script_wallets, browser_wallet, build_data } = self;
+    pub async fn link(self) -> Result<LinkedState> {
+        let Self { args, script_config, script_wallets, build_data } = self;
 
         let build_data = build_data.link(&script_config).await?;
 
-        Ok(LinkedState { args, script_config, script_wallets, browser_wallet, build_data })
+        Ok(LinkedState { args, script_config, script_wallets, build_data })
     }
 
     /// Tries loading the resumed state from the cache files, skipping simulation stage.
-    pub async fn resume(self) -> Result<BundledState<FEN>> {
+    pub async fn resume(self) -> Result<BundledState> {
         let chain = if self.args.multi {
             None
         } else {
@@ -291,49 +285,35 @@ impl<FEN: FoundryEvmNetwork> CompiledState<FEN> {
             }
         };
 
-        let (args, build_data, script_wallets, browser_wallet, script_config) =
-            if self.args.unlocked {
+        let (args, build_data, script_wallets, script_config) = if !self.args.unlocked {
+            let mut froms = sequence.sequences().iter().flat_map(|s| {
+                s.transactions
+                    .iter()
+                    .skip(s.receipts.len())
+                    .map(|t| t.transaction.from().expect("from is missing in script artifact"))
+            });
+
+            let available_signers = self
+                .script_wallets
+                .signers()
+                .map_err(|e| eyre::eyre!("Failed to get available signers: {}", e))?;
+
+            if !froms.all(|from| available_signers.contains(&from)) {
+                // IF we are missing required signers, execute script as we might need to collect
+                // private keys from the execution.
+                let executed = self.link().await?.prepare_execution().await?.execute().await?;
                 (
-                    self.args,
-                    self.build_data,
-                    self.script_wallets,
-                    self.browser_wallet,
-                    self.script_config,
+                    executed.args,
+                    executed.build_data.build_data,
+                    executed.script_wallets,
+                    executed.script_config,
                 )
             } else {
-                let mut froms = sequence.sequences().iter().flat_map(|s| {
-                    s.transactions
-                        .iter()
-                        .skip(s.receipts.len())
-                        .map(|t| t.transaction.from().expect("from is missing in script artifact"))
-                });
-
-                let available_signers = self
-                    .script_wallets
-                    .signers()
-                    .map_err(|e| eyre::eyre!("Failed to get available signers: {}", e))?;
-
-                if froms.all(|from| available_signers.contains(&from)) {
-                    (
-                        self.args,
-                        self.build_data,
-                        self.script_wallets,
-                        self.browser_wallet,
-                        self.script_config,
-                    )
-                } else {
-                    // IF we are missing required signers, execute script as we might need to
-                    // collect private keys from the execution.
-                    let executed = self.link().await?.prepare_execution().await?.execute().await?;
-                    (
-                        executed.args,
-                        executed.build_data.build_data,
-                        executed.script_wallets,
-                        executed.browser_wallet,
-                        executed.script_config,
-                    )
-                }
-            };
+                (self.args, self.build_data, self.script_wallets, self.script_config)
+            }
+        } else {
+            (self.args, self.build_data, self.script_wallets, self.script_config)
+        };
 
         // Collect libraries from sequence and link contracts with them.
         let libraries = match sequence {
@@ -348,17 +328,12 @@ impl<FEN: FoundryEvmNetwork> CompiledState<FEN> {
             args,
             script_config,
             script_wallets,
-            browser_wallet,
             build_data: linked_build_data,
             sequence,
         })
     }
 
-    fn try_load_sequence(
-        &self,
-        chain: Option<u64>,
-        dry_run: bool,
-    ) -> Result<ScriptSequenceKind<FEN::Network>> {
+    fn try_load_sequence(&self, chain: Option<u64>, dry_run: bool) -> Result<ScriptSequenceKind> {
         if let Some(chain) = chain {
             let sequence = ScriptSequence::load(
                 &self.script_config.config,
