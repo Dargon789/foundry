@@ -14,7 +14,7 @@ use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use foundry_cli::{
     opts::NetworkVariant,
     utils::{self, LoadConfig},
@@ -686,7 +686,10 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let provider = utils::get_provider(&config)?;
 
             let who = stdin::unwrap_line(who)?;
-            let address = provider.resolve_name(&who).await?;
+            let address = provider
+                .resolve_name(&who)
+                .await
+                .wrap_err(format!("Failed to resolve ENS name: {who}"))?;
             if verify {
                 let name = provider.lookup_address(&address).await?;
                 eyre::ensure!(
@@ -798,7 +801,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 }
                 _ => SimpleCast::decode_raw_transaction::<Ethereum>(&tx)?,
             };
-            sh_println!("{}", serde_json::to_string_pretty(&decoded_tx)?)?;
+            sh_println!("{decoded_tx}")?;
         }
         CastSubcommand::RecoverAuthority { auth } => {
             let auth: SignedAuthorization = serde_json::from_str(&auth)?;

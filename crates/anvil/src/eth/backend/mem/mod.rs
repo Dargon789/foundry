@@ -54,9 +54,9 @@ use alloy_evm::{
 };
 use alloy_network::{
     AnyHeader, AnyRpcBlock, AnyRpcHeader, AnyRpcTransaction, AnyTxEnvelope, AnyTxType, Network,
-    ReceiptResponse, TransactionBuilder, UnknownTxEnvelope, UnknownTypedTransaction,
+    NetworkTransactionBuilder, ReceiptResponse, UnknownTxEnvelope, UnknownTypedTransaction,
 };
-use alloy_op_evm::OpEvmFactory;
+use alloy_op_evm::{OpEvmFactory, OpTx};
 use alloy_primitives::{
     Address, B256, Bloom, Bytes, TxHash, TxKind, U64, U256, hex, keccak256, logs_bloom,
     map::{AddressMap, HashMap, HashSet},
@@ -119,7 +119,7 @@ use revm::{
     context::{Block as RevmBlock, BlockEnv, Cfg, TxEnv},
     context_interface::{
         block::BlobExcessGasAndPrice,
-        result::{ExecutionResult, HaltReason, Output, ResultAndState},
+        result::{EVMError, ExecutionResult, HaltReason, Output, ResultAndState},
     },
     database::{CacheDB, DbAccount, WrapDatabaseRef},
     interpreter::InstructionResult,
@@ -246,7 +246,7 @@ pub struct Backend<N: Network> {
     prune_state_history_config: PruneStateHistoryConfig,
     /// max number of blocks with transactions in memory
     transaction_block_keeper: Option<usize>,
-    node_config: Arc<AsyncRwLock<NodeConfig>>,
+    pub(crate) node_config: Arc<AsyncRwLock<NodeConfig>>,
     /// Slots in an epoch
     slots_in_an_epoch: u64,
     /// Precompiles to inject to the EVM.
@@ -1152,7 +1152,13 @@ impl<N: Network> Backend<N> {
                 inspector,
             );
             self.inject_precompiles(evm.precompiles_mut());
-            let result = evm.transact(tx_env)?;
+            let result = evm.transact(OpTx(tx_env)).map_err(|e| match e {
+                EVMError::Database(db) => EVMError::Database(db),
+                EVMError::Header(h) => EVMError::Header(h),
+                EVMError::Custom(s) => EVMError::Custom(s),
+                EVMError::CustomAny(err) => EVMError::CustomAny(err),
+                EVMError::Transaction(t) => EVMError::Transaction(t),
+            })?;
             Ok(ResultAndState {
                 result: result.result.map_haltreason(|h| match h {
                     OpHaltReason::Base(eth) => eth,
@@ -1290,7 +1296,8 @@ impl<N: Network> Backend<N> {
                 evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(OpSpecId::ISTHMUS),
                 evm_env.block_env.clone(),
             );
-            let mut evm = OpEvmFactory::default().create_evm_with_inspector(db, op_env, inspector);
+            let mut evm =
+                OpEvmFactory::<OpTx>::default().create_evm_with_inspector(db, op_env, inspector);
             run!(evm)
         } else if self.is_tempo() {
             let hardfork = TempoHardfork::from(self.hardfork);
@@ -2072,6 +2079,7 @@ impl<N: Network> Backend<N> {
                     // we want to force the correct base fee for the next block during
                     // `setup_fork_db_config`
                     node_config.base_fee.take();
+                    node_config.fork_urls = vec![eth_rpc_url.clone()];
 
                     node_config.setup_fork_db_config(eth_rpc_url, &mut evm_env, &self.fees).await?
                 };
@@ -2094,7 +2102,9 @@ impl<N: Network> Backend<N> {
             let block_number =
                 forking.block_number.map(BlockNumber::from).unwrap_or(BlockNumber::Latest);
             // reset the fork entirely and reapply the genesis config
-            fork.reset(forking.json_rpc_url.clone(), block_number).await?;
+            let reset_urls =
+                forking.json_rpc_url.as_ref().map(|url| vec![url.clone()]).unwrap_or_default();
+            fork.reset(reset_urls, block_number).await?;
             let fork_block_number = fork.block_number();
             let fork_block = fork
                 .block_by_number(fork_block_number)
@@ -2108,7 +2118,8 @@ impl<N: Network> Backend<N> {
                     // If rpc url is unspecified, then update the fork with the new block number and
                     // existing rpc url, this updates the cache path
                     {
-                        let maybe_fork_url = { self.node_config.read().await.eth_rpc_url.clone() };
+                        let maybe_fork_url =
+                            { self.node_config.read().await.fork_urls.first().cloned() };
                         if let Some(fork_url) = maybe_fork_url {
                             self.reset_block_number(fork_url, fork_block_number).await?;
                         }
@@ -2222,6 +2233,8 @@ impl<N: Network> Backend<N> {
     ) -> Result<(), BlockchainError> {
         let mut node_config = self.node_config.write().await;
         node_config.fork_choice = Some(ForkChoice::Block(fork_block_number as i128));
+        // Update fork_urls so setup_fork_db_config uses the correct URL set
+        node_config.fork_urls = vec![fork_url.clone()];
 
         let mut evm_env = self.evm_env.read().clone();
         let (forked_db, client_fork_config) =
@@ -2364,7 +2377,7 @@ where
             return Ok(fork.logs(&filter).await?);
         }
 
-        Ok(Vec::new())
+        Err(BlockchainError::UnknownBlock)
     }
 
     /// Returns the logs that match the filter in the given range of blocks
@@ -2497,6 +2510,8 @@ where
             excess_blob_gas: if is_cancun { evm_env.block_env.blob_excess_gas() } else { None },
             withdrawals_root: is_shanghai.then_some(EMPTY_WITHDRAWALS),
             requests_hash: is_prague.then_some(EMPTY_REQUESTS_HASH),
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         let block = create_block(header, transactions);
@@ -2909,7 +2924,7 @@ where
 
                             Ok(tracing_inspector
                                 .into_geth_builder()
-                                .geth_call_traces(call_config, result.gas_used())
+                                .geth_call_traces(call_config, result.tx_gas_used())
                                 .into())
                         }
                         GethDebugBuiltInTracerType::PreStateTracer => {
@@ -2966,7 +2981,7 @@ where
                             tx_env.clone(),
                         )?;
                         let res = inspector
-                            .json_result(result, &tx_env.into_tx_env(), &block, &cache_db)
+                            .json_result(result, &OpTx(tx_env).into_tx_env(), &block, &cache_db)
                             .map_err(|err| BlockchainError::Message(err.to_string()))?;
 
                         Ok(GethTrace::JS(res))
@@ -3909,7 +3924,7 @@ impl Backend<FoundryNetwork> {
 
                     // commit the transaction
                     cache_db.commit(state);
-                    gas_used += result.gas_used();
+                    gas_used += result.tx_gas_used();
 
                     // create the transaction from a request
                     let from = request.from.unwrap_or_default();
@@ -3933,7 +3948,8 @@ impl Backend<FoundryNetwork> {
                     let return_data = result.output().cloned().unwrap_or_default();
                     let sim_res = SimCallResult {
                         return_data,
-                        gas_used: result.gas_used(),
+                        gas_used: result.tx_gas_used(),
+                        max_used_gas: None,
                         status: result.is_success(),
                         error: result.is_success().not().then(|| {
                             alloy_rpc_types::simulate::SimulateError {
@@ -4085,7 +4101,7 @@ where
 
             // Reject if valid_before is expired or too close to current time (< 3 seconds)
             const AA_VALID_BEFORE_MIN_SECS: u64 = 3;
-            if let Some(valid_before) = tempo_tx.valid_before {
+            if let Some(valid_before) = tempo_tx.valid_before.map(|v| v.get()) {
                 let min_allowed = current_time.saturating_add(AA_VALID_BEFORE_MIN_SECS);
                 if valid_before <= min_allowed {
                     return Err(InvalidTransactionError::TempoValidBeforeExpired {
@@ -4098,7 +4114,7 @@ where
 
             // Reject if valid_after is too far in the future (> 1 hour)
             const AA_VALID_AFTER_MAX_SECS: u64 = 3600;
-            if let Some(valid_after) = tempo_tx.valid_after {
+            if let Some(valid_after) = tempo_tx.valid_after.map(|v| v.get()) {
                 let max_allowed = current_time.saturating_add(AA_VALID_AFTER_MAX_SECS);
                 if valid_after > max_allowed {
                     return Err(InvalidTransactionError::TempoValidAfterTooFar {
@@ -4515,13 +4531,13 @@ fn unpack_execution_result<H: IntoInstructionResult>(
 ) -> (InstructionResult, u64, Option<Output>, Vec<revm::primitives::Log>) {
     match result {
         ExecutionResult::Success { reason, gas, output, logs, .. } => {
-            (reason.into(), gas.used(), Some(output), logs)
+            (reason.into(), gas.tx_gas_used(), Some(output), logs)
         }
         ExecutionResult::Revert { gas, output, logs, .. } => {
-            (InstructionResult::Revert, gas.used(), Some(Output::Call(output)), logs)
+            (InstructionResult::Revert, gas.tx_gas_used(), Some(Output::Call(output)), logs)
         }
         ExecutionResult::Halt { reason, gas, logs, .. } => {
-            (reason.into_instruction_result(), gas.used(), None, logs)
+            (reason.into_instruction_result(), gas.tx_gas_used(), None, logs)
         }
     }
 }
