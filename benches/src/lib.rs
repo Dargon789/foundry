@@ -127,6 +127,7 @@ impl BenchmarkProject {
         let root = root_path.to_str().unwrap();
 
         // Remove all files in the directory
+        let root_path = root_path.canonicalize()?;
         for entry in std::fs::read_dir(&root_path)? {
             let entry = entry?;
             let path = entry.path();
