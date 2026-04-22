@@ -40,8 +40,7 @@ mod tests {
     /// Checks that the `file` has the specified `contents`. If that is not the
     /// case, updates the file and then fails the test.
     fn ensure_file_contents(file: &Path, contents: &str) {
-        if let Ok(old_contents) = fs::read_to_string(file)
-            && normalize_newlines(&old_contents) == normalize_newlines(contents)
+        if fs::read_to_string(file).map(|old| normalize_newlines(&old) == normalize_newlines(contents)).unwrap_or(false)
         {
             // File is already up to date.
             return;
