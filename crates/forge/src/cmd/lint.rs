@@ -67,7 +67,7 @@ impl LintArgs {
                         inputs
                             .extend(foundry_compilers::utils::source_files(path, SOLC_EXTENSIONS));
                     } else if path.is_sol() {
-                        inputs.push(path.to_path_buf());
+                        inputs.push(path.clone());
                     } else {
                         warn!("cannot process path {}", path.display());
                     }
@@ -105,7 +105,7 @@ impl LintArgs {
             .with_lints(include)
             .without_lints(exclude)
             .with_severity(if severity.is_empty() { None } else { Some(severity) })
-            .with_mixed_case_exceptions(&config.lint.mixed_case_exceptions);
+            .with_lint_specific(&config.lint.lint_specific);
 
         let output = ProjectCompiler::new().files(input.iter().cloned()).compile(&project)?;
         let solar_sources =
