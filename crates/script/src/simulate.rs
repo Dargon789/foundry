@@ -71,7 +71,7 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
 
                 let mut builder = ScriptTransactionBuilder::new(tx.transaction, rpc);
 
-                if to.is_some() {
+                if let Some(alloy_primitives::TxKind::Call(_)) = to {
                     builder.set_call(
                         &address_to_abi,
                         &self.execution_artifacts.decoder,
