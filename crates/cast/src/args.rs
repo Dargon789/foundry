@@ -801,7 +801,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 }
                 _ => SimpleCast::decode_raw_transaction::<Ethereum>(&tx)?,
             };
-            sh_println!("{decoded_tx}")?;
+            sh_println!("{}", serde_json::to_string_pretty(&decoded_tx)?)?;
         }
         CastSubcommand::RecoverAuthority { auth } => {
             let auth: SignedAuthorization = serde_json::from_str(&auth)?;
