@@ -2,14 +2,13 @@
 //! WebSocket, or IPC transport. Retries are handled by a client layer (e.g.,
 //! `RetryBackoffLayer`) when used.
 
-use crate::{DEFAULT_USER_AGENT, REQUEST_TIMEOUT};
+use crate::{DEFAULT_USER_AGENT, REQUEST_TIMEOUT, provider::mpp::transport::LazyMppHttpTransport};
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_pubsub::{PubSubConnect, PubSubFrontend};
-use alloy_rpc_types::engine::{Claims, JwtSecret};
+use alloy_rpc_types_engine::{Claims, JwtSecret};
 use alloy_transport::{
     Authorization, BoxTransport, TransportError, TransportErrorKind, TransportFut,
 };
-use alloy_transport_http::Http;
 use alloy_transport_ipc::IpcConnect;
 use alloy_transport_ws::WsConnect;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -23,8 +22,8 @@ use url::Url;
 /// Only meant to be used internally by [RuntimeTransport].
 #[derive(Clone, Debug)]
 pub enum InnerTransport {
-    /// HTTP transport
-    Http(Http<reqwest::Client>),
+    /// HTTP transport with lazy MPP 402 handling
+    Http(LazyMppHttpTransport),
     /// WebSocket transport
     Ws(PubSubFrontend),
     /// IPC transport
@@ -80,6 +79,8 @@ pub struct RuntimeTransport {
     timeout: std::time::Duration,
     /// Whether to accept invalid certificates.
     accept_invalid_certs: bool,
+    /// Whether to disable automatic proxy detection.
+    no_proxy: bool,
 }
 
 /// A builder for [RuntimeTransport].
@@ -90,17 +91,19 @@ pub struct RuntimeTransportBuilder {
     jwt: Option<String>,
     timeout: std::time::Duration,
     accept_invalid_certs: bool,
+    no_proxy: bool,
 }
 
 impl RuntimeTransportBuilder {
     /// Create a new builder with the given URL.
-    pub fn new(url: Url) -> Self {
+    pub const fn new(url: Url) -> Self {
         Self {
             url,
             headers: vec![],
             jwt: None,
             timeout: REQUEST_TIMEOUT,
             accept_invalid_certs: false,
+            no_proxy: false,
         }
     }
 
@@ -117,14 +120,23 @@ impl RuntimeTransportBuilder {
     }
 
     /// Set the timeout for the transport.
-    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub const fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Set whether to accept invalid certificates.
-    pub fn accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
+    pub const fn accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
         self.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Set whether to disable automatic proxy detection.
+    ///
+    /// This can help in sandboxed environments (e.g., Cursor IDE sandbox, macOS App Sandbox)
+    /// where system proxy detection via SCDynamicStore causes crashes.
+    pub const fn no_proxy(mut self, no_proxy: bool) -> Self {
+        self.no_proxy = no_proxy;
         self
     }
 
@@ -138,6 +150,7 @@ impl RuntimeTransportBuilder {
             jwt: self.jwt,
             timeout: self.timeout,
             accept_invalid_certs: self.accept_invalid_certs,
+            no_proxy: self.no_proxy,
         }
     }
 }
@@ -163,8 +176,15 @@ impl RuntimeTransport {
     pub fn reqwest_client(&self) -> Result<reqwest::Client, RuntimeTransportError> {
         let mut client_builder = reqwest::Client::builder()
             .timeout(self.timeout)
-            .tls_built_in_root_certs(self.url.scheme() == "https")
             .danger_accept_invalid_certs(self.accept_invalid_certs);
+
+        // Disable automatic proxy detection if requested. This helps in sandboxed environments
+        // (e.g., Cursor IDE sandbox, macOS App Sandbox) where system proxy detection via
+        // SCDynamicStore causes crashes. See: https://github.com/foundry-rs/foundry/issues/12733
+        if self.no_proxy {
+            client_builder = client_builder.no_proxy();
+        }
+
         let mut headers = reqwest::header::HeaderMap::new();
 
         // If there's a JWT, add it to the headers if we can decode it.
@@ -181,7 +201,7 @@ impl RuntimeTransport {
 
         // Add any custom headers.
         for header in &self.headers {
-            let make_err = || RuntimeTransportError::BadHeader(header.to_string());
+            let make_err = || RuntimeTransportError::BadHeader(header.clone());
 
             let (key, val) = header.split_once(':').ok_or_else(make_err)?;
 
@@ -199,15 +219,29 @@ impl RuntimeTransport {
             );
         }
 
+        // If MPP_API_KEY is set, attach it as x-api-key for gated MPP proxies.
+        // Does not override an explicit x-api-key header from the user.
+        if !headers.contains_key(HeaderName::from_static("x-api-key"))
+            && let Ok(api_key) = std::env::var("MPP_API_KEY")
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                let mut value = HeaderValue::from_str(api_key)
+                    .map_err(|_| RuntimeTransportError::BadHeader("MPP_API_KEY".to_string()))?;
+                value.set_sensitive(true);
+                headers.insert(HeaderName::from_static("x-api-key"), value);
+            }
+        }
+
         client_builder = client_builder.default_headers(headers);
 
         Ok(client_builder.build()?)
     }
 
-    /// Connects to an HTTP [alloy_transport_http::Http] transport.
+    /// Connects to an HTTP transport with lazy MPP 402 handling.
     fn connect_http(&self) -> Result<InnerTransport, RuntimeTransportError> {
         let client = self.reqwest_client()?;
-        Ok(InnerTransport::Http(Http::with_client(client, self.url.clone())))
+        Ok(InnerTransport::Http(LazyMppHttpTransport::lazy(client, self.url.clone())))
     }
 
     /// Connects to a WS transport.

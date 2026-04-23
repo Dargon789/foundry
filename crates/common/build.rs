@@ -2,17 +2,14 @@
 
 use chrono::DateTime;
 use std::{error::Error, path::PathBuf};
-use vergen::EmitBuilder;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    EmitBuilder::builder()
-        .build_date()
-        .build_timestamp()
-        .git_describe(false, true, None)
-        .git_sha(false)
-        .emit_and_set()?;
+    let build = vergen::Build::builder().build_date(true).build_timestamp(true).build();
+    let git = vergen::Gitcl::builder().describe(false, true, None).sha(false).build();
+
+    vergen::Emitter::new().add_instructions(&build)?.add_instructions(&git)?.emit_and_set()?;
 
     let sha = env_var("VERGEN_GIT_SHA");
     let sha_short = &sha[..10];
@@ -77,6 +74,11 @@ Build Profile: {profile}"
     for (i, line) in long_version.lines().enumerate() {
         println!("cargo:rustc-env=FOUNDRY_LONG_VERSION_{i}={line}");
     }
+
+    // The long SHA of the latest commit.
+    //
+    // Example: 5186142d3bb4d1be7bb4ade548b77c8e2270717e
+    println!("cargo:rustc-env=FOUNDRY_COMMIT_SHA={sha}");
 
     Ok(())
 }
