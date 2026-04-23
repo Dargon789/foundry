@@ -101,9 +101,27 @@ pub struct KeysFile {
 /// Uses `TEMPO_HOME` env var if set, otherwise `~/.tempo`.
 pub fn tempo_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var(TEMPO_HOME_ENV) {
-        return Some(PathBuf::from(home));
+        if is_safe_home_override(&home) {
+            return Some(PathBuf::from(home));
+        }
+        tracing::warn!(
+            env = TEMPO_HOME_ENV,
+            "ignoring unsafe TEMPO_HOME override; falling back to default"
+        );
     }
     dirs::home_dir().map(|h| h.join(DEFAULT_TEMPO_HOME))
+}
+
+/// Validates a Tempo home override from environment.
+///
+/// Accepts only a single relative path component (no separators, no `..`,
+/// and not absolute) to prevent path traversal / arbitrary path targeting.
+fn is_safe_home_override(home: &str) -> bool {
+    if home.trim().is_empty() || home.contains("..") || home.contains('/') || home.contains('\\') {
+        return false;
+    }
+    let p = std::path::Path::new(home);
+    p.components().count() == 1 && !p.is_absolute()
 }
 
 /// Returns the path to the Tempo wallet keys file.
