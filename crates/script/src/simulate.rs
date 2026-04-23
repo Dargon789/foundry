@@ -129,7 +129,7 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
                 let mut runner = runners.get(&transaction.rpc).expect("invalid rpc url").write();
                 let tx = transaction.tx_mut();
 
-                let to = tx.to();
+                let to = if let Some(alloy_primitives::TxKind::Call(to)) = tx.to() { Some(to) } else { None };
                 let result = runner
                     .simulate(
                         tx.from()
