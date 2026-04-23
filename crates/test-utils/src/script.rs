@@ -120,6 +120,7 @@ impl ScriptTester {
         let from_dir = testdata.join("utils");
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
+        let from_dir = from_dir.canonicalize()?;
         for entry in fs::read_dir(&from_dir)? {
             let file = entry?.path();
             // Only operate on regular files to avoid following symlinks or directories
@@ -247,11 +248,12 @@ impl ScriptTester {
 
         trace!(target: "tests", "STDOUT\n{stdout}\n\nSTDERR\n{stderr}");
 
-        assert!(
-            !(!stdout.contains(expected.as_str()) && !stderr.contains(expected.as_str())),
-            "--STDOUT--\n{stdout}\n\n--STDERR--\n{stderr}\n\n--EXPECTED--\n{:?} not found in stdout or stderr",
-            expected.as_str()
-        );
+        if !stdout.contains(expected.as_str()) && !stderr.contains(expected.as_str()) {
+            panic!(
+                "--STDOUT--\n{stdout}\n\n--STDERR--\n{stderr}\n\n--EXPECTED--\n{:?} not found in stdout or stderr",
+                expected.as_str()
+            );
+        }
 
         self
     }
