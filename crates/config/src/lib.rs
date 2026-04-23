@@ -1319,37 +1319,33 @@ impl Config {
         } else {
             project.root().join(&self.test_failures_file)
         };
-        if test_failures_path.starts_with(project.root()) {
-            if let Err(err) = fs::remove_file(&test_failures_path)
-                && err.kind() != io::ErrorKind::NotFound
-            {
+        let root_canon = dunce::canonicalize(project.root()).unwrap_or_else(|_| project.root().to_path_buf());
+        let validated_test_failures_path = test_failures_path
+            .parent()
+            .and_then(|parent| dunce::canonicalize(parent).ok().map(|p| (p, test_failures_path.file_name())))
+            .and_then(|(parent, file_name)| file_name.map(|name| parent.join(name)));
+
+        match validated_test_failures_path {
+            Some(path) if path.starts_with(&root_canon) => {
+                if let Err(err) = fs::remove_file(&path) && err.kind() != io::ErrorKind::NotFound {
+                    warnings.push(format!(
+                        "failed to remove test failures file {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            _ => {
                 warnings.push(format!(
-                    "failed to remove test failures file {}: {err}",
+                    "skipped removing test failures file outside project root: {}",
                     test_failures_path.display()
                 ));
             }
-        } else {
-            warnings.push(format!(
-                "skipping removal of test failures file outside project root: {}",
-                test_failures_path.display()
-            ));
         }
 
         // Remove fuzz and invariant cache directories.
         let mut remove_test_dir = |test_dir: &Option<PathBuf>| {
             if let Some(test_dir) = test_dir {
-                let path = if test_dir.is_absolute() {
-                    test_dir.clone()
-                } else {
-                    project.root().join(test_dir)
-                };
-                if !path.starts_with(project.root()) {
-                    warnings.push(format!(
-                        "skipping removal of test cache directory outside project root: {}",
-                        path.display()
-                    ));
-                    return;
-                }
+                let path = project.root().join(test_dir);
                 if let Err(err) = fs::remove_dir_all(&path)
                     && err.kind() != io::ErrorKind::NotFound
                 {

@@ -121,6 +121,7 @@ impl ScriptTester {
         let canonical_from_dir = from_dir.canonicalize()?;
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
+        let from_dir = from_dir.canonicalize()?;
         for entry in fs::read_dir(&from_dir)? {
             let file = entry?.path();
 

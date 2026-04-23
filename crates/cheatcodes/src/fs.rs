@@ -1129,14 +1129,15 @@ mod tests {
         assert_eq!(latest.contractAddress, address!("20c0000000000000000000000000000000000000"));
         assert!(latest.success);
 
-        let temp_root = env::temp_dir().canonicalize().unwrap();
-        let root_parent = root.parent().and_then(|p| p.canonicalize().ok()).unwrap();
-        let root_name_ok = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("foundry-cheatcodes-"))
-            .unwrap_or(false);
-        assert!(root_parent == temp_root && root_name_ok, "refusing to delete unexpected path");
-        stdfs::remove_dir_all(root).unwrap();
+        if root.exists() {
+            let root_canon = stdfs::canonicalize(&root).unwrap();
+            let temp_canon = stdfs::canonicalize(env::temp_dir()).unwrap();
+            assert!(
+                root_canon.starts_with(&temp_canon),
+                "refusing to remove non-temp test directory: {}",
+                root_canon.display()
+            );
+            stdfs::remove_dir_all(&root).unwrap();
+        }
     }
 }
