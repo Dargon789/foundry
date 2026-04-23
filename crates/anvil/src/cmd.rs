@@ -648,8 +648,8 @@ impl AnvilEvmArgs {
     pub fn resolve_rpc_alias(&mut self) {
         if let Ok(config) = Config::load_with_providers(FigmentProviders::Anvil) {
             let mut resolved_urls = Vec::new();
+            let mut endpoints = config.rpc_endpoints.clone().resolved();
             for fork_url in &self.fork_url {
-                let mut endpoints = config.rpc_endpoints.clone().resolved();
                 if let Some(endpoint) = endpoints.remove(&fork_url.url) {
                     // Alias matched — expand all URLs from the endpoint config
                     match endpoint.all_urls() {
