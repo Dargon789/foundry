@@ -12,6 +12,7 @@ members = [
     "crates/cli/",
     "crates/common/",
     "crates/config/",
+    "crates/config/spec/",
     "crates/debugger/",
     "crates/doc/",
     "crates/evm/core/",
@@ -326,6 +327,7 @@ foundry-cli-markdown = { path = "crates/cli-markdown" }
 foundry-common = { path = "crates/common" }
 foundry-common-fmt = { path = "crates/common/fmt" }
 foundry-config = { path = "crates/config" }
+foundry-config-spec = { path = "crates/config/spec" }
 foundry-debugger = { path = "crates/debugger" }
 foundry-evm = { path = "crates/evm/evm" }
 foundry-evm-abi = { path = "crates/evm/abi" }
