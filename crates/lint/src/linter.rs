@@ -19,7 +19,7 @@ use std::{ops::ControlFlow, path::PathBuf};
 ///
 /// # Required Methods
 ///
-/// - `lint`: Scans the provided source files emitting a diagnostic for lints found.
+/// - `lint`: Scans the provided source files emitting a daignostic for lints found.
 pub trait Linter: Send + Sync + Clone {
     type Language: Language;
     type Lint: Lint;
@@ -60,7 +60,7 @@ impl<'s> LintContext<'s> {
 }
 
 /// Trait for lints that operate directly on the AST.
-/// Its methods mirror `solar_ast::visit::Visit`, with the addition of `LintContext`.
+/// Its methods mirror `solar_ast::visit::Visit`, with the addition of `LintCotext`.
 pub trait EarlyLintPass<'ast>: Send + Sync {
     fn check_expr(&mut self, _ctx: &LintContext<'_>, _expr: &'ast Expr<'ast>) {}
     fn check_item_struct(&mut self, _ctx: &LintContext<'_>, _struct: &'ast ItemStruct<'ast>) {}
