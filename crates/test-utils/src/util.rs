@@ -3,11 +3,27 @@ use foundry_config::Config;
 use std::{
     env,
     fs::{self, File},
-    io::{Read, Seek, Write},
-    path::{Component, Path, PathBuf},
+    io::{self, IsTerminal, Read, Seek, Write},
+    path::{Path, PathBuf},
     process::Command,
     sync::LazyLock,
 };
+
+/// Base directory under which all test utility filesystem operations are constrained.
+/// Using a fixed directory under the system temp dir avoids trusting the current
+/// working directory (which may be user-controlled) as a security boundary.
+static TEST_UTIL_BASE: LazyLock<PathBuf> = LazyLock::new(|| {
+    // Resolve the system temp directory to an absolute, canonical path where possible.
+    // If canonicalization fails for any reason, fall back to the raw temp_dir value.
+    let tmp = env::temp_dir();
+    let mut base = tmp
+        .canonicalize()
+        .unwrap_or(tmp);
+    base.push("foundry_test_utils");
+    // Ignore errors here; they will surface when the path is actually used.
+    let _ = fs::create_dir_all(&base);
+    base
+});
 
 /// Directories to skip when copying project directories.
 /// These are build artifacts and runtime-generated files that should not be copied to temp
@@ -18,6 +34,9 @@ pub use crate::{ext::*, prj::*};
 
 /// The commit of forge-std to use.
 pub const FORGE_STD_REVISION: &str = include_str!("../../../testdata/forge-std-rev");
+
+/// Stores whether `stdout` is a tty / terminal.
+pub static IS_TTY: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
 
 /// Global default template path. Contains the global template project from which all other
 /// temp projects are initialized. See [`initialize()`] for more info.
@@ -146,7 +165,9 @@ pub fn get_compiled(project: &mut Project) -> ProjectCompileOutput {
     out = project.compile().unwrap();
     test_debug!("compiled {}", lock_file_path.display());
 
-    assert!(!out.has_compiler_errors(), "Compiled with errors:\n{out}");
+    if out.has_compiler_errors() {
+        panic!("Compiled with errors:\n{out}");
+    }
 
     if let Some(write) = &mut write {
         write.write_all(crate::fd_lock::LOCK_TOKEN).unwrap();
@@ -174,7 +195,7 @@ pub fn get_vyper() -> Vyper {
         let path = VYPER.as_path();
         let mut file = File::create(path).unwrap();
         if let Err(e) = file.try_lock() {
-            if matches!(e, fs::TryLockError::WouldBlock) {
+            if let fs::TryLockError::WouldBlock = e {
                 file.lock().unwrap();
                 assert!(path.exists());
                 return Vyper::new(path).unwrap();
@@ -230,121 +251,84 @@ pub fn read_string(path: impl AsRef<Path>) -> String {
 /// like `out/`, `cache/`, and `broadcast/` which are build artifacts that should not be
 /// copied to temporary test workspaces.
 pub fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    // Canonicalize the source once and treat it as the base directory for all traversal.
-    let base = src.canonicalize()?;
-    // Canonicalize the destination once and treat it as the base directory for all writes.
-    let dst_base = dst.canonicalize()?;
-    copy_dir_filtered_inner(src, dst, &base, &dst_base, true)
+    let src = resolve_and_validate_under_base(src)?;
+    let dst = resolve_and_validate_under_base(dst)?;
+
+    fs::create_dir_all(&dst)?;
+    copy_dir_filtered_inner(&src, &dst, true)
 }
 
-fn copy_dir_filtered_inner(
-    src: &Path,
-    dst: &Path,
-    base_src: &Path,
-    base_dst: &Path,
-    is_root: bool,
-) -> std::io::Result<()> {
-    for entry in fs::read_dir(src)? {
+/// Resolve a path against a safe base directory and ensure it does not escape that base.
+///
+/// This guards against using uncontrolled paths that could traverse outside the intended
+/// workspace (for example, via `..` components or absolute paths).
+fn resolve_and_validate_under_base(path: &Path) -> io::Result<PathBuf> {
+    // Use a fixed base directory for test utilities instead of the current working
+    // directory, which may be influenced by the environment.
+    let base = TEST_UTIL_BASE.clone();
+
+    // If `path` is absolute, interpret it relative to the base by stripping the
+    // root and joining the remaining components. This avoids treating arbitrary
+    // absolute paths as trustworthy.
+    let joined = if path.is_absolute() {
+        let relative_components = path.components().filter_map(|c| {
+            use std::path::Component;
+            match c {
+                Component::Normal(p) => Some(PathBuf::from(p)),
+                // Skip root and current-dir components; preserve parent-dir so that
+                // canonicalization below can detect and resolve them safely.
+                Component::RootDir | Component::CurDir => None,
+                Component::ParentDir => Some(PathBuf::from("..")),
+                Component::Prefix(_) => None,
+            }
+        });
+        let mut rel = PathBuf::new();
+        for c in relative_components {
+            rel.push(c);
+        }
+        base.join(rel)
+    } else {
+        base.join(path)
+    };
+
+    let canonical = joined.canonicalize()?;
+    if !canonical.starts_with(&base) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path escapes allowed base directory",
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn copy_dir_filtered_inner(src: &Path, dst: &Path, is_root: bool) -> std::io::Result<()> {
+    // Ensure that each recursion step operates on paths that are constrained to the
+    // configured base directory. This guarantees that any `src_path` passed to
+    // filesystem operations cannot escape the allowed workspace even if the initial
+    // input was influenced by the user.
+    let src = resolve_and_validate_under_base(src)?;
+    let dst = resolve_and_validate_under_base(dst)?;
+
+    for entry in fs::read_dir(&src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
-        let src_path = entry.path();
-        // Ensure that any path we operate on stays within the original source base directory.
-        let canonical_src_path = src_path.canonicalize()?;
-        if !canonical_src_path.starts_with(base_src) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "attempted to access path outside of allowed source base directory",
-            ));
-        }
-        let relative_src_path = canonical_src_path.strip_prefix(base_src).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "failed to derive relative path within source base directory",
-            )
-        })?;
-        for component in relative_src_path.components() {
-            match component {
-                Component::Normal(name) => {
-                    let name = name.to_string_lossy();
-                    if name.contains("..") || name.contains('/') || name.contains('\\') {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "invalid path component in source entry",
-                        ));
-                    }
-                }
-                Component::CurDir => {}
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "attempted to access path outside of allowed source base directory",
-                    ));
-                }
-            }
-        }
-        let dst_path = base_dst.join(relative_src_path);
+        let name = entry.file_name();
+        let src_path = src.join(&name);
+        let dst_path = dst.join(&name);
 
         if ty.is_dir() {
             // Skip build artifact directories at the root level
             if is_root
-                && let Some(name) = entry.file_name().to_str()
-                && SKIP_DIRS.contains(&name)
+                && let Some(name_str) = name.to_str()
+                && SKIP_DIRS.contains(&name_str)
             {
                 continue;
             }
-            // Ensure that the destination directory stays within the allowed destination base.
-            let canonical_dst_dir = dst_path.canonicalize().or_else(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    // Directory does not exist yet; ensure its parent is within base_dst.
-                    if let Some(parent) = dst_path.parent() {
-                        let parent_canonical = parent.canonicalize()?;
-                        if !parent_canonical.starts_with(base_dst) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                "attempted to create directory outside of allowed destination base directory",
-                            ));
-                        }
-                    }
-                    Ok(dst_path.clone())
-                } else {
-                    Err(err)
-                }
-            })?;
-            if !canonical_dst_dir.starts_with(base_dst) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "attempted to create directory outside of allowed destination base directory",
-                ));
-            }
             fs::create_dir_all(&dst_path)?;
-            copy_dir_filtered_inner(&src_path, &dst_path, base_src, base_dst, false)?;
+            copy_dir_filtered_inner(&src_path, &dst_path, false)?;
         } else {
-            // Ensure that the destination file path stays within the allowed destination base.
-            let canonical_dst_path = dst_path.canonicalize().or_else(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    // File does not exist yet; ensure its parent is within base_dst.
-                    if let Some(parent) = dst_path.parent() {
-                        let parent_canonical = parent.canonicalize()?;
-                        if !parent_canonical.starts_with(base_dst) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                "attempted to write file outside of allowed destination base directory",
-                            ));
-                        }
-                    }
-                    Ok(dst_path.clone())
-                } else {
-                    Err(err)
-                }
-            })?;
-            if !canonical_dst_path.starts_with(base_dst) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "attempted to write file outside of allowed destination base directory",
-                ));
-            }
-            fs::copy(&canonical_src_path, &canonical_dst_path)?;
+            fs::copy(&src_path, &dst_path)?;
         }
     }
     Ok(())

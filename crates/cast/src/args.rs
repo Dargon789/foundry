@@ -15,7 +15,10 @@ use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use eyre::{Result, WrapErr};
-use foundry_cli::utils::{self, LoadConfig};
+use foundry_cli::{
+    opts::NetworkVariant,
+    utils::{self, LoadConfig},
+};
 use foundry_common::{
     abi::{get_error, get_event},
     fmt::{format_tokens, format_uint_exp, serialize_value_as_json},
@@ -28,7 +31,6 @@ use foundry_common::{
     },
     shell, stdin,
 };
-use foundry_evm_networks::NetworkVariant;
 use op_alloy_network::Optimism;
 use std::time::Instant;
 use tempo_alloy::TempoNetwork;
@@ -799,7 +801,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 }
                 _ => SimpleCast::decode_raw_transaction::<Ethereum>(&tx)?,
             };
-            sh_println!("{decoded_tx}")?;
+            sh_println!("{}", serde_json::to_string_pretty(&decoded_tx)?)?;
         }
         CastSubcommand::RecoverAuthority { auth } => {
             let auth: SignedAuthorization = serde_json::from_str(&auth)?;
