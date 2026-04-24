@@ -131,7 +131,7 @@ impl ScriptTester {
             }
             // Optionally verify canonicalized file is in from_dir to avoid symlink traversal
             if let Ok(canonical_file) = file.canonicalize() {
-                if !canonical_file.starts_with(&from_dir) {
+                if !canonical_file.starts_with(from_dir.canonicalize().unwrap_or_else(|_| from_dir.clone())) {
                     continue;
                 }
             }
