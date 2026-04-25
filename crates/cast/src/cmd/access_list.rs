@@ -1,10 +1,9 @@
 use crate::{
     Cast,
-    rlp_converter::TryIntoRlpEncodable,
     tx::{CastTxBuilder, SenderKind},
 };
 use alloy_ens::NameOrAddress;
-use alloy_network::{AnyNetwork, Network};
+use alloy_network::{Ethereum, Network};
 use alloy_rpc_types::BlockId;
 use clap::Parser;
 use eyre::Result;
@@ -12,13 +11,8 @@ use foundry_cli::{
     opts::{RpcOpts, TransactionOpts},
     utils::LoadConfig,
 };
-use foundry_common::{
-    fmt::{UIfmt, UIfmtHeaderExt, UIfmtSignatureExt},
-    provider::ProviderBuilder,
-};
-use foundry_primitives::FoundryTransactionBuilder;
+use foundry_common::{FoundryTransactionBuilder, provider::ProviderBuilder};
 use foundry_wallets::WalletOpts;
-use serde::Serialize;
 use std::str::FromStr;
 use tempo_alloy::TempoNetwork;
 
@@ -68,18 +62,13 @@ impl AccessListArgs {
         if self.tx.tempo.is_tempo() {
             self.run_with_network::<TempoNetwork>().await
         } else {
-            self.run_with_network::<AnyNetwork>().await
+            self.run_with_network::<Ethereum>().await
         }
     }
 
     pub async fn run_with_network<N: Network + Unpin>(self) -> Result<()>
     where
-        N::TxEnvelope: Serialize + UIfmtSignatureExt,
-        N::Header: TryIntoRlpEncodable,
         N::TransactionRequest: FoundryTransactionBuilder<N>,
-        N::TransactionResponse: UIfmt,
-        N::HeaderResponse: UIfmtHeaderExt,
-        N::BlockResponse: UIfmt,
     {
         let Self { to, mut sig, args, data, tx, rpc, wallet, block } = self;
 
