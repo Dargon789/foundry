@@ -434,6 +434,7 @@ fn deploy_code<FEN: FoundryEvmNetwork>(
             value.unwrap_or(U256::ZERO),
             bytecode.into(),
             ccx.gas_limit,
+            0,
         ),
         ccx,
     )?;
@@ -1129,6 +1130,15 @@ mod tests {
         assert_eq!(latest.contractAddress, address!("20c0000000000000000000000000000000000000"));
         assert!(latest.success);
 
-        stdfs::remove_dir_all(root).unwrap();
+        if root.exists() {
+            let root_canon = stdfs::canonicalize(&root).unwrap();
+            let temp_canon = stdfs::canonicalize(env::temp_dir()).unwrap();
+            assert!(
+                root_canon.starts_with(&temp_canon),
+                "refusing to remove non-temp test directory: {}",
+                root_canon.display()
+            );
+            stdfs::remove_dir_all(&root).unwrap();
+        }
     }
 }
