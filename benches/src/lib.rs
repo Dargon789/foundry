@@ -137,7 +137,7 @@ impl BenchmarkProject {
                 Err(_) => continue, // Skip if unable to canonicalize
             };
             // Ensure canonicalized path stays strictly within root_path (TempProject root)
-            if !canon.starts_with(&root_path) {
+            if !canon.starts_with(root_path.canonicalize().unwrap_or_else(|_| root_path.clone())) {
                 sh_eprintln!("⚠️  Skipping suspicious path during cleanup: {:?}", canon);
                 continue;
             }
