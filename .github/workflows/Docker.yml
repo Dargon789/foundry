@@ -30,7 +30,7 @@ jobs:
           password: ${{ secrets.REGISTRY_TOKEN }}
       
       - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Extract metadata (tags, labels) for Docker
       - name: Extract Docker metadata
