@@ -4,6 +4,7 @@ use foundry_evm_core::{
     abi::console::{format_units_int, format_units_uint},
     backend::GLOBAL_FAIL_SLOT,
     constants::CHEATCODE_ADDRESS,
+    decode::ASSERTION_FAILED_PREFIX,
     evm::FoundryEvmNetwork,
 };
 use itertools::Itertools;
@@ -195,7 +196,7 @@ fn handle_assertion_result<FEN: FoundryEvmNetwork, E>(
     error_formatter: Option<&dyn Fn(&E) -> String>,
     error_msg: Option<&str>,
 ) -> Result {
-    let error_msg = error_msg.unwrap_or("assertion failed");
+    let error_msg = error_msg.unwrap_or(ASSERTION_FAILED_PREFIX);
     let msg = if let Some(error_formatter) = error_formatter {
         Cow::Owned(format!("{error_msg}: {}", error_formatter(&err)))
     } else {
@@ -221,9 +222,9 @@ fn handle_assertion_result_mono<FEN: FoundryEvmNetwork>(
 /// Implements [crate::Cheatcode] for pairs of cheatcodes.
 ///
 /// Accepts a list of pairs of cheatcodes, where the first cheatcode is the one that doesn't contain
-/// a custom error message, and the second one contains it at `error` field.
+/// a custom error message, and the second one contains it at `err` field.
 ///
-/// Passed `args` are the common arguments for both cheatcode structs (excluding `error` field).
+/// Passed `args` are the common arguments for both cheatcode structs (excluding `err` field).
 ///
 /// Macro also accepts an optional closure that formats the error returned by the assertion.
 macro_rules! impl_assertions {
@@ -266,10 +267,12 @@ macro_rules! impl_assertions {
                 ccx: &mut CheatsCtxt<'_, '_, FEN>,
                 executor: &mut dyn CheatcodesExecutor<FEN>,
             ) -> Result {
-                let Self { $($arg,)* error } = self;
+                let Self { $($arg,)* err } = self;
                 match $body {
                     Ok(()) => Ok(Default::default()),
-                    Err(err) => handle_assertion_result(ccx, executor, err, $error_formatter, Some(error))
+                    Err(assertion_err) => {
+                        handle_assertion_result(ccx, executor, assertion_err, $error_formatter, Some(err))
+                    }
                 }
             }
         }

@@ -17,14 +17,15 @@ use alloy_evm::{
     Evm, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockValidationError,
-        ExecutableTx, OnStateHook, StateChangePreBlockSource, StateChangeSource, StateDB, TxResult,
+        ExecutableTx, GasOutput, OnStateHook, StateChangePreBlockSource, StateChangeSource,
+        StateDB, TxResult,
     },
     eth::{
         EthTxResult,
         receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
     },
 };
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use anvil_core::eth::transaction::{
     MaybeImpersonatedTransaction, PendingTransaction, TransactionInfo,
 };
@@ -69,6 +70,7 @@ impl ReceiptBuilder for FoundryReceiptBuilder {
             FoundryTxType::Deposit => {
                 unreachable!("deposit receipts are built in commit_transaction")
             }
+            FoundryTxType::PostExec => FoundryReceiptEnvelope::PostExec(receipt),
             FoundryTxType::Tempo => FoundryReceiptEnvelope::Tempo(receipt),
         }
     }
@@ -88,6 +90,10 @@ impl<H> TxResult for AnvilTxResult<H> {
 
     fn result(&self) -> &ResultAndState<Self::HaltReason> {
         self.inner.result()
+    }
+
+    fn into_result(self) -> ResultAndState<Self::HaltReason> {
+        self.inner.into_result()
     }
 }
 
@@ -211,7 +217,10 @@ where
         })
     }
 
-    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
+    fn commit_transaction(
+        &mut self,
+        output: Self::Result,
+    ) -> Result<GasOutput, BlockExecutionError> {
         let AnvilTxResult {
             inner: EthTxResult { result: ResultAndState { result, state }, blob_gas_used, tx_type },
             sender,
@@ -221,7 +230,7 @@ where
             hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
         }
 
-        let gas_used = result.gas_used();
+        let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
 
         if self.spec_id >= SpecId::CANCUN {
@@ -257,7 +266,7 @@ where
         self.receipts.push(receipt);
         self.evm.db_mut().commit(state);
 
-        Ok(gas_used)
+        Ok(GasOutput::new(gas_used))
     }
 
     fn finish(
@@ -337,8 +346,10 @@ pub fn execute_pool_transactions<B>(
     ) -> Result<(), InvalidTransactionError>,
 ) -> ExecutedPoolTransactions<B::Transaction>
 where
-    B: BlockExecutor<Evm: Evm<DB: Database + Debug, Inspector = AnvilInspector>>,
-    B::Transaction: Transaction + Encodable2718 + Clone,
+    B: BlockExecutor<
+            Transaction = FoundryTxEnvelope,
+            Evm: Evm<DB: Database + Debug, Inspector = AnvilInspector>,
+        >,
     B::Receipt: TxReceipt,
     <B::Result as TxResult>::HaltReason: Clone + IntoInstructionResult,
     <B::Evm as Evm>::Tx: FromTxWithEncoded<B::Transaction> + FoundryTransaction,
@@ -355,6 +366,16 @@ where
     for pool_tx in pool_transactions {
         let pending = &pool_tx.pending_transaction;
         let sender = *pending.sender();
+        let block_timestamp = executor.evm().block().timestamp();
+
+        if let FoundryTxEnvelope::Tempo(aa_tx) = pending.transaction.as_ref()
+            && let Some(valid_after) = aa_tx.tx().valid_after
+            && U256::from(valid_after.get()) > block_timestamp
+        {
+            trace!(target: "backend", "[{:?}] transaction not valid yet, will retry later", pool_tx.hash());
+            not_yet_valid.push(pool_tx.clone());
+            continue;
+        }
 
         let account = match executor.evm_mut().db_mut().basic(sender).map(|a| a.unwrap_or_default())
         {
@@ -406,7 +427,7 @@ where
         match executor.execute_transaction_without_commit((tx_env, recovered)) {
             Ok(result) => {
                 let exec_result = result.result().result.clone();
-                let gas_used = result.result().result.gas_used();
+                let gas_used = result.result().result.tx_gas_used();
 
                 executor.commit_transaction(result).expect("commit failed");
 
@@ -462,11 +483,7 @@ where
                 transactions.push(pending.transaction.clone());
             }
             Err(err) => {
-                let err_str = err.to_string();
-                if err_str.contains("not valid yet") {
-                    trace!(target: "backend", "[{:?}] transaction not valid yet, will retry later", pool_tx.hash());
-                    not_yet_valid.push(pool_tx.clone());
-                } else if err.as_validation().is_some() {
+                if err.as_validation().is_some() {
                     warn!(target: "backend", "Skipping invalid tx [{:?}]: {}", pool_tx.hash(), err);
                     invalid.push(pool_tx.clone());
                 } else {

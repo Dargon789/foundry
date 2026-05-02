@@ -45,7 +45,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
     borrow::Cow,
     collections::BTreeMap,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -53,12 +53,13 @@ use std::{
 mod macros;
 
 pub mod utils;
-pub use foundry_evm_hardforks::{FromEvmVersion, evm_spec_id};
+pub use foundry_evm_hardforks::{FoundryHardfork, FromEvmVersion, evm_spec_id};
 pub use utils::*;
 
 mod endpoints;
 pub use endpoints::{
     ResolvedRpcEndpoint, ResolvedRpcEndpoints, RpcEndpoint, RpcEndpointUrl, RpcEndpoints,
+    builtin_rpc_url,
 };
 
 mod etherscan;
@@ -235,6 +236,8 @@ pub struct Config {
     /// The EVM version to use when building contracts.
     #[serde(with = "from_str_lowercase")]
     pub evm_version: EvmVersion,
+    /// The runtime hardfork to use when executing tests and scripts.
+    pub hardfork: Option<FoundryHardfork>,
     /// List of contracts to generate gas reports for.
     pub gas_reports: Vec<String>,
     /// List of contracts to ignore for gas reports.
@@ -313,6 +316,8 @@ pub struct Config {
     pub etherscan: EtherscanConfigs,
     /// List of solidity error codes to always silence in the compiler output.
     pub ignored_error_codes: Vec<SolidityErrorCode>,
+    /// List of (path prefix, solidity error codes) to silence in the compiler output.
+    pub ignored_error_codes_from: Vec<(PathBuf, Vec<SolidityErrorCode>)>,
     /// List of file paths to ignore.
     #[serde(rename = "ignored_warnings_from")]
     pub ignored_file_paths: Vec<PathBuf>,
@@ -788,6 +793,18 @@ impl Config {
         Self::from_figment(Figment::from(provider))
     }
 
+    /// Applies an inline provider on top of the current config without reloading external
+    /// providers such as `foundry.toml`, env vars, or remappings.
+    pub fn merge_inline_provider<T: Provider>(&self, provider: T) -> Result<Self, Error> {
+        let mut config =
+            self.to_figment(FigmentProviders::None).merge(provider).extract::<Self>()?;
+        config.profile = self.profile.clone();
+        config.profiles = self.profiles.clone();
+        config.normalize_hardfork_settings()?;
+
+        Ok(config)
+    }
+
     #[doc(hidden)]
     #[deprecated(note = "use `Config::from_provider` instead")]
     pub fn try_from<T: Provider>(provider: T) -> Result<Self, ExtractConfigError> {
@@ -830,18 +847,39 @@ impl Config {
         // Check if the selected profile exists.
         if config.profiles.contains(&selected_profile) {
             config.profile = selected_profile;
-        } else if strict_profile {
-            return Err(ExtractConfigError::new(Error::from(format!(
-                "selected profile `{selected_profile}` does not exist"
-            ))));
         } else {
-            // Fall back to default profile for nested lib configs.
+            // Fall back to the default profile. In strict mode (top-level loads), emit a warning
+            // so users are informed when an unknown profile (e.g. via `FOUNDRY_PROFILE`) is
+            // selected; the silent fallback is reserved for nested lib configs.
+            if strict_profile {
+                config
+                    .warnings
+                    .push(Warning::UnknownProfile { profile: selected_profile.to_string() });
+            }
             config.profile = Self::DEFAULT_PROFILE;
         }
 
         config.normalize_optimizer_settings();
+        config.normalize_hardfork_settings().map_err(ExtractConfigError::new)?;
+
+        // Validate optimizer_runs does not exceed u32::MAX (Solidity compiler limit)
+        if let Some(runs) = config.optimizer_runs
+            && runs > u32::MAX as usize
+        {
+            return Err(ExtractConfigError::new(Error::from(format!(
+                "`optimizer_runs` value {} exceeds maximum allowed value of {}",
+                runs,
+                u32::MAX
+            ))));
+        }
 
         Ok(config)
+    }
+
+    fn normalize_hardfork_settings(&mut self) -> Result<(), Error> {
+        let Some(hardfork) = self.hardfork else { return Ok(()) };
+        self.networks = self.networks.normalize_for_hardfork(hardfork).map_err(Error::from)?;
+        Ok(())
     }
 
     /// Returns the populated [Figment] using the requested [FigmentProviders] preset.
@@ -1067,7 +1105,8 @@ impl Config {
     /// Cleans up any duplicate `Remapping` and sorts them
     ///
     /// On windows this will convert any `\` in the remapping path into a `/`
-    pub const fn sanitize_remappings(&mut self) {
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn sanitize_remappings(&mut self) {
         #[cfg(target_os = "windows")]
         {
             // force `/` in remappings on windows
@@ -1201,6 +1240,10 @@ impl Config {
     pub fn create_project(&self, cached: bool, no_artifacts: bool) -> Result<Project, SolcError> {
         let settings = self.compiler_settings()?;
         let paths = self.project_paths();
+
+        // Strip "./" prefix for consistent path matching
+        let parse_path = |path: &PathBuf| path.strip_prefix("./").unwrap_or(path).to_path_buf();
+
         let mut builder = Project::builder()
             .artifacts(self.configured_artifacts_handler())
             .additional_settings(self.additional_settings(&settings))
@@ -1208,15 +1251,10 @@ impl Config {
             .settings(settings)
             .paths(paths)
             .ignore_error_codes(self.ignored_error_codes.iter().copied().map(Into::into))
-            .ignore_paths(
-                self.ignored_file_paths
-                    .iter()
-                    .map(|path| {
-                        // Strip "./" prefix for consistent path matching
-                        path.strip_prefix("./").unwrap_or(path).to_path_buf()
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            .ignore_error_codes_from(self.ignored_error_codes_from.iter().map(|(path, codes)| {
+                (parse_path(path), codes.iter().copied().map(Into::into).collect())
+            }))
+            .ignore_paths(self.ignored_file_paths.iter().map(parse_path).collect())
             .set_compiler_severity_filter(if self.deny.warnings() {
                 Severity::Warning
             } else {
@@ -1235,7 +1273,9 @@ impl Config {
         let project = builder.build(self.compiler()?)?;
 
         if self.force {
-            self.cleanup(&project)?;
+            // Warnings are intentionally dropped here because `sh_warn!` is a circular
+            // dependency. Callers that need warnings should call `cleanup()` directly.
+            let _ = self.cleanup(&project);
         }
 
         Ok(project)
@@ -1264,21 +1304,40 @@ impl Config {
     }
 
     /// Cleans the project.
+    ///
+    /// Returns a list of warning messages for any non-fatal cleanup failures. Cleanup is
+    /// best-effort: all steps are attempted even if some fail.
     pub fn cleanup<C: Compiler, T: ArtifactOutput<CompilerContract = C::CompilerContract>>(
         &self,
         project: &Project<C, T>,
-    ) -> Result<(), SolcError> {
-        project.cleanup()?;
+    ) -> Result<Vec<String>, SolcError> {
+        let mut warnings = Vec::new();
+
+        if let Err(err) = project.cleanup() {
+            warnings.push(format!("failed to clean project artifacts: {err}"));
+        }
 
         // Remove last test run failures file.
-        let _ = fs::remove_file(&self.test_failures_file);
+        if let Err(err) = fs::remove_file(&self.test_failures_file)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            warnings.push(format!(
+                "failed to remove test failures file {}: {err}",
+                self.test_failures_file.display()
+            ));
+        }
 
         // Remove fuzz and invariant cache directories.
-        let remove_test_dir = |test_dir: &Option<PathBuf>| {
+        let mut remove_test_dir = |test_dir: &Option<PathBuf>| {
             if let Some(test_dir) = test_dir {
                 let path = project.root().join(test_dir);
-                if path.exists() {
-                    let _ = fs::remove_dir_all(&path);
+                if let Err(err) = fs::remove_dir_all(&path)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    warnings.push(format!(
+                        "failed to remove test cache directory {}: {err}",
+                        path.display()
+                    ));
                 }
             }
         };
@@ -1287,7 +1346,7 @@ impl Config {
         remove_test_dir(&self.invariant.corpus.corpus_dir);
         remove_test_dir(&self.invariant.failure_persist_dir);
 
-        Ok(())
+        Ok(warnings)
     }
 
     /// Ensures that the configured version is installed if explicitly set
@@ -1329,7 +1388,7 @@ impl Config {
 
     /// Returns the Spec derived from the configured [EvmVersion]
     pub fn evm_spec_id<SPEC: FromEvmVersion>(&self) -> SPEC {
-        evm_spec_id(self.evm_version)
+        self.hardfork.map(Into::into).unwrap_or_else(|| evm_spec_id(self.evm_version))
     }
 
     /// Returns whether the compiler version should be auto-detected
@@ -1505,6 +1564,10 @@ impl Config {
 
         if let Some(mesc_url) = self.get_rpc_url_from_mesc(maybe_alias) {
             return Some(Ok(Cow::Owned(mesc_url)));
+        }
+
+        if let Some(builtin) = crate::endpoints::builtin_rpc_url(maybe_alias) {
+            return Some(Ok(Cow::Borrowed(builtin)));
         }
 
         None
@@ -1898,6 +1961,7 @@ impl Config {
             out: self.out,
             libs: self.libs,
             remappings: self.remappings,
+            network: self.networks.active_network_name().map(String::from),
         }
     }
 
@@ -2115,63 +2179,108 @@ impl Config {
     }
 
     /// Clears the foundry cache.
-    pub fn clean_foundry_cache() -> eyre::Result<()> {
+    ///
+    /// Returns warnings for any non-fatal deletion failures.
+    pub fn clean_foundry_cache() -> eyre::Result<Vec<String>> {
         if let Some(cache_dir) = Self::foundry_cache_dir() {
             let path = cache_dir.as_path();
-            let _ = fs::remove_dir_all(path);
+            if let Err(err) = fs::remove_dir_all(path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Ok(vec![format!(
+                    "failed to remove foundry cache at {}: {err}",
+                    path.display()
+                )]);
+            }
         } else {
             eyre::bail!("failed to get foundry_cache_dir");
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
     /// Clears the foundry cache for `chain`.
-    pub fn clean_foundry_chain_cache(chain: Chain) -> eyre::Result<()> {
+    ///
+    /// Returns warnings for any non-fatal deletion failures.
+    pub fn clean_foundry_chain_cache(chain: Chain) -> eyre::Result<Vec<String>> {
         if let Some(cache_dir) = Self::foundry_chain_cache_dir(chain) {
             let path = cache_dir.as_path();
-            let _ = fs::remove_dir_all(path);
+            if let Err(err) = fs::remove_dir_all(path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Ok(vec![format!(
+                    "failed to remove foundry cache for chain {chain} at {}: {err}",
+                    path.display()
+                )]);
+            }
         } else {
             eyre::bail!("failed to get foundry_chain_cache_dir");
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
     /// Clears the foundry cache for `chain` and `block`.
-    pub fn clean_foundry_block_cache(chain: Chain, block: u64) -> eyre::Result<()> {
+    ///
+    /// Returns warnings for any non-fatal deletion failures.
+    pub fn clean_foundry_block_cache(chain: Chain, block: u64) -> eyre::Result<Vec<String>> {
         if let Some(cache_dir) = Self::foundry_block_cache_dir(chain, block) {
             let path = cache_dir.as_path();
-            let _ = fs::remove_dir_all(path);
+            if let Err(err) = fs::remove_dir_all(path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Ok(vec![format!(
+                    "failed to remove foundry cache for chain {chain} block {block} at {}: {err}",
+                    path.display()
+                )]);
+            }
         } else {
             eyre::bail!("failed to get foundry_block_cache_dir");
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
     /// Clears the foundry etherscan cache.
-    pub fn clean_foundry_etherscan_cache() -> eyre::Result<()> {
+    ///
+    /// Returns warnings for any non-fatal deletion failures.
+    pub fn clean_foundry_etherscan_cache() -> eyre::Result<Vec<String>> {
         if let Some(cache_dir) = Self::foundry_etherscan_cache_dir() {
             let path = cache_dir.as_path();
-            let _ = fs::remove_dir_all(path);
+            if let Err(err) = fs::remove_dir_all(path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Ok(vec![format!(
+                    "failed to remove foundry etherscan cache at {}: {err}",
+                    path.display()
+                )]);
+            }
         } else {
             eyre::bail!("failed to get foundry_etherscan_cache_dir");
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
     /// Clears the foundry etherscan cache for `chain`.
-    pub fn clean_foundry_etherscan_chain_cache(chain: Chain) -> eyre::Result<()> {
+    ///
+    /// Returns warnings for any non-fatal deletion failures.
+    pub fn clean_foundry_etherscan_chain_cache(chain: Chain) -> eyre::Result<Vec<String>> {
         if let Some(cache_dir) = Self::foundry_etherscan_chain_cache_dir(chain) {
             let path = cache_dir.as_path();
-            let _ = fs::remove_dir_all(path);
+            if let Err(err) = fs::remove_dir_all(path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Ok(vec![format!(
+                    "failed to remove foundry etherscan cache for chain {chain} at {}: {err}",
+                    path.display()
+                )]);
+            }
         } else {
             eyre::bail!("failed to get foundry_etherscan_cache_dir for chain: {}", chain);
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
     /// List the data in the foundry cache.
@@ -2540,6 +2649,7 @@ impl Default for Config {
             include_paths: vec![],
             force: false,
             evm_version: EvmVersion::Osaka,
+            hardfork: None,
             gas_reports: vec!["*".to_string()],
             gas_reports_ignore: vec![],
             gas_reports_include_tests: false,
@@ -2610,6 +2720,7 @@ impl Default for Config {
                 SolidityErrorCode::TransferDeprecated,
                 SolidityErrorCode::NatspecMemorySafeAssemblyDeprecated,
             ],
+            ignored_error_codes_from: vec![],
             ignored_file_paths: vec![],
             deny: DenyLevel::Never,
             deny_warnings: false,
@@ -2743,6 +2854,9 @@ pub struct BasicConfig {
     /// `Remappings` to use for this repo
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remappings: Vec<RelativeRemapping>,
+    /// The active non-Ethereum network (e.g. `"tempo"`).
+    #[serde(skip)]
+    pub network: Option<String>,
 }
 
 impl BasicConfig {
@@ -2750,13 +2864,35 @@ impl BasicConfig {
     ///
     /// This serializes to a table with the name of the profile
     pub fn to_string_pretty(&self) -> Result<String, toml::ser::Error> {
-        let s = toml::to_string_pretty(self)?;
+        let mut profile_body = toml::Value::try_from(self)?;
+        if let Some(ref network) = self.network
+            && let toml::Value::Table(ref mut table) = profile_body
+        {
+            table.insert("network".to_string(), toml::Value::String(network.clone()));
+        }
+
+        let mut profile_section = toml::value::Table::new();
+        profile_section.insert(self.profile.to_string(), profile_body);
+
+        let mut document = toml::value::Table::new();
+        document.insert("profile".to_string(), toml::Value::Table(profile_section));
+
+        if self.network.as_deref() == Some("tempo") {
+            let mut endpoints = toml::value::Table::new();
+            endpoints.insert(
+                "tempo".to_string(),
+                toml::Value::String("https://rpc.tempo.xyz/".to_string()),
+            );
+            endpoints.insert(
+                "moderato".to_string(),
+                toml::Value::String("https://rpc.moderato.tempo.xyz/".to_string()),
+            );
+            document.insert("rpc_endpoints".to_string(), toml::Value::Table(endpoints));
+        }
+
+        let body = toml::to_string_pretty(&toml::Value::Table(document))?;
         Ok(format!(
-            "\
-[profile.{}]
-{s}
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options\n",
-            self.profile
+            "{body}\n# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options\n"
         ))
     }
 }
@@ -2807,6 +2943,7 @@ mod tests {
     use foundry_compilers::artifacts::{
         ModelCheckerEngine, YulDetails, vyper::VyperOptimizationMode,
     };
+    use foundry_evm_hardforks::TempoHardfork;
     use similar_asserts::assert_eq;
     use soldeer_core::remappings::RemappingsLocation;
     use std::{fs::File, io::Write};
@@ -3565,6 +3702,7 @@ mod tests {
                         "mainnet",
                         RpcEndpointType::Config(RpcEndpoint {
                             endpoint: RpcEndpointUrl::Env("${_CONFIG_MAINNET}".to_string()),
+                            extra_endpoints: vec![],
                             config: RpcEndpointConfig {
                                 retries: Some(3),
                                 retry_backoff: Some(1000),
@@ -3590,6 +3728,7 @@ mod tests {
                         "mainnet",
                         RpcEndpointType::Config(RpcEndpoint {
                             endpoint: RpcEndpointUrl::Env("${_CONFIG_MAINNET}".to_string()),
+                            extra_endpoints: vec![],
                             config: RpcEndpointConfig {
                                 retries: Some(3),
                                 retry_backoff: Some(1000),
@@ -3637,6 +3776,7 @@ mod tests {
                         "mainnet",
                         RpcEndpointType::Config(RpcEndpoint {
                             endpoint: RpcEndpointUrl::Env("${_CONFIG_MAINNET}".to_string()),
+                            extra_endpoints: vec![],
                             config: RpcEndpointConfig {
                                 retries: Some(3),
                                 retry_backoff: Some(1000),
@@ -3663,6 +3803,7 @@ mod tests {
                             endpoint: RpcEndpointUrl::Url(
                                 "https://eth-mainnet.alchemyapi.io/v2/123455".to_string()
                             ),
+                            extra_endpoints: vec![],
                             config: RpcEndpointConfig {
                                 retries: Some(3),
                                 retry_backoff: Some(1000),
@@ -4261,6 +4402,7 @@ mod tests {
                     out: "myout".into(),
                     libs: default.libs.clone(),
                     remappings: default.remappings.clone(),
+                    network: None,
                 }
             );
             jail.set_env("FOUNDRY_PROFILE", r"other");
@@ -4273,6 +4415,7 @@ mod tests {
                     out: "myout".into(),
                     libs: default.libs.clone(),
                     remappings: default.remappings,
+                    network: None,
                 }
             );
             Ok(())
@@ -4894,7 +5037,8 @@ mod tests {
                     src: "src".into(),
                     out: "out".into(),
                     libs: vec!["lib".into()],
-                    remappings: vec![]
+                    remappings: vec![],
+                    network: None,
                 }
             )
         );
@@ -4920,6 +5064,58 @@ mod tests {
                     unknown_section: Profile::new("default"),
                     source: Some("foundry.toml".into())
                 }]
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn hardfork_overrides_spec_id() {
+        let config = Config {
+            hardfork: Some(FoundryHardfork::Tempo(TempoHardfork::T3)),
+            ..Config::default()
+        };
+
+        assert_eq!(config.evm_spec_id::<TempoHardfork>(), TempoHardfork::T3);
+    }
+
+    #[test]
+    fn tempo_hardfork_infers_tempo_network() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                hardfork = "tempo:T3"
+            "#,
+            )?;
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.hardfork, Some(FoundryHardfork::Tempo(TempoHardfork::T3)));
+            assert!(config.networks.is_tempo());
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn hardfork_rejects_conflicting_network() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                tempo = true
+                hardfork = "shanghai"
+            "#,
+            )?;
+
+            let err = Config::load().unwrap_err();
+            assert!(
+                err.to_string()
+                    .to_lowercase()
+                    .contains("hardfork `shanghai` conflicts with network config `tempo`")
             );
 
             Ok(())
@@ -6502,6 +6698,55 @@ mod tests {
     }
 
     #[test]
+    fn no_unknown_key_warning_for_network_field() {
+        // Regression test: `network` is a flattened `Option` field of `NetworkConfigs`. It must
+        // not trigger an unknown-key warning, regardless of whether it is set.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                network = "tempo"
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            assert!(
+                !cfg.warnings.iter().any(
+                    |w| matches!(w, crate::Warning::UnknownKey { key, .. } if key == "network")
+                ),
+                "did not expect UnknownKey warning for `network`, got: {:?}",
+                cfg.warnings
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn no_unknown_key_warning_for_legacy_tempo_alias() {
+        // Regression test: the legacy `tempo = true` alias must keep working without warnings.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                tempo = true
+                "#,
+            )?;
+
+            let cfg = Config::load().unwrap();
+            assert!(
+                !cfg.warnings
+                    .iter()
+                    .any(|w| matches!(w, crate::Warning::UnknownKey { key, .. } if key == "tempo")),
+                "did not expect UnknownKey warning for `tempo`, got: {:?}",
+                cfg.warnings
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
     fn fails_on_ambiguous_version_in_compilation_restrictions() {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
@@ -6847,9 +7092,9 @@ mod tests {
         });
     }
 
-    // Test for issue #12844: FOUNDRY_PROFILE=nonexistent should fail
+    // Test for issue #12844: FOUNDRY_PROFILE=nonexistent should warn and fall back to default.
     #[test]
-    fn fails_on_unknown_profile() {
+    fn warns_on_unknown_profile() {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "foundry.toml",
@@ -6860,11 +7105,15 @@ mod tests {
             )?;
 
             jail.set_env("FOUNDRY_PROFILE", "nonexistent");
-            let err = Config::load().expect_err("expected unknown profile to fail");
-            let err_msg = err.to_string();
+            let cfg = Config::load().expect("expected unknown profile to fall back to default");
+            assert_eq!(cfg.profile, Config::DEFAULT_PROFILE);
             assert!(
-                err_msg.contains("selected profile `nonexistent` does not exist"),
-                "Expected error about nonexistent profile, got: {err_msg}"
+                cfg.warnings.iter().any(|w| matches!(
+                    w,
+                    crate::Warning::UnknownProfile { profile } if profile == "nonexistent"
+                )),
+                "Expected UnknownProfile warning, got: {:?}",
+                cfg.warnings
             );
 
             Ok(())
