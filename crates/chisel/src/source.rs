@@ -5,7 +5,6 @@
 //! execution helpers.
 
 use eyre::Result;
-use forge_doc::solang_ext::{CodeLocationExt, SafeUnwrap};
 use foundry_common::fs;
 use foundry_compilers::{
     Artifact, ProjectCompileOutput,
@@ -17,7 +16,7 @@ use foundry_config::{Config, SolcReq};
 use foundry_evm::{backend::Backend, core::bytecode::InstIter, opts::EvmOpts};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use solang_parser::pt;
+use solang_parser::pt::{self, CodeLocation};
 use solar::interface::diagnostics::EmittedDiagnostics;
 use std::{cell::OnceCell, collections::HashMap, fmt, path::PathBuf};
 use walkdir::WalkDir;
@@ -567,20 +566,6 @@ impl SessionSource {
         self.clear_output();
     }
 
-    /// Clear the global-level code .
-    pub fn clear_global(&mut self) -> &mut Self {
-        String::clear(&mut self.global_code);
-        self.clear_output();
-        self
-    }
-
-    /// Clear the contract-level code .
-    pub fn clear_contract(&mut self) -> &mut Self {
-        String::clear(&mut self.contract_code);
-        self.clear_output();
-        self
-    }
-
     /// Clear the `run()` function code.
     pub fn clear_run(&mut self) -> &mut Self {
         String::clear(&mut self.run_code);
@@ -694,39 +679,6 @@ impl SessionSource {
         Ok(intermediate_output)
     }
 
-    /// Construct the source as a valid Forge script.
-    pub fn to_script_source(&self) -> String {
-        let Self {
-            contract_name,
-            global_code,
-            contract_code: top_level_code,
-            run_code,
-            config,
-            ..
-        } = self;
-
-        let script_import =
-            if !config.no_vm { "import {Script} from \"forge-std/Script.sol\";\n" } else { "" };
-
-        format!(
-            r#"
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity 0;
-
-{script_import}
-{global_code}
-
-contract {contract_name} is Script {{
-    {top_level_code}
-
-    /// @notice Script entry point
-    function run() public {{
-        {run_code}
-    }}
-}}"#,
-        )
-    }
-
     /// Construct the REPL source.
     pub fn to_repl_source(&self) -> String {
         let Self {
@@ -836,20 +788,20 @@ contract {contract_name} {{
                                 }
                             }
                             pt::ContractPart::EventDefinition(def) => {
-                                let event_name = def.name.safe_unwrap().name.clone();
+                                let event_name = def.name.as_ref().unwrap().name.clone();
                                 intermediate.event_definitions.insert(event_name, def);
                             }
                             pt::ContractPart::StructDefinition(def) => {
-                                let struct_name = def.name.safe_unwrap().name.clone();
+                                let struct_name = def.name.as_ref().unwrap().name.clone();
                                 intermediate.struct_definitions.insert(struct_name, def);
                             }
                             pt::ContractPart::VariableDefinition(def) => {
-                                let var_name = def.name.safe_unwrap().name.clone();
+                                let var_name = def.name.as_ref().unwrap().name.clone();
                                 intermediate.variable_definitions.insert(var_name, def);
                             }
                             _ => {}
                         });
-                        Some((cd.name.safe_unwrap().name.clone(), intermediate))
+                        Some((cd.name.as_ref().unwrap().name.clone(), intermediate))
                     }
                     _ => None,
                 })
@@ -870,7 +822,7 @@ contract {contract_name} {{
     pub fn get_statement_definitions(statement: &pt::Statement) -> Vec<(String, pt::Expression)> {
         match statement {
             pt::Statement::VariableDefinition(_, def, _) => {
-                vec![(def.name.safe_unwrap().name.clone(), def.ty.clone())]
+                vec![(def.name.as_ref().unwrap().name.clone(), def.ty.clone())]
             }
             pt::Statement::Expression(_, pt::Expression::Assign(_, left, _)) => {
                 if let pt::Expression::List(_, list) = left.as_ref() {

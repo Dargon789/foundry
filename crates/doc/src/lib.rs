@@ -22,6 +22,10 @@ mod helpers;
 mod parser;
 pub use parser::{
     Comment, CommentTag, Comments, CommentsRef, ParseItem, ParseSource, Parser, error,
+    source::{
+        BaseInfo, ContractKind, ContractSource, EnumSource, ErrorSource, EventSource,
+        FunctionSource, ParamInfo, StructSource, TypeSource, VariableAttr, VariableSource,
+    },
 };
 
 mod preprocessor;
@@ -30,7 +34,4 @@ pub use preprocessor::*;
 mod writer;
 pub use writer::{AsDoc, AsDocResult, BufWriter, Markdown};
 
-pub use mdbook;
-
-// old formatter dependencies
-pub mod solang_ext;
+pub use mdbook_driver;
