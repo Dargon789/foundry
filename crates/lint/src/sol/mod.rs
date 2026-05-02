@@ -21,6 +21,7 @@ use solar::{
     interface::{
         Session,
         diagnostics::{self, HumanEmitter, JsonEmitter},
+        source_map::SourceFile,
     },
     sema::{
         Compiler, Gcx,
@@ -29,7 +30,7 @@ use solar::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 use thiserror::Error;
 
@@ -40,12 +41,14 @@ pub mod codesize;
 pub mod gas;
 pub mod high;
 pub mod info;
+pub mod low;
 pub mod med;
 
 static ALL_REGISTERED_LINTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     let mut lints = Vec::new();
     lints.extend_from_slice(high::REGISTERED_LINTS);
     lints.extend_from_slice(med::REGISTERED_LINTS);
+    lints.extend_from_slice(low::REGISTERED_LINTS);
     lints.extend_from_slice(info::REGISTERED_LINTS);
     lints.extend_from_slice(gas::REGISTERED_LINTS);
     lints.extend_from_slice(codesize::REGISTERED_LINTS);
@@ -128,11 +131,13 @@ impl<'a> SolidityLinter<'a> {
         ast: &'gcx ast::SourceUnit<'gcx>,
         path: &Path,
         inline_config: &InlineConfig<Vec<String>>,
+        source_file: Option<Arc<SourceFile>>,
     ) -> Result<(), diagnostics::ErrorGuaranteed> {
         // Declare all available passes and lints
         let mut passes_and_lints = Vec::new();
         passes_and_lints.extend(high::create_early_lint_passes());
         passes_and_lints.extend(med::create_early_lint_passes());
+        passes_and_lints.extend(low::create_early_lint_passes());
         passes_and_lints.extend(info::create_early_lint_passes());
 
         // Do not apply 'gas' and 'codesize' severity rules on tests and scripts
@@ -165,6 +170,7 @@ impl<'a> SolidityLinter<'a> {
             self.with_json_emitter,
             self.config(inline_config),
             lints,
+            source_file,
         );
         let mut early_visitor = EarlyLintVisitor::new(&ctx, &mut passes);
         _ = early_visitor.visit_source_unit(ast);
@@ -179,11 +185,13 @@ impl<'a> SolidityLinter<'a> {
         source_id: hir::SourceId,
         path: &Path,
         inline_config: &InlineConfig<Vec<String>>,
+        source_file: Option<Arc<SourceFile>>,
     ) -> Result<(), diagnostics::ErrorGuaranteed> {
         // Declare all available passes and lints
         let mut passes_and_lints = Vec::new();
         passes_and_lints.extend(high::create_late_lint_passes());
         passes_and_lints.extend(med::create_late_lint_passes());
+        passes_and_lints.extend(low::create_late_lint_passes());
         passes_and_lints.extend(info::create_late_lint_passes());
 
         // Do not apply 'gas' and 'codesize' severity rules on tests and scripts
@@ -216,6 +224,7 @@ impl<'a> SolidityLinter<'a> {
             self.with_json_emitter,
             self.config(inline_config),
             lints,
+            source_file,
         );
         let mut late_visitor = LateLintVisitor::new(&ctx, &mut passes, &gcx.hir);
 
@@ -284,13 +293,25 @@ impl<'a> Linter for SolidityLinter<'a> {
                 let inline_config = parse_inline_config(gcx.sess, &comments, ast);
 
                 // Early lints.
-                let _ = self.process_source_ast(gcx.sess, ast, path, &inline_config);
+                let _ = self.process_source_ast(
+                    gcx.sess,
+                    ast,
+                    path,
+                    &inline_config,
+                    Some(file.clone()),
+                );
 
                 // Late lints.
                 let Some((hir_source_id, _)) = gcx.get_hir_source(path) else {
                     panic!("HIR source not found for {}", path.display());
                 };
-                let _ = self.process_source_hir(gcx, hir_source_id, path, &inline_config);
+                let _ = self.process_source_hir(
+                    gcx,
+                    hir_source_id,
+                    path,
+                    &inline_config,
+                    Some(file.clone()),
+                );
             });
 
             convert_solar_errors(compiler.dcx())
@@ -400,6 +421,12 @@ impl<'a> TryFrom<&'a str> for SolLint {
         }
 
         for &lint in med::REGISTERED_LINTS {
+            if lint.id() == value {
+                return Ok(lint);
+            }
+        }
+
+        for &lint in low::REGISTERED_LINTS {
             if lint.id() == value {
                 return Ok(lint);
             }
