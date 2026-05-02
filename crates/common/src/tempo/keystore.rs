@@ -6,7 +6,7 @@
 use alloy_primitives::{Address, hex};
 use alloy_rlp::Decodable;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Environment variable for an ephemeral Tempo private key.
 pub const TEMPO_PRIVATE_KEY_ENV: &str = "TEMPO_PRIVATE_KEY";
@@ -99,9 +99,23 @@ pub struct KeysFile {
 /// Resolve the Tempo home directory.
 ///
 /// Uses `TEMPO_HOME` env var if set, otherwise `~/.tempo`.
+fn is_safe_tempo_home_override(path: &Path) -> bool {
+    !path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
 pub fn tempo_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var(TEMPO_HOME_ENV) {
-        return Some(PathBuf::from(home));
+        let candidate = PathBuf::from(home);
+        if is_safe_tempo_home_override(&candidate) {
+            return Some(candidate);
+        }
+        tracing::warn!(
+            env = TEMPO_HOME_ENV,
+            ?candidate,
+            "ignoring unsafe TEMPO_HOME override containing parent directory components"
+        );
     }
     dirs::home_dir().map(|h| h.join(DEFAULT_TEMPO_HOME))
 }

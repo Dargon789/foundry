@@ -91,7 +91,7 @@ fn extract_keccak256_arg<'hir>(expr: &'hir hir::Expr<'hir>) -> Option<&'hir hir:
         return None;
     };
 
-    (is_keccak && args.len() == 1).then(|| &args[0])
+    if is_keccak && args.len() == 1 { Some(&args[0]) } else { None }
 }
 
 // -- HELPER FUNCTIONS AND STRUCTS ----------------------------------------------------------------
