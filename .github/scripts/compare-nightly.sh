@@ -19,7 +19,10 @@ warn = float(os.environ["WARN"])
 fail = float(os.environ["FAIL"])
 
 prev_path = os.environ.get("PREV_JSON", "")
-prev = json.load(open(prev_path)) if prev_path and os.path.isfile(prev_path) else {}
+prev = {}
+if prev_path and os.path.isfile(prev_path):
+    with open(prev_path) as f:
+        prev = json.load(f)
 with open(os.environ["TODAY_JSON"]) as f:
     today = json.load(f)
 
