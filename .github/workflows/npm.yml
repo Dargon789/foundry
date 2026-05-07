@@ -3,12 +3,6 @@ name: npm
 permissions: {}
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_id:
-        type: string
-        required: false
-        description: The run id of the release to publish
   workflow_run:
     types: [completed]
     workflows: [release]
@@ -151,7 +145,7 @@ jobs:
           # Extract artifacts into an isolated temp directory, not the workspace
           path: ${{ steps.paths.outputs.artifact_dir }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
+          run-id: ${{ github.event.workflow_run.id }}
 
       - name: Validate Downloaded Artifacts
         env:
