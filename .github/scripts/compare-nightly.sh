@@ -39,6 +39,13 @@ for key in all_keys:
     if p is None:
         print(f"| `{key}` | N/A | {t:.5f}s | — | 🆕 New |")
         continue
+    if p == 0:
+        if t > 0:
+            print(f"| `{key}` | 0.0s | {t:.5f}s | +∞% | 🔴 Regression |")
+            has_regression = True
+        else:
+            print(f"| `{key}` | 0.0s | {t:.5f}s | — | ➡️ OK |")
+        continue
     delta = (t - p) / p * 100
     if delta >= fail:
         status = "🔴 Regression"
