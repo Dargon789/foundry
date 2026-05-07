@@ -19,7 +19,10 @@ warn = float(os.environ["WARN"])
 fail = float(os.environ["FAIL"])
 
 prev_path = os.environ.get("PREV_JSON", "")
-prev = json.load(open(prev_path)) if prev_path and os.path.isfile(prev_path) else {}
+prev = {}
+if prev_path and os.path.isfile(prev_path):
+    with open(prev_path) as f:
+        prev = json.load(f)
 with open(os.environ["TODAY_JSON"]) as f:
     today = json.load(f)
 
@@ -39,7 +42,10 @@ for key in all_keys:
     if p is None:
         print(f"| `{key}` | N/A | {t:.5f}s | — | 🆕 New |")
         continue
-    delta = (t - p) / p * 100 if p > 0 else 0
+    if p == 0:
+        delta = float('inf') if t > 0 else 0.0
+    else:
+        delta = (t - p) / p * 100
     if delta >= fail:
         status = "🔴 Regression"
         has_regression = True
