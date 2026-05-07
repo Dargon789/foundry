@@ -1,4 +1,5 @@
 //! Helper functions for suggesting alternative values for a possibly erroneous user input.
+use std::cmp::Ordering;
 
 /// Filters multiple strings from a given list of possible values which are similar
 /// to the passed in value `v` within a certain confidence by least confidence.
