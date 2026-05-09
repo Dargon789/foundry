@@ -1,0 +1,22 @@
+version: 2.1
+ 
+jobs:
+  test:
+    docker:
+      - image: ghcr.io/foundry-rs/foundry:latest
+    steps:
+      - checkout
+      - run:
+          name: Install submodules
+          command: git submodule update --init --recursive
+      - run:
+          name: Build
+          command: forge build
+      - run:
+          name: Test
+          command: forge test -vvv
+ 
+workflows:
+  main:
+    jobs:
+      - test

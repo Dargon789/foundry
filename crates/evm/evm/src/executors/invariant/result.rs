@@ -1,10 +1,11 @@
 use super::{
     InvariantFailures, InvariantFuzzError, InvariantMetrics, InvariantTest, InvariantTestRun,
-    call_after_invariant_function, call_invariant_function, error::FailedInvariantCaseData,
+    call_after_invariant_function, call_invariant_function,
+    error::{FailedInvariantCaseData, HandlerAssertionFailure, handler_edge_fingerprint},
 };
 use crate::executors::{Executor, RawCallResult};
 use alloy_dyn_abi::JsonAbiExt;
-use alloy_primitives::I256;
+use alloy_primitives::{Address, B256, I256, Selector};
 use alloy_sol_types::{Panic, PanicKind, Revert, SolError, SolInterface};
 use eyre::Result;
 use foundry_config::InvariantConfig;
@@ -27,7 +28,13 @@ use std::{borrow::Cow, collections::HashMap};
 /// The outcome of an invariant fuzz test
 #[derive(Debug)]
 pub struct InvariantFuzzTestResult {
-    pub error: Option<InvariantFuzzError>,
+    /// Errors recorded per invariant.
+    pub errors: HashMap<String, InvariantFuzzError>,
+    /// Handler-side assertion bugs discovered during the campaign, keyed by the
+    /// `(reverter, selector)` site of the asserting call. These are bugs in fuzzed handler
+    /// functions, distinct from invariant predicate violations; the same handler function
+    /// asserting via different code paths counts as a single bug.
+    pub handler_errors: HashMap<(Address, Selector), HandlerAssertionFailure>,
     /// Every successful fuzz test case
     pub cases: Vec<FuzzedCases>,
     /// Number of reverted fuzz calls
@@ -50,18 +57,25 @@ pub struct InvariantFuzzTestResult {
     pub optimization_best_sequence: Vec<BasicTxDetails>,
 }
 
-/// Enriched results of an invariant run check.
-///
-/// Contains the success condition and call results of the last run
-pub(crate) struct RichInvariantResults<FEN: FoundryEvmNetwork> {
-    pub(crate) can_continue: bool,
-    pub(crate) call_result: Option<RawCallResult<FEN>>,
-}
-
-impl<FEN: FoundryEvmNetwork> RichInvariantResults<FEN> {
-    pub(crate) const fn new(can_continue: bool, call_result: Option<RawCallResult<FEN>>) -> Self {
-        Self { can_continue, call_result }
-    }
+/// Given the executor state, asserts that no invariant has been broken. Otherwise, it fills the
+/// external `invariant_failures.failed_invariant` map and returns a generic error.
+/// Either returns the call result if successful, or nothing if there was an error.
+pub(crate) fn invariant_preflight_check<FEN: FoundryEvmNetwork>(
+    invariant_contract: &InvariantContract<'_>,
+    invariant_config: &InvariantConfig,
+    targeted_contracts: &FuzzRunIdentifiedContracts,
+    executor: &Executor<FEN>,
+    calldata: &[BasicTxDetails],
+    invariant_failures: &mut InvariantFailures,
+) -> Result<()> {
+    assert_invariants(
+        invariant_contract,
+        invariant_config,
+        targeted_contracts,
+        executor,
+        calldata,
+        invariant_failures,
+    )
 }
 
 /// Returns true if this call failed due to a Solidity assertion:
@@ -130,37 +144,50 @@ pub(crate) fn assert_invariants<FEN: FoundryEvmNetwork>(
     executor: &Executor<FEN>,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
-) -> Result<Option<RawCallResult<FEN>>> {
-    let mut inner_sequence = vec![];
+) -> Result<()> {
+    let inner_sequence = invariant_inner_sequence(executor);
 
-    if let Some(fuzzer) = &executor.inspector().fuzzer
-        && let Some(call_generator) = &fuzzer.call_generator
-    {
-        inner_sequence.extend(call_generator.last_sequence.read().iter().cloned());
-    }
-
-    let (call_result, success) = call_invariant_function(
-        executor,
-        invariant_contract.address,
-        invariant_contract.invariant_function.abi_encode_input(&[])?.into(),
-    )?;
-    if !success {
+    for (invariant, fail_on_revert) in &invariant_contract.invariant_fns {
         // We only care about invariants which we haven't broken yet.
-        if invariant_failures.error.is_none() {
-            let case_data = FailedInvariantCaseData::new(
-                invariant_contract,
-                invariant_config,
-                targeted_contracts,
-                calldata,
-                call_result,
-                &inner_sequence,
+        if invariant_failures.has_failure(invariant) {
+            continue;
+        }
+
+        let (call_result, success) = call_invariant_function(
+            executor,
+            invariant_contract.address,
+            invariant.abi_encode_input(&[])?.into(),
+        )?;
+        if !success {
+            invariant_failures.record_failure(
+                invariant,
+                InvariantFuzzError::BrokenInvariant(FailedInvariantCaseData::new(
+                    invariant_contract,
+                    invariant_config.shrink_run_limit,
+                    *fail_on_revert,
+                    targeted_contracts,
+                    calldata,
+                    call_result,
+                    &inner_sequence,
+                )),
             );
-            invariant_failures.error = Some(InvariantFuzzError::BrokenInvariant(case_data));
-            return Ok(None);
         }
     }
 
-    Ok(Some(call_result))
+    Ok(())
+}
+
+/// Helper function to initialize invariant inner sequence.
+fn invariant_inner_sequence<FEN: FoundryEvmNetwork>(
+    executor: &Executor<FEN>,
+) -> Vec<Option<BasicTxDetails>> {
+    let mut seq = vec![];
+    if let Some(fuzzer) = &executor.inspector().fuzzer
+        && let Some(call_generator) = &fuzzer.call_generator
+    {
+        seq.extend(call_generator.last_sequence.read().iter().cloned());
+    }
+    seq
 }
 
 /// Returns if invariant test can continue and last successful call result of the invariant test
@@ -168,15 +195,22 @@ pub(crate) fn assert_invariants<FEN: FoundryEvmNetwork>(
 ///
 /// For optimization mode (int256 return), tracks the max value but never fails on invariant.
 /// For check mode, asserts the invariant and fails if broken.
+///
+/// `handler_target` / `handler_selector` identify the just-executed handler call; they are
+/// used to attribute handler-side assertion failures so they can be tracked independently
+/// from invariant predicate violations.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn can_continue<FEN: FoundryEvmNetwork>(
     invariant_contract: &InvariantContract<'_>,
-    invariant_test: &mut InvariantTest<FEN>,
+    invariant_test: &mut InvariantTest,
     invariant_run: &mut InvariantTestRun<FEN>,
     invariant_config: &InvariantConfig,
     call_result: RawCallResult<FEN>,
     state_changeset: &StateChangeset,
-) -> Result<RichInvariantResults<FEN>> {
-    let mut call_results = None;
+    handler_target: Address,
+    handler_selector: Selector,
+    pre_merge_edges_hash: Option<B256>,
+) -> Result<bool> {
     let is_optimization = invariant_contract.is_optimization();
 
     let handlers_succeeded = || {
@@ -200,7 +234,7 @@ pub(crate) fn can_continue<FEN: FoundryEvmNetwork>(
             let (inv_result, success) = call_invariant_function(
                 &invariant_run.executor,
                 invariant_contract.address,
-                invariant_contract.invariant_function.abi_encode_input(&[])?.into(),
+                invariant_contract.primary_invariant_fn.abi_encode_input(&[])?.into(),
             )?;
             if success
                 && inv_result.result.len() >= 32
@@ -214,10 +248,9 @@ pub(crate) fn can_continue<FEN: FoundryEvmNetwork>(
                     invariant_run.optimization_prefix_len = invariant_run.inputs.len();
                 }
             }
-            call_results = Some(inv_result);
         } else {
             // Check mode: assert invariants and fail if broken.
-            call_results = assert_invariants(
+            assert_invariants(
                 invariant_contract,
                 invariant_config,
                 &invariant_test.targeted_contracts,
@@ -225,51 +258,123 @@ pub(crate) fn can_continue<FEN: FoundryEvmNetwork>(
                 &invariant_run.inputs,
                 &mut invariant_test.test_data.failures,
             )?;
-            if call_results.is_none() {
-                return Ok(RichInvariantResults::new(false, None));
-            }
         }
     } else {
-        let invariant_data = &mut invariant_test.test_data;
         let is_assert_failure = did_fail_on_assert(&call_result, state_changeset);
+        let reverted = call_result.reverted;
 
-        if call_result.reverted {
-            invariant_data.failures.reverts += 1;
+        if reverted {
+            invariant_test.test_data.failures.reverts += 1;
         }
 
-        if is_assert_failure || (call_result.reverted && invariant_config.fail_on_revert) {
-            let case_data = FailedInvariantCaseData::new(
+        if is_assert_failure {
+            // Handler-side assertion: a unique bug attributable to the *handler call*, not to
+            // any of the live `invariant_*` predicates. Dedup by the `(reverter, selector)`
+            // site so the same handler function asserting via different code paths counts as
+            // a single bug (Echidna/Medusa semantics). On collision the shortest
+            // `call_sequence` wins, so persisted reproducers stay minimal.
+            let target = handler_target;
+            let selector = handler_selector;
+            let fingerprint = handler_edge_fingerprint(pre_merge_edges_hash, target, selector);
+
+            // Skip building case data if we already have a strictly shorter repro for this
+            // site — common when a handler asserts repeatedly.
+            let already_minimal = invariant_test
+                .test_data
+                .failures
+                .broken_handlers
+                .get(&(target, selector))
+                .is_some_and(|f| f.call_sequence.len() <= invariant_run.inputs.len());
+
+            if !already_minimal {
+                let case_data = FailedInvariantCaseData::new(
+                    invariant_contract,
+                    invariant_config.shrink_run_limit,
+                    invariant_config.fail_on_revert,
+                    &invariant_test.targeted_contracts,
+                    &invariant_run.inputs,
+                    call_result,
+                    &[],
+                )
+                .with_assertion_failure(true);
+                let revert_reason = case_data.revert_reason;
+                invariant_test.test_data.failures.revert_reason = Some(revert_reason.clone());
+                let call_sequence = invariant_run.inputs.clone();
+                let original_sequence_len = call_sequence.len();
+                invariant_test.test_data.failures.record_handler_failure(HandlerAssertionFailure {
+                    reverter: target,
+                    selector,
+                    call_sequence,
+                    original_sequence_len,
+                    revert_reason,
+                    assertion_failure: true,
+                    edge_fingerprint: fingerprint,
+                });
+            }
+
+            if reverted && !is_optimization && !invariant_config.has_delay() {
+                // Mirror the standard reverted-input pop so the input doesn't appear in
+                // subsequent prefixes. Delay-enabled campaigns keep reverted calls so
+                // shrinking can preserve their warp/roll contribution.
+                invariant_run.inputs.pop();
+            }
+
+            return Ok(invariant_test
+                .test_data
+                .failures
+                .can_continue(invariant_contract.invariant_fns.len()));
+        }
+
+        // Non-assertion revert: per-invariant `fail_on_revert` semantics still mark the
+        // affected invariants as broken (assertion failures are now routed above and never
+        // flow into this filter).
+        let failing_invariants: Vec<_> = invariant_contract
+            .invariant_fns
+            .iter()
+            .filter(|(invariant, fail_on_revert)| {
+                *fail_on_revert && !invariant_test.test_data.failures.has_failure(invariant)
+            })
+            .collect();
+
+        if !failing_invariants.is_empty() {
+            let base = FailedInvariantCaseData::new(
                 invariant_contract,
-                invariant_config,
+                invariant_config.shrink_run_limit,
+                invariant_config.fail_on_revert,
                 &invariant_test.targeted_contracts,
                 &invariant_run.inputs,
                 call_result,
                 &[],
             )
-            .with_assertion_failure(is_assert_failure);
-            invariant_data.failures.revert_reason = Some(case_data.revert_reason.clone());
-            invariant_data.failures.error = Some(if is_assert_failure {
-                InvariantFuzzError::BrokenInvariant(case_data)
-            } else {
-                InvariantFuzzError::Revert(case_data)
-            });
+            .with_assertion_failure(false);
+            invariant_test.test_data.failures.revert_reason = Some(base.revert_reason.clone());
 
-            return Ok(RichInvariantResults::new(false, None));
-        } else if call_result.reverted && !is_optimization && !invariant_config.has_delay() {
+            for (invariant, fail_on_revert) in failing_invariants {
+                let mut data = base.clone();
+                data.fail_on_revert = *fail_on_revert;
+                invariant_test
+                    .test_data
+                    .failures
+                    .record_failure(invariant, InvariantFuzzError::Revert(data));
+            }
+        }
+
+        if reverted && !is_optimization && !invariant_config.has_delay() {
             // If we don't fail test on revert then remove the reverted call from inputs.
             // Delay-enabled campaigns keep reverted calls so shrinking can preserve their
             // warp/roll contribution when building the final counterexample.
             invariant_run.inputs.pop();
         }
     }
-    Ok(RichInvariantResults::new(true, call_results))
+
+    Ok(invariant_test.test_data.failures.can_continue(invariant_contract.invariant_fns.len()))
 }
 
 /// Given the executor state, asserts conditions within `afterInvariant` function.
 /// If call fails then the invariant test is considered failed.
 pub(crate) fn assert_after_invariant<FEN: FoundryEvmNetwork>(
     invariant_contract: &InvariantContract<'_>,
-    invariant_test: &mut InvariantTest<FEN>,
+    invariant_test: &mut InvariantTest,
     invariant_run: &InvariantTestRun<FEN>,
     invariant_config: &InvariantConfig,
 ) -> Result<bool> {
@@ -279,13 +384,17 @@ pub(crate) fn assert_after_invariant<FEN: FoundryEvmNetwork>(
     if !success {
         let case_data = FailedInvariantCaseData::new(
             invariant_contract,
-            invariant_config,
+            invariant_config.shrink_run_limit,
+            invariant_config.fail_on_revert,
             &invariant_test.targeted_contracts,
             &invariant_run.inputs,
             call_result,
             &[],
         );
-        invariant_test.set_error(InvariantFuzzError::BrokenInvariant(case_data));
+        invariant_test.set_error(
+            invariant_contract.primary_invariant_fn,
+            InvariantFuzzError::BrokenInvariant(case_data),
+        );
     }
     Ok(success)
 }
