@@ -120,34 +120,22 @@ impl ScriptTester {
         let from_dir = testdata.join("utils");
         let to_dir = root.join("utils");
         fs::create_dir_all(&to_dir)?;
-        let from_dir = from_dir.canonicalize()?;
         for entry in fs::read_dir(&from_dir)? {
-            let file = entry?.path();
-            // Only operate on regular files to avoid following symlinks or directories
-            let metadata = fs::symlink_metadata(&file)?;
-            let ftype = metadata.file_type();
-            if !ftype.is_file() {
-                continue;
-            }
-            let name = match file.file_name() {
-                Some(name) => name,
-                None => continue,
-            };
+            let file = &entry?.path();
+            let name = file.file_name().unwrap();
             // Validate file name to avoid path traversal and absolute paths
             let name_str = name.to_string_lossy();
             if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
                 // Skip invalid (potentially dangerous) file names
                 continue;
             }
-            // Verify canonicalized file is in from_dir to avoid symlink traversal
+            // Optionally verify canonicalized file is in from_dir to avoid symlink traversal
             if let Ok(canonical_file) = file.canonicalize() {
-                if !canonical_file.starts_with(&from_dir) {
+                if !canonical_file.starts_with(from_dir.canonicalize().unwrap_or_else(|_| from_dir.clone())) {
                     continue;
                 }
-            } else {
-                continue;
             }
-            fs::copy(&file, to_dir.join(name))?;
+            fs::copy(file, to_dir.join(name))?;
         }
         Ok(())
     }
@@ -248,12 +236,11 @@ impl ScriptTester {
 
         trace!(target: "tests", "STDOUT\n{stdout}\n\nSTDERR\n{stderr}");
 
-        if !stdout.contains(expected.as_str()) && !stderr.contains(expected.as_str()) {
-            panic!(
-                "--STDOUT--\n{stdout}\n\n--STDERR--\n{stderr}\n\n--EXPECTED--\n{:?} not found in stdout or stderr",
-                expected.as_str()
-            );
-        }
+        assert!(
+            !(!stdout.contains(expected.as_str()) && !stderr.contains(expected.as_str())),
+            "--STDOUT--\n{stdout}\n\n--STDERR--\n{stderr}\n\n--EXPECTED--\n{:?} not found in stdout or stderr",
+            expected.as_str()
+        );
 
         self
     }
@@ -301,7 +288,7 @@ pub enum ScriptOutcome {
 }
 
 impl ScriptOutcome {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::OkNoEndpoint => "If you wish to simulate on-chain transactions pass a RPC URL.",
             Self::OkSimulation => "SIMULATION COMPLETE. To broadcast these",
@@ -325,7 +312,7 @@ impl ScriptOutcome {
         }
     }
 
-    pub fn is_err(&self) -> bool {
+    pub const fn is_err(&self) -> bool {
         match self {
             Self::OkNoEndpoint
             | Self::OkSimulation

@@ -1318,13 +1318,32 @@ impl Config {
         }
 
         // Remove last test run failures file.
-        if let Err(err) = fs::remove_file(&self.test_failures_file)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            warnings.push(format!(
-                "failed to remove test failures file {}: {err}",
-                self.test_failures_file.display()
-            ));
+        let test_failures_path = if self.test_failures_file.is_absolute() {
+            self.test_failures_file.clone()
+        } else {
+            project.root().join(&self.test_failures_file)
+        };
+        let root_canon = dunce::canonicalize(project.root()).unwrap_or_else(|_| project.root().to_path_buf());
+        let validated_test_failures_path = test_failures_path
+            .parent()
+            .and_then(|parent| dunce::canonicalize(parent).ok().map(|p| (p, test_failures_path.file_name())))
+            .and_then(|(parent, file_name)| file_name.map(|name| parent.join(name)));
+
+        match validated_test_failures_path {
+            Some(path) if path.starts_with(&root_canon) => {
+                if let Err(err) = fs::remove_file(&path) && err.kind() != io::ErrorKind::NotFound {
+                    warnings.push(format!(
+                        "failed to remove test failures file {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            _ => {
+                warnings.push(format!(
+                    "skipped removing test failures file outside project root: {}",
+                    test_failures_path.display()
+                ));
+            }
         }
 
         // Remove fuzz and invariant cache directories.

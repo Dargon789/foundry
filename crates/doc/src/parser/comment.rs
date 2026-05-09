@@ -205,12 +205,6 @@ impl Comments {
     }
 }
 
-impl From<Vec<Comment>> for Comments {
-    fn from(value: Vec<Comment>) -> Self {
-        Self(value)
-    }
-}
-
 /// The collection of references to natspec [Comment] items.
 #[derive(Debug, Default, PartialEq, Eq, Deref)]
 pub struct CommentsRef<'a>(Vec<&'a Comment>);
