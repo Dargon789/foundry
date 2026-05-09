@@ -1298,7 +1298,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
                 .journal()
                 .evm_state()
                 .get(&create.caller())
-                .map(|acc| create.caller().create(acc.info.nonce));
+                .map(|acc| create.caller().create(acc.info.nonce.saturating_sub(1)));
 
             let (result, address) = self.transact_inner(
                 ecx,
