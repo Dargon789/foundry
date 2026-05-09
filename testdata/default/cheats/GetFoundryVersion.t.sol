@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.18;
 
-import "ds-test/test.sol";
-import "cheats/Vm.sol";
+import "utils/Test.sol";
 
-contract GetFoundryVersionTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract GetFoundryVersionTest is Test {
     function testGetFoundryVersion() public view {
         // (e.g. 0.3.0-nightly+3cb96bde9b.1737036656.debug)
         string memory fullVersionString = vm.getFoundryVersion();
@@ -86,5 +83,56 @@ contract GetFoundryVersionTest is DSTest {
 
         // Should return true for past versions
         assertTrue(vm.foundryVersionAtLeast("0.2.0"));
+    }
+
+    /// Returns the `MAJOR.MINOR.PATCH` prefix of `vm.getFoundryVersion()`,
+    /// stripping any pre-release suffix (`-nightly`, `-dev`, …) and the
+    /// `+<sha>.<ts>.<profile>` build metadata.
+    function _semverPrefix() internal view returns (string memory) {
+        string[] memory plusSplit = vm.split(vm.getFoundryVersion(), "+");
+        require(plusSplit.length == 2, "Invalid version format: Missing '+' separator");
+        string[] memory dashSplit = vm.split(plusSplit[0], "-");
+        return dashSplit[0];
+    }
+
+    function testGetFoundryVersionMajorMinorPatchIsParseable() public view {
+        // The MAJOR.MINOR.PATCH prefix must always be three numeric components,
+        // regardless of build kind (tagged release / nightly / dev).
+        string[] memory parts = vm.split(_semverPrefix(), ".");
+        require(parts.length == 3, "Invalid semver prefix: expected MAJOR.MINOR.PATCH");
+        // Each component must parse as a uint (this reverts on garbage).
+        vm.parseUint(parts[0]);
+        vm.parseUint(parts[1]);
+        vm.parseUint(parts[2]);
+    }
+
+    function testGetFoundryVersionBuildProfile() public view {
+        // The build profile must be present and non-empty (e.g. "debug", "release", "dist", …).
+        string[] memory plusSplit = vm.split(vm.getFoundryVersion(), "+");
+        string[] memory metadataComponents = vm.split(plusSplit[1], ".");
+        require(bytes(metadataComponents[2]).length > 0, "Build profile is empty");
+    }
+
+    function testFoundryVersionCmpAndAtLeastAreConsistent() public {
+        // `foundryVersionAtLeast(v)` must equal `foundryVersionCmp(v) >= 0` for any input.
+        string[3] memory probes = ["0.0.1", _semverPrefix(), "99.0.0"];
+        for (uint256 i = 0; i < probes.length; i++) {
+            assertEq(vm.foundryVersionAtLeast(probes[i]), vm.foundryVersionCmp(probes[i]) >= 0);
+        }
+    }
+
+    function testFoundryVersionCmpRejectsPreRelease() public {
+        vm._expectCheatcodeRevert();
+        vm.foundryVersionCmp("1.0.0-nightly");
+    }
+
+    function testFoundryVersionCmpRejectsBuildMetadata() public {
+        vm._expectCheatcodeRevert();
+        vm.foundryVersionCmp("1.0.0+abc1234567.1700000000.release");
+    }
+
+    function testFoundryVersionCmpRejectsInvalidVersion() public {
+        vm._expectCheatcodeRevert();
+        vm.foundryVersionCmp("not-a-version");
     }
 }

@@ -1,109 +1,110 @@
 //! Implementations of [`Scripting`](spec::Group::Scripting) cheatcodes.
 
-use crate::{Cheatcode, CheatsCtxt, Result, Vm::*};
+use crate::{Cheatcode, CheatsCtxt, Result, Vm::*, evm::journaled_account};
 use alloy_consensus::{SidecarBuilder, SimpleCoder};
-use alloy_primitives::{Address, Uint, B256, U256};
+use alloy_primitives::{Address, B256, U256, Uint};
 use alloy_rpc_types::Authorization;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolValue;
-use foundry_wallets::{multi_wallet::MultiWallet, WalletSigner};
+use foundry_evm_core::evm::FoundryEvmNetwork;
+use foundry_wallets::{WalletSigner, wallet_multi::MultiWallet};
 use parking_lot::Mutex;
 use revm::{
     bytecode::Bytecode,
-    context::JournalTr,
+    context::{Cfg, ContextTr, JournalTr, Transaction},
     context_interface::transaction::SignedAuthorization,
-    primitives::{hardfork::SpecId, KECCAK_EMPTY},
+    primitives::{KECCAK_EMPTY, hardfork::SpecId},
 };
 use std::sync::Arc;
 
 impl Cheatcode for broadcast_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         broadcast(ccx, None, true)
     }
 }
 
 impl Cheatcode for broadcast_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { signer } = self;
         broadcast(ccx, Some(signer), true)
     }
 }
 
 impl Cheatcode for broadcast_2Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { privateKey } = self;
         broadcast_key(ccx, privateKey, true)
     }
 }
 
 impl Cheatcode for attachDelegation_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { signedDelegation } = self;
         attach_delegation(ccx, signedDelegation, false)
     }
 }
 
 impl Cheatcode for attachDelegation_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { signedDelegation, crossChain } = self;
         attach_delegation(ccx, signedDelegation, *crossChain)
     }
 }
 
 impl Cheatcode for signDelegation_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { implementation, privateKey } = *self;
         sign_delegation(ccx, privateKey, implementation, None, false, false)
     }
 }
 
 impl Cheatcode for signDelegation_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { implementation, privateKey, nonce } = *self;
         sign_delegation(ccx, privateKey, implementation, Some(nonce), false, false)
     }
 }
 
 impl Cheatcode for signDelegation_2Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { implementation, privateKey, crossChain } = *self;
         sign_delegation(ccx, privateKey, implementation, None, crossChain, false)
     }
 }
 
 impl Cheatcode for signAndAttachDelegation_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { implementation, privateKey } = *self;
         sign_delegation(ccx, privateKey, implementation, None, false, true)
     }
 }
 
 impl Cheatcode for signAndAttachDelegation_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { implementation, privateKey, nonce } = *self;
         sign_delegation(ccx, privateKey, implementation, Some(nonce), false, true)
     }
 }
 
 impl Cheatcode for signAndAttachDelegation_2Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { implementation, privateKey, crossChain } = *self;
         sign_delegation(ccx, privateKey, implementation, None, crossChain, true)
     }
 }
 
 /// Helper function to attach an EIP-7702 delegation.
-fn attach_delegation(
-    ccx: &mut CheatsCtxt,
+fn attach_delegation<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
     delegation: &SignedDelegation,
     cross_chain: bool,
 ) -> Result {
     let SignedDelegation { v, r, s, nonce, implementation } = delegation;
     // Set chain id to 0 if universal deployment is preferred.
     // See https://github.com/ethereum/EIPs/blob/master/EIPS/eip-7702.md#protection-from-malleability-cross-chain
-    let chain_id = if cross_chain { U256::from(0) } else { U256::from(ccx.ecx.cfg.chain_id) };
+    let chain_id = if cross_chain { U256::from(0) } else { U256::from(ccx.ecx.cfg().chain_id()) };
 
     let auth = Authorization { address: *implementation, nonce: *nonce, chain_id };
     let signed_auth = SignedAuthorization::new_unchecked(
@@ -113,14 +114,14 @@ fn attach_delegation(
         U256::from_be_bytes(s.0),
     );
     write_delegation(ccx, signed_auth.clone())?;
-    ccx.state.active_delegation = Some(signed_auth);
+    ccx.state.add_delegation(signed_auth);
     Ok(Default::default())
 }
 
 /// Helper function to sign and attach (if needed) an EIP-7702 delegation.
 /// Uses the provided nonce, otherwise retrieves and increments the nonce of the EOA.
-fn sign_delegation(
-    ccx: &mut CheatsCtxt,
+fn sign_delegation<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
     private_key: Uint<256, 4>,
     implementation: Address,
     nonce: Option<u64>,
@@ -131,11 +132,19 @@ fn sign_delegation(
     let nonce = if let Some(nonce) = nonce {
         nonce
     } else {
-        let authority_acc = ccx.ecx.journaled_state.load_account(signer.address())?;
-        // If we don't have a nonce then use next auth account nonce.
-        authority_acc.data.info.nonce + 1
+        let account_nonce = {
+            let authority_acc = ccx.ecx.journal_mut().load_account(signer.address())?;
+            authority_acc.info.nonce
+        };
+        // Calculate next nonce considering existing active delegations
+        next_delegation_nonce(
+            &ccx.state.active_delegations,
+            signer.address(),
+            &ccx.state.broadcast,
+            account_nonce,
+        )
     };
-    let chain_id = if cross_chain { U256::from(0) } else { U256::from(ccx.ecx.cfg.chain_id) };
+    let chain_id = if cross_chain { U256::from(0) } else { U256::from(ccx.ecx.cfg().chain_id()) };
 
     let auth = Authorization { address: implementation, nonce, chain_id };
     let sig = signer.sign_hash_sync(&auth.signature_hash())?;
@@ -143,7 +152,7 @@ fn sign_delegation(
     if attach {
         let signed_auth = SignedAuthorization::new_unchecked(auth, sig.v() as u8, sig.r(), sig.s());
         write_delegation(ccx, signed_auth.clone())?;
-        ccx.state.active_delegation = Some(signed_auth);
+        ccx.state.add_delegation(signed_auth);
     }
     Ok(SignedDelegation {
         v: sig.v() as u8,
@@ -155,62 +164,113 @@ fn sign_delegation(
     .abi_encode())
 }
 
-fn write_delegation(ccx: &mut CheatsCtxt, auth: SignedAuthorization) -> Result<()> {
+/// Returns the next valid nonce for a delegation, considering existing active delegations.
+fn next_delegation_nonce(
+    active_delegations: &[SignedAuthorization],
+    authority: Address,
+    broadcast: &Option<Broadcast>,
+    account_nonce: u64,
+) -> u64 {
+    match active_delegations
+        .iter()
+        .rfind(|auth| auth.recover_authority().is_ok_and(|recovered| recovered == authority))
+    {
+        Some(auth) => {
+            // Increment nonce of last recorded delegation.
+            auth.nonce + 1
+        }
+        None => {
+            // First time a delegation is added for this authority.
+            if let Some(broadcast) = broadcast {
+                // Increment nonce if authority is the sender of transaction.
+                if broadcast.new_origin == authority {
+                    return account_nonce + 1;
+                }
+            }
+            // Return current nonce if authority is not the sender of transaction.
+            account_nonce
+        }
+    }
+}
+
+fn write_delegation<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    auth: SignedAuthorization,
+) -> Result<()> {
     let authority = auth.recover_authority().map_err(|e| format!("{e}"))?;
-    let authority_acc = ccx.ecx.journaled_state.load_account(authority)?;
-    if authority_acc.data.info.nonce + 1 != auth.nonce {
-        return Err("invalid nonce".into());
+    let account_nonce = {
+        let authority_acc = ccx.ecx.journal_mut().load_account(authority)?;
+        authority_acc.info.nonce
+    };
+
+    let expected_nonce = next_delegation_nonce(
+        &ccx.state.active_delegations,
+        authority,
+        &ccx.state.broadcast,
+        account_nonce,
+    );
+
+    if expected_nonce != auth.nonce {
+        return Err(format!(
+            "invalid nonce for {authority:?}: expected {expected_nonce}, got {}",
+            auth.nonce
+        )
+        .into());
     }
 
     if auth.address.is_zero() {
         // Set empty code if the delegation address of authority is 0x.
         // See https://github.com/ethereum/EIPs/blob/master/EIPS/eip-7702.md#behavior.
-        ccx.ecx.journaled_state.set_code_with_hash(authority, Bytecode::default(), KECCAK_EMPTY);
+        ccx.ecx.journal_mut().set_code_with_hash(authority, Bytecode::default(), KECCAK_EMPTY);
     } else {
         let bytecode = Bytecode::new_eip7702(*auth.address());
-        ccx.ecx.journaled_state.set_code(authority, bytecode);
+        ccx.ecx.journal_mut().set_code(authority, bytecode);
     }
     Ok(())
 }
 
 impl Cheatcode for attachBlobCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { blob } = self;
         ensure!(
-            ccx.ecx.cfg.spec >= SpecId::CANCUN,
+            (*ccx.ecx.cfg().spec()).into() >= SpecId::CANCUN,
             "`attachBlob` is not supported before the Cancun hard fork; \
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
         let sidecar: SidecarBuilder<SimpleCoder> = SidecarBuilder::from_slice(blob);
-        let sidecar = sidecar.build().map_err(|e| format!("{e}"))?;
-        ccx.state.active_blob_sidecar = Some(sidecar);
+        let sidecar_variant = if (*ccx.ecx.cfg().spec()).into() < SpecId::OSAKA {
+            sidecar.build_4844().map_err(|e| format!("{e}"))?.into()
+        } else {
+            sidecar.build_7594().map_err(|e| format!("{e}"))?.into()
+        };
+        ccx.state.active_blob_sidecar = Some(sidecar_variant);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for startBroadcast_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         broadcast(ccx, None, false)
     }
 }
 
 impl Cheatcode for startBroadcast_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { signer } = self;
         broadcast(ccx, Some(signer), false)
     }
 }
 
 impl Cheatcode for startBroadcast_2Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { privateKey } = self;
         broadcast_key(ccx, privateKey, false)
     }
 }
 
 impl Cheatcode for stopBroadcastCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         let Some(broadcast) = ccx.state.broadcast.take() else {
             bail!("no broadcast in progress to stop");
@@ -221,7 +281,7 @@ impl Cheatcode for stopBroadcastCall {
 }
 
 impl Cheatcode for getWalletsCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let wallets = ccx.state.wallets().signers().unwrap_or_default();
         Ok(wallets.abi_encode())
     }
@@ -239,6 +299,8 @@ pub struct Broadcast {
     pub depth: usize,
     /// Whether the prank stops by itself after the next call
     pub single_call: bool,
+    /// Whether `vm.deployCode` cheatcode is used to deploy from code.
+    pub deploy_from_code: bool,
 }
 
 /// Contains context for wallet management.
@@ -250,7 +312,7 @@ pub struct WalletsInner {
     pub provided_sender: Option<Address>,
 }
 
-/// Clonable wrapper around [`WalletsInner`].
+/// Cloneable wrapper around [`WalletsInner`].
 #[derive(Debug, Clone)]
 pub struct Wallets {
     /// Inner data.
@@ -273,29 +335,19 @@ impl Wallets {
     }
 
     /// Locks inner Mutex and adds a signer to the [MultiWallet].
-    pub fn add_private_key(&self, private_key: &B256) -> Result<()> {
-        self.add_local_signer(PrivateKeySigner::from_bytes(private_key)?);
-        Ok(())
-    }
-
-    /// Locks inner Mutex and adds a signer to the [MultiWallet].
     pub fn add_local_signer(&self, wallet: PrivateKeySigner) {
         self.inner.lock().multi_wallet.add_signer(WalletSigner::Local(wallet));
     }
 
     /// Locks inner Mutex and returns all signer addresses in the [MultiWallet].
     pub fn signers(&self) -> Result<Vec<Address>> {
-        Ok(self.inner.lock().multi_wallet.signers()?.keys().cloned().collect())
+        Ok(self.inner.lock().multi_wallet.signers()?.keys().copied().collect())
     }
 
     /// Number of signers in the [MultiWallet].
     pub fn len(&self) -> usize {
         let mut inner = self.inner.lock();
-        let signers = inner.multi_wallet.signers();
-        if signers.is_err() {
-            return 0;
-        }
-        signers.unwrap().len()
+        inner.multi_wallet.signers().map_or(0, |signers| signers.len())
     }
 
     /// Whether the [MultiWallet] is empty.
@@ -305,15 +357,19 @@ impl Wallets {
 }
 
 /// Sets up broadcasting from a script using `new_origin` as the sender.
-fn broadcast(ccx: &mut CheatsCtxt, new_origin: Option<&Address>, single_call: bool) -> Result {
-    let depth = ccx.ecx.journaled_state.depth();
+fn broadcast<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    new_origin: Option<&Address>,
+    single_call: bool,
+) -> Result {
+    let depth = ccx.ecx.journal().depth();
     ensure!(
         ccx.state.get_prank(depth).is_none(),
         "you have an active prank; broadcasting and pranks are not compatible"
     );
     ensure!(ccx.state.broadcast.is_none(), "a broadcast is active already");
 
-    let mut new_origin = new_origin.cloned();
+    let mut new_origin = new_origin.copied();
 
     if new_origin.is_none() {
         let mut wallets = ccx.state.wallets().inner.lock();
@@ -327,13 +383,17 @@ fn broadcast(ccx: &mut CheatsCtxt, new_origin: Option<&Address>, single_call: bo
             }
         }
     }
+    let new_origin = new_origin.unwrap_or(ccx.ecx.tx().caller());
+    // Ensure new origin is loaded and touched.
+    let _ = journaled_account(ccx.ecx, new_origin)?;
 
     let broadcast = Broadcast {
-        new_origin: new_origin.unwrap_or(ccx.ecx.tx.caller),
+        new_origin,
         original_caller: ccx.caller,
-        original_origin: ccx.ecx.tx.caller,
+        original_origin: ccx.ecx.tx().caller(),
         depth,
         single_call,
+        deploy_from_code: false,
     };
     debug!(target: "cheatcodes", ?broadcast, "started");
     ccx.state.broadcast = Some(broadcast);
@@ -343,7 +403,11 @@ fn broadcast(ccx: &mut CheatsCtxt, new_origin: Option<&Address>, single_call: bo
 /// Sets up broadcasting from a script with the sender derived from `private_key`.
 /// Adds this private key to `state`'s `wallets` vector to later be used for signing
 /// if broadcast is successful.
-fn broadcast_key(ccx: &mut CheatsCtxt, private_key: &U256, single_call: bool) -> Result {
+fn broadcast_key<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    private_key: &U256,
+    single_call: bool,
+) -> Result {
     let wallet = super::crypto::parse_wallet(private_key)?;
     let new_origin = wallet.address();
 

@@ -1,6 +1,10 @@
 use crate::{eth::subscription::SubscriptionId, types::ReorgOptions};
-use alloy_primitives::{Address, Bytes, TxHash, B256, B64, U256};
+use alloy_primitives::{
+    Address, B64, B256, Bytes, TxHash, U256,
+    map::{HashMap, HashSet},
+};
 use alloy_rpc_types::{
+    BlockId, BlockNumberOrTag as BlockNumber, BlockOverrides, Filter, Index,
     anvil::{Forking, MineOptions},
     pubsub::{Params as SubscriptionParams, SubscriptionKind},
     request::TransactionRequest,
@@ -9,12 +13,13 @@ use alloy_rpc_types::{
     trace::{
         filter::TraceFilter,
         geth::{GethDebugTracingCallOptions, GethDebugTracingOptions},
+        parity::TraceType,
     },
-    BlockId, BlockNumberOrTag as BlockNumber, BlockOverrides, Filter, Index,
 };
 use alloy_serde::WithOtherFields;
 use foundry_common::serde_helpers::{
-    deserialize_number, deserialize_number_opt, deserialize_number_seq,
+    deserialize_number, deserialize_number_opt, deserialize_number_seq, deserialize_u64_seq,
+    deserialize_u64_seq_opt,
 };
 
 pub mod block;
@@ -27,7 +32,7 @@ use self::serde_helpers::*;
 
 /// Wrapper type that ensures the type is named `params`
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-pub struct Params<T: Default> {
+pub struct Params<T> {
     #[serde(default)]
     pub params: T,
 }
@@ -43,6 +48,10 @@ pub enum EthRequest {
     #[serde(rename = "web3_sha3", with = "sequence")]
     Web3Sha3(Bytes),
 
+    /// Returns the current Ethereum protocol version.
+    #[serde(rename = "eth_protocolVersion", with = "empty_params")]
+    EthProtocolVersion(()),
+
     #[serde(rename = "eth_chainId", with = "empty_params")]
     EthChainId(()),
 
@@ -51,6 +60,10 @@ pub enum EthRequest {
 
     #[serde(rename = "net_listening", with = "empty_params")]
     NetListening(()),
+
+    /// Returns the number of hashes per second with which the node is mining.
+    #[serde(rename = "eth_hashrate", with = "empty_params")]
+    EthHashrate(()),
 
     #[serde(rename = "eth_gasPrice", with = "empty_params")]
     EthGasPrice(()),
@@ -67,6 +80,10 @@ pub enum EthRequest {
     #[serde(rename = "eth_blockNumber", with = "empty_params")]
     EthBlockNumber(()),
 
+    /// Returns the client coinbase address.
+    #[serde(rename = "eth_coinbase", with = "empty_params")]
+    EthCoinbase(()),
+
     #[serde(rename = "eth_getBalance")]
     EthGetBalance(Address, Option<BlockId>),
 
@@ -78,6 +95,10 @@ pub enum EthRequest {
 
     #[serde(rename = "eth_getStorageAt")]
     EthGetStorageAt(Address, U256, Option<BlockId>),
+
+    /// Returns storage values for multiple accounts and slots in a single call.
+    #[serde(rename = "eth_getStorageValues")]
+    EthGetStorageValues(HashMap<Address, Vec<B256>>, Option<BlockId>),
 
     #[serde(rename = "eth_getBlockByHash")]
     EthGetBlockByHash(B256, bool),
@@ -144,8 +165,14 @@ pub enum EthRequest {
     #[serde(rename = "eth_sendTransaction", with = "sequence")]
     EthSendTransaction(Box<WithOtherFields<TransactionRequest>>),
 
+    #[serde(rename = "eth_sendTransactionSync", with = "sequence")]
+    EthSendTransactionSync(Box<WithOtherFields<TransactionRequest>>),
+
     #[serde(rename = "eth_sendRawTransaction", with = "sequence")]
     EthSendRawTransaction(Bytes),
+
+    #[serde(rename = "eth_sendRawTransactionSync", with = "sequence")]
+    EthSendRawTransactionSync(Bytes),
 
     #[serde(rename = "eth_call")]
     EthCall(
@@ -169,11 +196,26 @@ pub enum EthRequest {
         #[serde(default)] Option<Box<BlockOverrides>>,
     ),
 
+    #[serde(rename = "eth_fillTransaction", with = "sequence")]
+    EthFillTransaction(WithOtherFields<TransactionRequest>),
+
     #[serde(rename = "eth_getTransactionByHash", with = "sequence")]
     EthGetTransactionByHash(TxHash),
 
+    /// Returns the blob for a given blob versioned hash.
+    #[serde(rename = "anvil_getBlobByHash", with = "sequence")]
+    GetBlobByHash(B256),
+
+    /// Returns the blobs for a given transaction hash.
+    #[serde(rename = "anvil_getBlobsByTransactionHash", with = "sequence")]
+    GetBlobByTransactionHash(TxHash),
+
+    /// Returns the genesis time for the chain
+    #[serde(rename = "anvil_getGenesisTime", with = "empty_params")]
+    GetGenesisTime(()),
+
     #[serde(rename = "eth_getTransactionByBlockHashAndIndex")]
-    EthGetTransactionByBlockHashAndIndex(TxHash, Index),
+    EthGetTransactionByBlockHashAndIndex(B256, Index),
 
     #[serde(rename = "eth_getTransactionByBlockNumberAndIndex")]
     EthGetTransactionByBlockNumberAndIndex(BlockNumber, Index),
@@ -182,7 +224,7 @@ pub enum EthRequest {
     EthGetRawTransactionByHash(TxHash),
 
     #[serde(rename = "eth_getRawTransactionByBlockHashAndIndex")]
-    EthGetRawTransactionByBlockHashAndIndex(TxHash, Index),
+    EthGetRawTransactionByBlockHashAndIndex(B256, Index),
 
     #[serde(rename = "eth_getRawTransactionByBlockNumberAndIndex")]
     EthGetRawTransactionByBlockNumberAndIndex(BlockNumber, Index),
@@ -250,6 +292,9 @@ pub enum EthRequest {
     #[serde(rename = "eth_syncing", with = "empty_params")]
     EthSyncing(()),
 
+    #[serde(rename = "eth_config", with = "empty_params")]
+    EthConfig(()),
+
     /// geth's `debug_getRawTransaction`  endpoint
     #[serde(rename = "debug_getRawTransaction", with = "sequence")]
     DebugGetRawTransaction(TxHash),
@@ -266,6 +311,22 @@ pub enum EthRequest {
         #[serde(default)] GethDebugTracingCallOptions,
     ),
 
+    /// reth's `debug_codeByHash` endpoint
+    #[serde(rename = "debug_codeByHash")]
+    DebugCodeByHash(B256, #[serde(default)] Option<BlockId>),
+
+    /// reth's `debug_dbGet` endpoint
+    #[serde(rename = "debug_dbGet")]
+    DebugDbGet(String),
+
+    /// geth's `debug_traceBlockByHash` endpoint
+    #[serde(rename = "debug_traceBlockByHash")]
+    DebugTraceBlockByHash(B256, #[serde(default)] GethDebugTracingOptions),
+
+    /// geth's `debug_traceBlockByNumber` endpoint
+    #[serde(rename = "debug_traceBlockByNumber")]
+    DebugTraceBlockByNumber(BlockNumber, #[serde(default)] GethDebugTracingOptions),
+
     /// Trace transaction endpoint for parity's `trace_transaction`
     #[serde(rename = "trace_transaction", with = "sequence")]
     TraceTransaction(B256),
@@ -280,6 +341,13 @@ pub enum EthRequest {
     // Return filtered traces over blocks
     #[serde(rename = "trace_filter", with = "sequence")]
     TraceFilter(TraceFilter),
+
+    /// Trace transaction endpoint for parity's `trace_replayBlockTransactions`
+    #[serde(rename = "trace_replayBlockTransactions")]
+    TraceReplayBlockTransactions(
+        #[serde(deserialize_with = "lenient_block_number::lenient_block_number")] BlockNumber,
+        HashSet<TraceType>,
+    ),
 
     // Custom endpoints, they're not extracted to a separate type out of serde convenience
     /// send transactions impersonating specific account and contract addresses.
@@ -303,6 +371,11 @@ pub enum EthRequest {
         with = "sequence"
     )]
     AutoImpersonateAccount(bool),
+
+    /// Registers a signature/address pair for faking `ecrecover` results
+    #[serde(rename = "anvil_impersonateSignature", with = "sequence")]
+    ImpersonateSignature(Bytes, Address),
+
     /// Returns true if automatic mining is enabled, and false.
     #[serde(rename = "anvil_getAutomine", alias = "hardhat_getAutomine", with = "empty_params")]
     GetAutoMine(()),
@@ -328,7 +401,7 @@ pub enum EthRequest {
     #[serde(
         rename = "anvil_setIntervalMining",
         alias = "evm_setIntervalMining",
-        with = "sequence"
+        deserialize_with = "deserialize_u64_seq"
     )]
     SetIntervalMining(u64),
 
@@ -337,11 +410,7 @@ pub enum EthRequest {
     GetIntervalMining(()),
 
     /// Removes transactions from the pool
-    #[serde(
-        rename = "anvil_dropTransaction",
-        alias = "hardhat_dropTransaction",
-        with = "sequence"
-    )]
+    #[serde(rename = "anvil_dropTransaction", alias = "hardhat_dropTransaction", with = "sequence")]
     DropTransaction(B256),
 
     /// Removes transactions from the pool
@@ -380,10 +449,18 @@ pub enum EthRequest {
     #[serde(
         rename = "anvil_dealERC20",
         alias = "hardhat_dealERC20",
-        alias = "anvil_setERC20Balance",
-        alias = "tenderly_setErc20Balance"
+        alias = "anvil_setERC20Balance"
     )]
     DealERC20(Address, Address, #[serde(deserialize_with = "deserialize_number")] U256),
+
+    /// Sets the ERC20 allowance for a spender
+    #[serde(rename = "anvil_setERC20Allowance")]
+    SetERC20Allowance(
+        Address,
+        Address,
+        Address,
+        #[serde(deserialize_with = "deserialize_number")] U256,
+    ),
 
     /// Sets the code of a contract
     #[serde(rename = "anvil_setCode", alias = "hardhat_setCode")]
@@ -408,7 +485,7 @@ pub enum EthRequest {
     SetCoinbase(Address),
 
     /// Sets the chain id
-    #[serde(rename = "anvil_setChainId", with = "sequence")]
+    #[serde(rename = "anvil_setChainId", deserialize_with = "deserialize_u64_seq")]
     SetChainId(u64),
 
     /// Enable or disable logging
@@ -507,7 +584,7 @@ pub enum EthRequest {
     /// Similar to `evm_increaseTime` but takes sets a block timestamp `interval`.
     ///
     /// The timestamp of the next block will be computed as `lastBlock_timestamp + interval`.
-    #[serde(rename = "anvil_setBlockTimestampInterval", with = "sequence")]
+    #[serde(rename = "anvil_setBlockTimestampInterval", deserialize_with = "deserialize_u64_seq")]
     EvmSetBlockTimeStampInterval(u64),
 
     /// Removes a `anvil_setBlockTimestampInterval` if it exists
@@ -528,11 +605,6 @@ pub enum EthRequest {
     /// Execute a transaction regardless of signature status
     #[serde(rename = "eth_sendUnsignedTransaction", with = "sequence")]
     EthSendUnsignedTransaction(Box<WithOtherFields<TransactionRequest>>),
-
-    /// Turn on call traces for transactions that are returned to the user when they execute a
-    /// transaction (instead of just txhash/receipt)
-    #[serde(rename = "anvil_enableTraces", with = "empty_params")]
-    EnableTraces(()),
 
     /// Returns the number of transactions currently pending for inclusion in the next block(s), as
     /// well as the ones that are being scheduled for future execution only.
@@ -632,6 +704,14 @@ pub enum EthRequest {
         #[serde(deserialize_with = "deserialize_number")] U256,
     ),
 
+    /// Returns the transaction by sender and nonce
+    /// Returns the full transaction data.
+    #[serde(rename = "eth_getTransactionBySenderAndNonce")]
+    EthGetTransactionBySenderAndNonce(
+        Address,
+        #[serde(deserialize_with = "deserialize_number")] U256,
+    ),
+
     /// Otterscan's `ots_getTransactionBySenderAndNonce` endpoint
     /// Given an ETH contract address, returns the tx hash and the direct address who created the
     /// contract.
@@ -647,30 +727,28 @@ pub enum EthRequest {
     Reorg(ReorgOptions),
 
     /// Rollback the chain
-    #[serde(rename = "anvil_rollback", with = "sequence")]
+    #[serde(rename = "anvil_rollback", deserialize_with = "deserialize_u64_seq_opt")]
     Rollback(Option<u64>),
 
-    /// Wallet
-    #[serde(rename = "wallet_getCapabilities", with = "empty_params")]
-    WalletGetCapabilities(()),
+    /// Sets the fee token for a user (Tempo-only)
+    #[serde(rename = "anvil_setFeeToken")]
+    SetFeeToken(Address, Address),
 
-    /// Wallet send_tx
-    #[serde(
-        rename = "wallet_sendTransaction",
-        alias = "odyssey_sendTransaction",
-        with = "sequence"
-    )]
-    WalletSendTransaction(Box<WithOtherFields<TransactionRequest>>),
+    /// Sets the fee token for a validator (Tempo-only)
+    #[serde(rename = "anvil_setValidatorFeeToken")]
+    SetValidatorFeeToken(Address, Address),
 
-    /// Add an address to the [`DelegationCapability`] of the wallet
-    ///
-    /// [`DelegationCapability`]: wallet::DelegationCapability  
-    #[serde(rename = "anvil_addCapability", with = "sequence")]
-    AnvilAddCapability(Address),
-
-    /// Set the executor (sponsor) wallet
-    #[serde(rename = "anvil_setExecutor", with = "sequence")]
-    AnvilSetExecutor(String),
+    /// Mints FeeAMM liquidity for a token pair (Tempo-only)
+    #[serde(rename = "anvil_setFeeAmmLiquidity")]
+    SetFeeAmmLiquidity(
+        /// user_token
+        Address,
+        /// validator_token
+        Address,
+        /// amount
+        #[serde(deserialize_with = "deserialize_number")]
+        U256,
+    ),
 }
 
 /// Represents ethereum JSON-RPC API
@@ -851,6 +929,68 @@ mod tests {
         let s = r#"{"method": "evm_setIntervalMining", "params": [100]}"#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn test_numeric_params_accept_hex_and_decimal_strings() {
+        // Standard JSON-RPC clients (web3.js / ethers / viem) encode numeric params as hex
+        // strings. These methods keep their internal `u64` types, but use a U64-aware
+        // deserializer for RPC params.
+        let parse = |s: &str| {
+            let value: serde_json::Value = serde_json::from_str(s).unwrap();
+            serde_json::from_value::<EthRequest>(value)
+        };
+
+        match parse(r#"{"method": "anvil_setIntervalMining", "params": [100]}"#).unwrap() {
+            EthRequest::SetIntervalMining(interval) => assert_eq!(interval, 100),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setIntervalMining", "params": 100}"#).unwrap() {
+            EthRequest::SetIntervalMining(interval) => assert_eq!(interval, 100),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setIntervalMining", "params": ["0x64"]}"#).unwrap() {
+            EthRequest::SetIntervalMining(interval) => assert_eq!(interval, 100),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setIntervalMining", "params": "0x64"}"#).unwrap() {
+            EthRequest::SetIntervalMining(interval) => assert_eq!(interval, 100),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setIntervalMining", "params": ["100"]}"#).unwrap() {
+            EthRequest::SetIntervalMining(interval) => assert_eq!(interval, 100),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setIntervalMining", "params": "100"}"#).unwrap() {
+            EthRequest::SetIntervalMining(interval) => assert_eq!(interval, 100),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setChainId", "params": ["0x539"]}"#).unwrap() {
+            EthRequest::SetChainId(chain_id) => assert_eq!(chain_id, 1337),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_setBlockTimestampInterval", "params": ["0xa"]}"#).unwrap()
+        {
+            EthRequest::EvmSetBlockTimeStampInterval(interval) => assert_eq!(interval, 10),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_rollback", "params": ["0x5"]}"#).unwrap() {
+            EthRequest::Rollback(depth) => assert_eq!(depth, Some(5)),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_rollback", "params": []}"#).unwrap() {
+            EthRequest::Rollback(depth) => assert_eq!(depth, None),
+            req => panic!("unexpected request: {req:?}"),
+        }
+        match parse(r#"{"method": "anvil_rollback", "params": [null]}"#).unwrap() {
+            EthRequest::Rollback(depth) => assert_eq!(depth, None),
+            req => panic!("unexpected request: {req:?}"),
+        }
+
+        assert!(
+            parse(r#"{"method": "anvil_setIntervalMining", "params": ["0x10000000000000000"]}"#)
+                .is_err()
+        );
     }
 
     #[test]

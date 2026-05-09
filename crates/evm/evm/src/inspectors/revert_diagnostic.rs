@@ -1,26 +1,22 @@
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolValue;
-use foundry_evm_core::{
-    backend::DatabaseError,
-    constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS},
-};
+use foundry_evm_core::constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS};
 use revm::{
+    Inspector,
     bytecode::opcode,
     context::{ContextTr, JournalTr},
-    inspector::JournalExt,
     interpreter::{
-        interpreter::EthInterpreter, interpreter_types::Jumps, CallInputs, CallOutcome, CallScheme,
-        InstructionResult, Interpreter, InterpreterAction, InterpreterResult,
+        CallInputs, CallOutcome, CallScheme, InstructionResult, Interpreter, InterpreterAction,
+        interpreter_types::{Jumps, LoopControl},
     },
-    Database, Inspector,
 };
 use std::fmt;
 
 const IGNORE: [Address; 2] = [HARDHAT_CONSOLE_ADDRESS, CHEATCODE_ADDRESS];
 
 /// Checks if the call scheme corresponds to any sort of delegate call
-pub fn is_delegatecall(scheme: CallScheme) -> bool {
-    matches!(scheme, CallScheme::DelegateCall | CallScheme::ExtDelegateCall | CallScheme::CallCode)
+pub const fn is_delegatecall(scheme: CallScheme) -> bool {
+    matches!(scheme, CallScheme::DelegateCall | CallScheme::CallCode)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,26 +58,22 @@ impl fmt::Display for DetailedRevertReason {
 #[derive(Clone, Debug, Default)]
 pub struct RevertDiagnostic {
     /// Tracks calls with calldata that target an address without executable code.
-    pub non_contract_call: Option<(Address, CallScheme, usize)>,
+    non_contract_call: Option<(Address, CallScheme, usize)>,
     /// Tracks EXTCODESIZE checks that target an address without executable code.
-    pub non_contract_size_check: Option<(Address, usize)>,
+    non_contract_size_check: Option<(Address, usize)>,
     /// Whether the step opcode is EXTCODESIZE or not.
-    pub is_extcodesize_step: bool,
+    is_extcodesize_step: bool,
 }
 
 impl RevertDiagnostic {
     /// Returns the effective target address whose code would be executed.
     /// For delegate calls, this is the `bytecode_address`. Otherwise, it's the `target_address`.
-    fn code_target_address(&self, inputs: &mut CallInputs) -> Address {
-        if is_delegatecall(inputs.scheme) {
-            inputs.bytecode_address
-        } else {
-            inputs.target_address
-        }
+    const fn code_target_address(&self, inputs: &mut CallInputs) -> Address {
+        if is_delegatecall(inputs.scheme) { inputs.bytecode_address } else { inputs.target_address }
     }
 
     /// Derives the revert reason based on the cached data. Should only be called after a revert.
-    fn reason(&self) -> Option<DetailedRevertReason> {
+    const fn reason(&self) -> Option<DetailedRevertReason> {
         if let Some((addr, scheme, _)) = self.non_contract_call {
             let reason = if is_delegatecall(scheme) {
                 DetailedRevertReason::DelegateCallToNonContract(addr)
@@ -101,16 +93,13 @@ impl RevertDiagnostic {
     }
 
     /// Injects the revert diagnostic into the debug traces. Should only be called after a revert.
-    fn broadcast_diagnostic(&self, interp: &mut Interpreter) {
+    fn broadcast_diagnostic(&self, interpreter: &mut Interpreter) {
         if let Some(reason) = self.reason() {
-            interp.control.instruction_result = InstructionResult::Revert;
-            interp.control.next_action = InterpreterAction::Return {
-                result: InterpreterResult {
-                    output: reason.to_string().abi_encode().into(),
-                    gas: interp.control.gas,
-                    result: InstructionResult::Revert,
-                },
-            };
+            interpreter.bytecode.set_action(InterpreterAction::new_return(
+                InstructionResult::Revert,
+                reason.to_string().abi_encode().into(),
+                interpreter.gas,
+            ));
         }
     }
 
@@ -120,32 +109,27 @@ impl RevertDiagnostic {
     ///  - if `non_contract_size_check` was set at the current depth, `broadcast_diagnostic` is
     ///    called. Otherwise, it is cleared.
     #[cold]
-    fn handle_revert<CTX, D>(&mut self, interp: &mut Interpreter, ctx: &mut CTX)
-    where
-        D: Database<Error = DatabaseError>,
-        CTX: ContextTr<Db = D>,
-        CTX::Journal: JournalExt,
-    {
+    fn handle_revert<CTX: ContextTr>(&mut self, interp: &mut Interpreter, ctx: &mut CTX) {
         // REVERT (offset, size)
-        if let Ok(size) = interp.stack.peek(1) {
-            if size.is_zero() {
-                // Check empty revert with same depth as a non-contract call
-                if let Some((_, _, depth)) = self.non_contract_call {
-                    if ctx.journal_ref().depth() == depth {
-                        self.broadcast_diagnostic(interp);
-                    } else {
-                        self.non_contract_call = None;
-                    }
-                    return;
+        if let Ok(size) = interp.stack.peek(1)
+            && size.is_zero()
+        {
+            // Check empty revert with same depth as a non-contract call
+            if let Some((_, _, depth)) = self.non_contract_call {
+                if ctx.journal_ref().depth() == depth {
+                    self.broadcast_diagnostic(interp);
+                } else {
+                    self.non_contract_call = None;
                 }
+                return;
+            }
 
-                // Check empty revert with same depth as a non-contract size check
-                if let Some((_, depth)) = self.non_contract_size_check {
-                    if depth == ctx.journal_ref().depth() {
-                        self.broadcast_diagnostic(interp);
-                    } else {
-                        self.non_contract_size_check = None;
-                    }
+            // Check empty revert with same depth as a non-contract size check
+            if let Some((_, depth)) = self.non_contract_size_check {
+                if depth == ctx.journal_ref().depth() {
+                    self.broadcast_diagnostic(interp);
+                } else {
+                    self.non_contract_size_check = None;
                 }
             }
         }
@@ -155,12 +139,7 @@ impl RevertDiagnostic {
     ///  - Optimistically caches the target address and current depth in `non_contract_size_check`,
     ///    pending later validation.
     #[cold]
-    fn handle_extcodesize<CTX, D>(&mut self, interp: &mut Interpreter, ctx: &mut CTX)
-    where
-        D: Database<Error = DatabaseError>,
-        CTX: ContextTr<Db = D>,
-        CTX::Journal: JournalExt,
-    {
+    fn handle_extcodesize<CTX: ContextTr>(&mut self, interp: &mut Interpreter, ctx: &mut CTX) {
         // EXTCODESIZE (address)
         if let Ok(word) = interp.stack.peek(0) {
             let addr = Address::from_word(word.into());
@@ -178,22 +157,17 @@ impl RevertDiagnostic {
     /// Tracks `EXTCODESIZE` output. If the bytecode size is NOT 0, clears the cache.
     #[cold]
     fn handle_extcodesize_output(&mut self, interp: &mut Interpreter) {
-        if let Ok(size) = interp.stack.peek(0) {
-            if size != U256::ZERO {
-                self.non_contract_size_check = None;
-            }
+        if let Ok(size) = interp.stack.peek(0)
+            && size != U256::ZERO
+        {
+            self.non_contract_size_check = None;
         }
 
         self.is_extcodesize_step = false;
     }
 }
 
-impl<CTX, D> Inspector<CTX, EthInterpreter> for RevertDiagnostic
-where
-    D: Database<Error = DatabaseError>,
-    CTX: ContextTr<Db = D>,
-    CTX::Journal: JournalExt,
-{
+impl<CTX: ContextTr> Inspector<CTX> for RevertDiagnostic {
     /// Tracks the first call with non-zero calldata that targets a non-contract address. Excludes
     /// precompiles and test addresses.
     fn call(&mut self, ctx: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
@@ -203,10 +177,11 @@ where
             return None;
         }
 
-        if let Ok(state) = ctx.journal().code(target) {
-            if state.is_empty() && !inputs.input.is_empty() {
-                self.non_contract_call = Some((target, inputs.scheme, ctx.journal_ref().depth()));
-            }
+        if let Ok(state) = ctx.journal_mut().code(target)
+            && state.is_empty()
+            && !inputs.input.is_empty()
+        {
+            self.non_contract_call = Some((target, inputs.scheme, ctx.journal_ref().depth()));
         }
         None
     }

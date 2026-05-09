@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.18;
 
-import "ds-test/test.sol";
-import "cheats/Vm.sol";
+import "utils/Test.sol";
 
 contract Mock {
     uint256 state = 0;
@@ -56,9 +55,7 @@ contract NestedMockDelegateCall {
     }
 }
 
-contract MockCallTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract MockCallTest is Test {
     function testMockGetters() public {
         Mock target = new Mock();
 
@@ -161,6 +158,35 @@ contract MockCallTest is DSTest {
         assertEq(mock.pay{value: 50}(1), 100);
     }
 
+    function testMockCallWithValueTransfersBalance() public {
+        Mock mock = new Mock();
+        uint256 value = 10;
+        vm.deal(address(this), value);
+
+        vm.mockCall(address(mock), value, abi.encodeWithSelector(mock.pay.selector), abi.encode(10));
+
+        assertEq(address(mock).balance, 0);
+        assertEq(mock.pay{value: value}(1), 10);
+        assertEq(address(mock).balance, value);
+        assertEq(address(this).balance, 0);
+    }
+
+    function testMockCallWithValueTransfersPrankedSenderBalance() public {
+        Mock mock = new Mock();
+        address sender = address(0xBEEF);
+        uint256 value = 10;
+        vm.deal(address(this), 0);
+        vm.deal(sender, value);
+
+        vm.mockCall(address(mock), value, abi.encodeWithSelector(mock.pay.selector), abi.encode(10));
+
+        vm.prank(sender);
+        assertEq(mock.pay{value: value}(1), 10);
+        assertEq(address(mock).balance, value);
+        assertEq(address(this).balance, 0);
+        assertEq(sender.balance, 0);
+    }
+
     function testMockCallWithValueCalldataPrecedence() public {
         Mock mock = new Mock();
 
@@ -183,9 +209,7 @@ contract MockCallTest is DSTest {
     }
 }
 
-contract MockCallRevertTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract MockCallRevertTest is Test {
     error TestError(bytes msg);
 
     bytes constant ERROR_MESSAGE = "ERROR_MESSAGE";
@@ -284,17 +308,25 @@ contract MockCallRevertTest is DSTest {
 
     function testMockCallRevertWithValue() public {
         Mock mock = new Mock();
+        uint256 value = 10;
+        vm.deal(address(this), value);
 
-        vm.mockCallRevert(address(mock), 10, abi.encodeWithSelector(mock.pay.selector), ERROR_MESSAGE);
+        vm.mockCallRevert(address(mock), value, abi.encodeWithSelector(mock.pay.selector), ERROR_MESSAGE);
 
         assertEq(mock.pay(1), 1);
         assertEq(mock.pay(2), 2);
 
-        try mock.pay{value: 10}(1) {
+        uint256 initSenderBalance = address(this).balance;
+        uint256 initTargetBalance = address(mock).balance;
+
+        try mock.pay{value: value}(1) {
             revert();
         } catch (bytes memory err) {
             require(keccak256(err) == keccak256(ERROR_MESSAGE));
         }
+
+        assertEq(address(this).balance, initSenderBalance);
+        assertEq(address(mock).balance, initTargetBalance);
     }
 
     function testMockCallResetsMockCallRevert() public {

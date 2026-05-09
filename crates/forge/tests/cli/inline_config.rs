@@ -11,8 +11,7 @@ forgetest!(runs, |prj, cmd| {
             function test2(bool) public {}
         }
     ",
-    )
-    .unwrap();
+    );
 
     cmd.arg("test").assert_success().stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
@@ -61,11 +60,10 @@ forgetest!(invalid_profile, |prj, cmd| {
             function test(bool) public {}
         }
     ",
-    )
-    .unwrap();
+    );
 
     cmd.arg("test").assert_failure().stderr_eq(str![[r#"
-Error: Inline config error at test/inline.sol:80:123:0: invalid profile `unknown.fuzz.runs = 2`; valid profiles: default
+Error: Inline config error at test/inline.sol:4:9: invalid profile `unknown.fuzz.runs = 2`; valid profiles: default
 
 "#]]);
 });
@@ -81,8 +79,7 @@ forgetest!(invalid_key, |prj, cmd| {
             function test(bool) public {}
         }
     ",
-    )
-    .unwrap();
+    );
 
     cmd.arg("test").assert_failure().stderr_eq(str![[]]).stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
@@ -113,8 +110,7 @@ forgetest!(invalid_key_2, |prj, cmd| {
             function test(bool) public {}
         }
     ",
-    )
-    .unwrap();
+    );
 
     cmd.arg("test").assert_failure().stderr_eq(str![[]]).stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
@@ -146,8 +142,7 @@ forgetest!(invalid_value, |prj, cmd| {
             function test(bool) public {}
         }
     ",
-    )
-    .unwrap();
+    );
 
     cmd.arg("test").assert_failure().stderr_eq(str![[]]).stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
@@ -165,6 +160,8 @@ Encountered 1 failing test in test/inline.sol:Inline
 [FAIL: invalid type: found sequence, expected u32 for key "default.fuzz.runs" in inline config] setUp() ([GAS])
 
 Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
 
 "#]]);
 });
@@ -178,8 +175,7 @@ forgetest!(invalid_value_2, |prj, cmd| {
             function test(bool) public {}
         }
     ",
-    )
-    .unwrap();
+    );
 
     cmd.arg("test").assert_failure().stderr_eq(str![[]]).stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
@@ -198,6 +194,8 @@ Encountered 1 failing test in test/inline.sol:Inline
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
 "#]]);
 });
 
@@ -206,7 +204,6 @@ forgetest_init!(config_inline_isolate, |prj, cmd| {
     use serde::{Deserialize, Deserializer};
     use std::{fs, path::Path};
 
-    prj.wipe_contracts();
     prj.add_test(
         "inline.sol",
         r#"
@@ -256,8 +253,7 @@ forgetest_init!(config_inline_isolate, |prj, cmd| {
             }
         }
     "#,
-    )
-    .unwrap();
+    );
 
     cmd.args(["test", "-j1"]).assert_success().stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
@@ -333,7 +329,6 @@ Ran 2 test suites [ELAPSED]: 3 tests passed, 0 failed, 0 skipped (3 total tests)
 });
 
 forgetest_init!(config_inline_evm_version, |prj, cmd| {
-    prj.wipe_contracts();
     prj.add_test(
         "inline.sol",
         r#"
@@ -382,8 +377,7 @@ forgetest_init!(config_inline_evm_version, |prj, cmd| {
             }
         }
     "#,
-    )
-    .unwrap();
+    );
 
     cmd.args(["test", "--evm-version=cancun", "-j1"]).assert_success().stdout_eq(str![[r#"
 ...
@@ -398,6 +392,140 @@ Ran 2 tests for test/inline.sol:FunctionConfig
 Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
 
 Ran 2 test suites [ELAPSED]: 4 tests passed, 0 failed, 0 skipped (4 total tests)
+
+"#]]);
+});
+
+forgetest_init!(config_inline_hardfork_same_network_family, |prj, cmd| {
+    prj.write_config(foundry_config::Config {
+        hardfork: Some("tempo:T2".parse::<foundry_config::FoundryHardfork>().unwrap()),
+        ..foundry_config::Config::default()
+    });
+    prj.add_test(
+        "inline.sol",
+        r#"
+        import {Test} from "forge-std/Test.sol";
+
+        contract InlineHardfork is Test {
+            /// forge-config: default.hardfork = "tempo:T3"
+            function test_inline_hardfork() public {
+                assertTrue(true);
+            }
+        }
+    "#,
+    );
+
+    cmd.arg("test").assert_success().stdout_eq(str![[r#"
+...
+Ran 1 test for test/inline.sol:InlineHardfork
+[PASS] test_inline_hardfork() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+});
+
+// Checks that tests annotated with `forge-config: default.networks.network` run on the correct
+// EVM network, and that unannotated tests run on the globally configured network.
+//
+// Each test makes a real call to the Tempo `TipFeeManager` precompile at
+// `0xfeec000000000000000000000000000000000000` (a Tempo-only contract that exists on the
+// Moderato testnet and is auto-injected by the in-memory Tempo EVM):
+//
+// * The default-network test asserts the precompile has no code (it does not exist on Ethereum).
+// * The Tempo-network test asserts the precompile has code and `userTokens(address)` returns the
+//   unset zero-address sentinel, proving the Tempo network was actually selected for that test and
+//   the Tempo genesis state was loaded.
+forgetest!(per_test_network_routing, |prj, cmd| {
+    prj.add_test(
+        "inline.sol",
+        r#"
+        address constant TIP_FEE_MANAGER = 0xfeEC000000000000000000000000000000000000;
+
+        contract DefaultNetwork {
+            // No annotation -> runs on the globally selected network (Ethereum by default).
+            // The Tempo FeeManager precompile must NOT exist here.
+            function test_fee_manager_absent_on_ethereum() public view {
+                require(
+                    TIP_FEE_MANAGER.code.length == 0,
+                    "TipFeeManager should not exist on Ethereum"
+                );
+            }
+        }
+
+        contract TempoNetwork {
+            /// forge-config: default.networks.network = "tempo"
+            function test_fee_manager_callable_on_tempo() public view {
+                // Sentinel bytecode (0xef) is injected at every Tempo precompile address.
+                require(
+                    TIP_FEE_MANAGER.code.length > 0,
+                    "TipFeeManager must be deployed on Tempo"
+                );
+
+                // Call a Tempo-only method: `userTokens(address)` returns the user's preferred
+                // fee token, or the zero address when none is set.
+                (bool ok, bytes memory ret) = TIP_FEE_MANAGER.staticcall(
+                    abi.encodeWithSignature("userTokens(address)", address(0))
+                );
+                require(ok, "userTokens call to TipFeeManager failed");
+                require(ret.length == 32, "unexpected return data length");
+                address token = abi.decode(ret, (address));
+                require(token == address(0), "expected unset user fee token");
+            }
+        }
+
+        // Mixed contract: one function annotated with Tempo, one unannotated (runs on Ethereum).
+        contract MixedNetwork {
+            // No annotation -> runs on Ethereum; precompile must be absent.
+            function test_fee_manager_absent_on_ethereum() public view {
+                require(
+                    TIP_FEE_MANAGER.code.length == 0,
+                    "TipFeeManager should not exist on Ethereum"
+                );
+            }
+
+            /// forge-config: default.networks.network = "tempo"
+            function test_fee_manager_callable_on_tempo() public view {
+                require(
+                    TIP_FEE_MANAGER.code.length > 0,
+                    "TipFeeManager must be deployed on Tempo"
+                );
+
+                (bool ok, bytes memory ret) = TIP_FEE_MANAGER.staticcall(
+                    abi.encodeWithSignature("userTokens(address)", address(0))
+                );
+                require(ok, "userTokens call to TipFeeManager failed");
+                require(ret.length == 32, "unexpected return data length");
+                address token = abi.decode(ret, (address));
+                require(token == address(0), "expected unset user fee token");
+            }
+        }
+        "#,
+    );
+
+    cmd.arg("test").assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/inline.sol:[..]Network
+[PASS] test_fee_manager_absent_on_[..]() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/inline.sol:[..]Network
+[PASS] test_fee_manager_absent_on_[..]() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/inline.sol:[..]Network
+[PASS] test_fee_manager_callable_on_[..]() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test for test/inline.sol:[..]Network
+[PASS] test_fee_manager_callable_on_[..]() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 3 test suites [ELAPSED]: 4 tests passed, 0 failed, 0 skipped (4 total tests)
 
 "#]]);
 });

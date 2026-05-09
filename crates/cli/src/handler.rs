@@ -1,22 +1,16 @@
 use eyre::EyreHandler;
-use itertools::Itertools;
 use std::{error::Error, fmt};
 
 /// A custom context type for Foundry specific error reporting via `eyre`.
+#[derive(Default)]
 pub struct Handler {
     debug_handler: Option<Box<dyn EyreHandler>>,
-}
-
-impl Default for Handler {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Handler {
     /// Create a new instance of the `Handler`.
     pub fn new() -> Self {
-        Self { debug_handler: None }
+        Self::default()
     }
 
     /// Override the debug handler with a custom one.
@@ -28,8 +22,7 @@ impl Handler {
 
 impl EyreHandler for Handler {
     fn display(&self, error: &(dyn Error + 'static), f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Display;
-        foundry_common::errors::dedup_chain(error).into_iter().format("; ").fmt(f)
+        f.write_str(&foundry_common::errors::display_chain(error))
     }
 
     fn debug(&self, error: &(dyn Error + 'static), f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,7 +31,7 @@ impl EyreHandler for Handler {
         }
 
         if f.alternate() {
-            return fmt::Debug::fmt(error, f)
+            return fmt::Debug::fmt(error, f);
         }
         let errors = foundry_common::errors::dedup_chain(error);
 
@@ -80,7 +73,9 @@ impl EyreHandler for Handler {
 /// Panics are always caught by the more debug-centric handler.
 pub fn install() {
     if std::env::var_os("RUST_BACKTRACE").is_none() {
-        std::env::set_var("RUST_BACKTRACE", "1");
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "1");
+        }
     }
 
     let panic_section =

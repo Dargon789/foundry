@@ -1,4 +1,4 @@
-use clap::{builder::RangedU64ValueParser, Parser};
+use clap::{Parser, builder::RangedU64ValueParser};
 use foundry_common::retry::Retry;
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ impl Default for RetryArgs {
 
 impl RetryArgs {
     /// Converts the arguments into a `Retry` instance.
-    pub fn into_retry(self) -> Retry {
+    pub const fn into_retry(self) -> Retry {
         Retry::new(self.retries, Duration::from_secs(self.delay as u64))
     }
 }

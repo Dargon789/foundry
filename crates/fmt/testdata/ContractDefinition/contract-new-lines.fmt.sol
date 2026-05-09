@@ -50,3 +50,24 @@ contract ERC20DecimalsMock is ERC20 {
     }
 
 }
+
+contract SomeContract is
+    ERC165Upgradeable, // 1 inherited component
+    ISomeContract // 4 inherited components
+{}
+
+contract AnotherContract is
+    Adminable, /* 1 inherited components */
+    UUPSUpgradeable /* 1 inherited component */
+{}
+
+contract WithLayoutAndBase layout at 69 is Base {}
+
+contract ERC7201Short layout at erc7201("s") is Base {}
+
+contract ERC7201Mid layout at erc7201("openzeppelin.med") is Base {}
+
+contract ERC7201OverMax layout at erc7201("openzeppelin.storage.exceeds.max")
+    is
+    Base
+{}

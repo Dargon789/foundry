@@ -2,6 +2,8 @@ mod abi;
 mod anvil;
 mod anvil_api;
 mod api;
+mod beacon_api;
+mod eip2935;
 mod eip4844;
 mod eip7702;
 mod fork;
@@ -9,6 +11,7 @@ mod gas;
 mod genesis;
 mod ipc;
 mod logs;
+#[cfg(feature = "optimism")]
 mod optimism;
 mod otterscan;
 mod proof;
@@ -16,17 +19,13 @@ mod pubsub;
 mod revert;
 mod sign;
 mod simulate;
+#[cfg(feature = "cmd")]
 mod state;
+mod tempo;
 mod traces;
 mod transaction;
 mod txpool;
 pub mod utils;
 mod wsapi;
 
-pub(crate) fn init_tracing() {
-    let _ = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
-}
-
-fn main() {}
+pub use foundry_test_utils::init_tracing;

@@ -4,10 +4,10 @@ use eyre::Result;
 use forge_doc::{
     ContractInheritance, Deployments, DocBuilder, GitSource, InferInlineHyperlinks, Inheritdoc,
 };
-use foundry_cli::opts::GH_REPO_PREFIX_REGEX;
+use foundry_cli::{opts::GH_REPO_PREFIX_REGEX, utils::Git};
 use foundry_common::compile::ProjectCompiler;
-use foundry_config::{load_config_with_root, Config};
-use std::{path::PathBuf, process::Command};
+use foundry_config::{Config, load_config_with_root};
+use std::path::PathBuf;
 
 mod server;
 use server::Server;
@@ -71,31 +71,26 @@ impl DocArgs {
         let root = &config.root;
         let project = config.project()?;
         let compiler = ProjectCompiler::new().quiet(true);
-        let _output = compiler.compile(&project)?;
+        let mut output = compiler.compile(&project)?;
+        let compiler = output.parser_mut().solc_mut().compiler_mut();
 
         let mut doc_config = config.doc;
         if let Some(out) = self.out {
             doc_config.out = out;
         }
-        if doc_config.repository.is_none() {
-            // Attempt to read repo from git
-            if let Ok(output) = Command::new("git").args(["remote", "get-url", "origin"]).output() {
-                if !output.stdout.is_empty() {
-                    let remote = String::from_utf8(output.stdout)?.trim().to_owned();
-                    if let Some(captures) = GH_REPO_PREFIX_REGEX.captures(&remote) {
-                        let brand = captures.name("brand").unwrap().as_str();
-                        let tld = captures.name("tld").unwrap().as_str();
-                        let project = GH_REPO_PREFIX_REGEX.replace(&remote, "");
-                        doc_config.repository = Some(format!(
-                            "https://{brand}.{tld}/{}",
-                            project.trim_end_matches(".git")
-                        ));
-                    }
-                }
-            }
+        // Attempt to read repo URL from git
+        if doc_config.repository.is_none()
+            && let Some(remote) = Git::new(root).remote_url("origin")
+            && let Some(captures) = GH_REPO_PREFIX_REGEX.captures(&remote)
+        {
+            let brand = captures.name("brand").unwrap().as_str();
+            let tld = captures.name("tld").unwrap().as_str();
+            let project = GH_REPO_PREFIX_REGEX.replace(&remote, "");
+            doc_config.repository =
+                Some(format!("https://{brand}.{tld}/{}", project.trim_end_matches(".git")));
         }
 
-        let commit = foundry_cli::utils::Git::new(root).commit_hash(false, "HEAD").ok();
+        let commit = Git::new(root).commit_hash(false, "HEAD").ok();
 
         let mut builder = DocBuilder::new(
             root.clone(),
@@ -120,7 +115,7 @@ impl DocArgs {
             builder = builder.with_preprocessor(Deployments { root: root.clone(), deployments });
         }
 
-        builder.build()?;
+        builder.build(compiler)?;
 
         if self.serve {
             Server::new(doc_config.out)
@@ -134,7 +129,7 @@ impl DocArgs {
     }
 
     /// Returns whether watch mode is enabled
-    pub fn is_watch(&self) -> bool {
+    pub const fn is_watch(&self) -> bool {
         self.watch.watch.is_some()
     }
 

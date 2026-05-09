@@ -2,23 +2,22 @@ use crate::eth::backend::db::{
     Db, MaybeForkedDatabase, MaybeFullDatabase, SerializableAccountRecord, SerializableBlock,
     SerializableHistoricalStates, SerializableState, SerializableTransaction, StateDb,
 };
-use alloy_primitives::{map::HashMap, Address, B256, U256};
+use alloy_network::Network;
+use alloy_primitives::{Address, B256, U256, map::AddressMap};
 use alloy_rpc_types::BlockId;
 use foundry_evm::{
-    backend::{
-        BlockchainDb, DatabaseError, DatabaseResult, RevertStateSnapshotAction, StateSnapshot,
-    },
+    backend::{BlockchainDb, DatabaseResult, RevertStateSnapshotAction, StateSnapshot},
     fork::database::ForkDbStateSnapshot,
 };
 use revm::{
     context::BlockEnv,
-    database::{Database, DatabaseRef, DbAccount},
+    database::{Database, DbAccount},
     state::AccountInfo,
 };
 
 pub use foundry_evm::fork::database::ForkedDatabase;
 
-impl Db for ForkedDatabase {
+impl<N: Network> Db for ForkedDatabase<N> {
     fn insert_account(&mut self, address: Address, account: AccountInfo) {
         self.database_mut().insert_account(address, account)
     }
@@ -88,12 +87,8 @@ impl Db for ForkedDatabase {
     }
 }
 
-impl MaybeFullDatabase for ForkedDatabase {
-    fn as_dyn(&self) -> &dyn DatabaseRef<Error = DatabaseError> {
-        self
-    }
-
-    fn maybe_as_full_db(&self) -> Option<&HashMap<Address, DbAccount>> {
+impl<N: Network> MaybeFullDatabase for ForkedDatabase<N> {
+    fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         Some(&self.database().cache.accounts)
     }
 
@@ -127,21 +122,27 @@ impl MaybeFullDatabase for ForkedDatabase {
     }
 }
 
-impl MaybeFullDatabase for ForkDbStateSnapshot {
-    fn as_dyn(&self) -> &dyn DatabaseRef<Error = DatabaseError> {
-        self
-    }
-
-    fn maybe_as_full_db(&self) -> Option<&HashMap<Address, DbAccount>> {
+impl<N: Network> MaybeFullDatabase for ForkDbStateSnapshot<N> {
+    fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         Some(&self.local.cache.accounts)
     }
 
     fn clear_into_state_snapshot(&mut self) -> StateSnapshot {
-        std::mem::take(&mut self.state_snapshot)
+        let mut state_snapshot = std::mem::take(&mut self.state_snapshot);
+        let local_state_snapshot = self.local.clear_into_state_snapshot();
+        state_snapshot.accounts.extend(local_state_snapshot.accounts);
+        state_snapshot.storage.extend(local_state_snapshot.storage);
+        state_snapshot.block_hashes.extend(local_state_snapshot.block_hashes);
+        state_snapshot
     }
 
     fn read_as_state_snapshot(&self) -> StateSnapshot {
-        self.state_snapshot.clone()
+        let mut state_snapshot = self.state_snapshot.clone();
+        let local_state_snapshot = self.local.read_as_state_snapshot();
+        state_snapshot.accounts.extend(local_state_snapshot.accounts);
+        state_snapshot.storage.extend(local_state_snapshot.storage);
+        state_snapshot.block_hashes.extend(local_state_snapshot.block_hashes);
+        state_snapshot
     }
 
     fn clear(&mut self) {
@@ -154,9 +155,9 @@ impl MaybeFullDatabase for ForkDbStateSnapshot {
     }
 }
 
-impl MaybeForkedDatabase for ForkedDatabase {
-    fn maybe_reset(&mut self, url: Option<String>, block_number: BlockId) -> Result<(), String> {
-        self.reset(url, block_number)
+impl<N: Network> MaybeForkedDatabase for ForkedDatabase<N> {
+    fn maybe_reset(&mut self, urls: Vec<String>, block_number: BlockId) -> Result<(), String> {
+        self.reset(urls, block_number)
     }
 
     fn maybe_flush_cache(&self) -> Result<(), String> {

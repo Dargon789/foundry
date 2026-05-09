@@ -2,21 +2,29 @@
 set -eo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
-# Major / minor: incremented for each stable release of Foundry.
-# Patch: incremented for each change between stable releases.
-FOUNDRYUP_INSTALLER_VERSION="1.1.0"
+# WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
+FOUNDRYUP_INSTALLER_VERSION="1.8.3"
 
 BASE_DIR=${XDG_CONFIG_HOME:-$HOME}
 FOUNDRY_DIR=${FOUNDRY_DIR:-"$BASE_DIR/.foundry"}
 FOUNDRY_VERSIONS_DIR="$FOUNDRY_DIR/versions"
 FOUNDRY_BIN_DIR="$FOUNDRY_DIR/bin"
 FOUNDRY_MAN_DIR="$FOUNDRY_DIR/share/man/man1"
-FOUNDRY_BIN_URL="https://raw.githubusercontent.com/foundry-rs/foundry/master/foundryup/foundryup"
+FOUNDRY_BIN_URL="https://raw.githubusercontent.com/foundry-rs/foundry/HEAD/foundryup/foundryup"
 FOUNDRY_BIN_PATH="$FOUNDRY_BIN_DIR/foundryup"
-
 FOUNDRYUP_JOBS=""
+FOUNDRYUP_IGNORE_VERIFICATION=false
+
+# Retry/backoff settings used for `fetch` (GitHub API calls).
+# Recovers from transient HTTP 403/429/5xx responses returned by
+# api.github.com under heavy load or per-IP rate limiting.
+FOUNDRYUP_MAX_RETRIES=5
+FOUNDRYUP_RETRY_DELAY=2
+FOUNDRYUP_RETRY_MAX_TIME=60
 
 BINS=(forge cast anvil chisel)
+HASH_NAMES=()
+HASH_VALUES=()
 
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
 
@@ -39,6 +47,8 @@ main() {
       -P|--pr)          shift; FOUNDRYUP_PR=$1;;
       -C|--commit)      shift; FOUNDRYUP_COMMIT=$1;;
       -j|--jobs)        shift; FOUNDRYUP_JOBS=$1;;
+      -n|--network)     shift; FOUNDRYUP_NETWORK=$1;;
+      -f|--force)       FOUNDRYUP_IGNORE_VERIFICATION=true;;
       --arch)           shift; FOUNDRYUP_ARCH=$1;;
       --platform)       shift; FOUNDRYUP_PLATFORM=$1;;
       -h|--help)
@@ -60,6 +70,9 @@ main() {
 
   # Print the banner after successfully parsing args
   banner
+
+  # Check if the foundryup installer is up to date, warn the user if not
+  check_installer_up_to_date
 
   if [ -n "$FOUNDRYUP_PR" ]; then
     if [ -z "$FOUNDRYUP_BRANCH" ]; then
@@ -96,76 +109,139 @@ main() {
     exit 0
   fi
 
+  if [[ -n "$FOUNDRYUP_NETWORK" ]]; then
+    warn "--network is deprecated and ignored; installing the regular Foundry release"
+  fi
+
   FOUNDRYUP_REPO=${FOUNDRYUP_REPO:-foundry-rs/foundry}
 
   # Install by downloading binaries
   if [[ "$FOUNDRYUP_REPO" == "foundry-rs/foundry" && -z "$FOUNDRYUP_BRANCH" && -z "$FOUNDRYUP_COMMIT" ]]; then
-    FOUNDRYUP_VERSION=${FOUNDRYUP_VERSION:-stable}
-    FOUNDRYUP_TAG=$FOUNDRYUP_VERSION
-
-    # Normalize versions (handle channels, versions without v prefix
-    if [[ "$FOUNDRYUP_VERSION" =~ ^nightly ]]; then
-      FOUNDRYUP_VERSION="nightly"
-    elif [[ "$FOUNDRYUP_VERSION" == [[:digit:]]* ]]; then
-      # Add v prefix
-      FOUNDRYUP_VERSION="v${FOUNDRYUP_VERSION}"
-      FOUNDRYUP_TAG="${FOUNDRYUP_VERSION}"
-    fi
+    FOUNDRYUP_VERSION=${FOUNDRYUP_VERSION:-latest}
+    resolve_version_and_tag
 
     say "installing foundry (version ${FOUNDRYUP_VERSION}, tag ${FOUNDRYUP_TAG})"
 
-    uname_s=$(uname -s)
-    PLATFORM=$(tolower "${FOUNDRYUP_PLATFORM:-$uname_s}")
-    EXT="tar.gz"
-    case $PLATFORM in
-      linux|alpine) ;;
-      darwin|mac*)
-        PLATFORM="darwin"
-        ;;
-      mingw*|win*)
-        EXT="zip"
-        PLATFORM="win32"
-        ;;
-      *)
-        err "unsupported platform: $PLATFORM"
-        ;;
-    esac
-
-    uname_m=$(uname -m)
-    ARCHITECTURE=$(tolower "${FOUNDRYUP_ARCH:-$uname_m}")
-    if [ "${ARCHITECTURE}" = "x86_64" ]; then
-      # Redirect stderr to /dev/null to avoid printing errors if non Rosetta.
-      if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
-        ARCHITECTURE="arm64" # Rosetta.
-      else
-        ARCHITECTURE="amd64" # Intel.
-      fi
-    elif [ "${ARCHITECTURE}" = "arm64" ] ||[ "${ARCHITECTURE}" = "aarch64" ] ; then
-      ARCHITECTURE="arm64" # Arm.
-    else
-      ARCHITECTURE="amd64" # Amd.
-    fi
+    # Detect platform and architecture.
+    detect_platform_arch
 
     # Compute the URL of the release tarball in the Foundry repository.
     RELEASE_URL="https://github.com/${FOUNDRYUP_REPO}/releases/download/${FOUNDRYUP_TAG}/"
+    ATTESTATION_URL="${RELEASE_URL}foundry_${FOUNDRYUP_VERSION}_${PLATFORM}_${ARCHITECTURE}.attestation.txt"
     BIN_ARCHIVE_URL="${RELEASE_URL}foundry_${FOUNDRYUP_VERSION}_${PLATFORM}_${ARCHITECTURE}.$EXT"
     MAN_TARBALL_URL="${RELEASE_URL}foundry_man_${FOUNDRYUP_VERSION}.tar.gz"
 
     ensure mkdir -p "$FOUNDRY_VERSIONS_DIR"
+
+    # If `--force` is set, skip the SHA verification.
+    if [ "$FOUNDRYUP_IGNORE_VERIFICATION" = false ]; then
+      # Check if the version is already installed by downloading the attestation file.
+      say "checking if forge, cast, anvil, and chisel for $FOUNDRYUP_TAG version are already installed"
+
+      # Create a temporary directory to store the attestation link and artifact.
+      tmp_dir="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
+      tmp="$tmp_dir/attestation.txt"
+      ensure download "$ATTESTATION_URL" "$tmp"
+
+      # Read the first line of the attestation file to get the artifact link.
+      # The first line should contain the link to the attestation artifact.
+      attestation_artifact_link="$(head -n1 "$tmp" | tr -d '\r')"
+      attestation_missing=false
+
+      # If the attestation artifact link is empty or the file contains 'Not Found',
+      # we consider the attestation missing and skip the SHA verification.
+      if [ -z "$attestation_artifact_link" ] || grep -q 'Not Found' "$tmp"; then
+        attestation_missing=true
+      fi
+
+      # Clean up the temporary attestation file.
+      rm -f "$tmp"
+
+      if $attestation_missing; then
+        say "no attestation found for this release, skipping SHA verification"
+      else
+        say "found attestation for $FOUNDRYUP_TAG version, downloading attestation artifact, checking..."
+
+        # Download the attestation artifact JSON file.
+        tmp="$tmp_dir/foundry-attestation.sigstore.json"
+        ensure download "${attestation_artifact_link}/download" "$tmp"
+
+        # Extract the payload from the JSON file.
+        payload_b64=$(awk '/"payload":/ {gsub(/[",]/, "", $2); print $2; exit}' "$tmp")
+        payload_json=$(printf '%s' "$payload_b64" | base64 -d 2>/dev/null || printf '%s' "$payload_b64" | base64 -D)
+
+
+        # Extract the names and hashes from the payload JSON.
+        # The payload is expected to be a JSON array of objects with "name" and "sha256" fields.
+        while read -r name_line && read -r sha_line; do
+          name=$(echo "$name_line" | sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')
+          sha=$(echo "$sha_line"  | sed -nE 's/.*"sha256"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')
+          if [ -n "$name" ] && [ -n "$sha" ]; then
+            HASH_NAMES+=("$name")
+            HASH_VALUES+=("$sha")
+          fi
+        done < <(echo "$payload_json" | tr '{}' '\n' | grep -E '"name"|sha256')
+
+        # Clean up the temporary attestation artifact.
+        # The hashes are now stored in the HASHES associative array.
+        rm -f "$tmp"
+
+        # Check if the binaries are already installed and match the expected hashes.
+        # If they do, skip the download.
+        version_dir="$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG"
+        all_match=true
+        for bin in "${BINS[@]}"; do
+          expected=""
+          for i in "${!HASH_NAMES[@]}"; do
+            if [ "${HASH_NAMES[$i]}" = "$bin" ] || [ "${HASH_NAMES[$i]}" = "$bin.exe" ]; then
+              expected="${HASH_VALUES[$i]}"
+              break
+            fi
+          done
+
+          path="$version_dir/$bin"
+
+          if [ -z "$expected" ] || [ ! -x "$path" ]; then
+            all_match=false
+            break
+          fi
+
+          actual=$(compute_sha256 "$path")
+          if [ "$actual" != "$expected" ]; then
+            all_match=false
+            break
+          fi
+        done
+
+        if $all_match; then
+          say "version $FOUNDRYUP_TAG already installed and verified, activating..."
+          FOUNDRYUP_VERSION=$FOUNDRYUP_TAG
+          use
+          say "done!"
+          exit 0
+        fi
+      fi
+
+      # If we reach here, we need to download the binaries.
+      say "binaries not found or do not match expected hashes, downloading new binaries"
+    fi
+
     # Download and extract the binaries archive
     say "downloading forge, cast, anvil, and chisel for $FOUNDRYUP_TAG version"
     if [ "$PLATFORM" = "win32" ]; then
-      tmp="$(mktemp -d 2>/dev/null || echo ".")/foundry.zip"
+      tmp="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
+      tmp="$tmp/foundry.zip"
       ensure download "$BIN_ARCHIVE_URL" "$tmp"
       ensure unzip "$tmp" -d "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG"
       rm -f "$tmp"
     else
-      tmp="$(mktemp -d 2>/dev/null || echo ".")/foundry.tar.gz"
+      tmp="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
+      tmp="$tmp/foundry.tar.gz"
       ensure download "$BIN_ARCHIVE_URL" "$tmp"
       # Make sure it's a valid tar archive.
-      ensure tar tf $tmp 1> /dev/null
+      ensure tar tf "$tmp" 1> /dev/null
       ensure mkdir -p "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG"
-      ensure tar -C "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG" -xvf $tmp
+      ensure tar -C "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG" -xvf "$tmp"
       rm -f "$tmp"
     fi
 
@@ -173,9 +249,62 @@ main() {
     if check_cmd tar; then
       say "downloading manpages"
       mkdir -p "$FOUNDRY_MAN_DIR"
-      download "$MAN_TARBALL_URL" | tar -xzC "$FOUNDRY_MAN_DIR"
+      if ! download "$MAN_TARBALL_URL" | tar -xzC "$FOUNDRY_MAN_DIR"; then
+        warn "skipping manpage download: unavailable or invalid archive"
+      fi
     else
       say 'skipping manpage download: missing "tar"'
+    fi
+
+    if [ "$FOUNDRYUP_IGNORE_VERIFICATION" = true ]; then
+      say "skipped SHA verification for downloaded binaries due to --force flag"
+    else
+      # Verify the downloaded binaries against the attestation file.
+      # If the attestation file was not found or is empty, we skip the verification.
+      if $attestation_missing; then
+        say "no attestation found for these binaries, skipping SHA verification for downloaded binaries"
+      else
+        say "verifying downloaded binaries against the attestation file"
+
+        failed=false
+        for bin in "${BINS[@]}"; do
+          expected=""
+          for i in "${!HASH_NAMES[@]}"; do
+            if [ "${HASH_NAMES[$i]}" = "$bin" ] || [ "${HASH_NAMES[$i]}" = "$bin.exe" ]; then
+              expected="${HASH_VALUES[$i]}"
+              break
+            fi
+          done
+
+          path="$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG/$bin"
+
+          if [ -z "$expected" ]; then
+            say "no expected hash for $bin"
+            failed=true
+            continue
+          fi
+
+          if [ ! -x "$path" ]; then
+            say "binary $bin not found at $path"
+            failed=true
+            continue
+          fi
+
+          actual=$(compute_sha256 "$path")
+          if [ "$actual" != "$expected" ]; then
+            say "$bin hash verification failed:"
+            say "  expected: $expected"
+            say "  actual:   $actual"
+            failed=true
+          else
+            say "$bin verified ✓"
+          fi
+        done
+
+        if $failed; then
+          err "one or more binaries failed post-installation verification"
+        fi
+      fi
     fi
 
     # Use newly installed version.
@@ -183,7 +312,6 @@ main() {
     use
 
     say "done!"
-
   # Install by cloning the repo with the provided branch/tag
   else
     need_cmd cargo
@@ -253,7 +381,7 @@ The installer for Foundry.
 
 Update or revert to a specific Foundry version with ease.
 
-By default, the latest stable version is installed from built binaries.
+By default, the latest version is installed from built binaries.
 
 USAGE:
     foundryup <OPTIONS>
@@ -262,7 +390,7 @@ OPTIONS:
     -h, --help      Print help information
     -v, --version   Print the version of foundryup
     -U, --update    Update foundryup to the latest version
-    -i, --install   Install a specific version from built binaries
+    -i, --install   Install a specific version (latest, nightly, nightly-<SHA>, or v1.2.3)
     -l, --list      List versions installed from built binaries
     -u, --use       Use a specific installed version from built binaries
     -b, --branch    Build and install a specific branch
@@ -271,6 +399,8 @@ OPTIONS:
     -r, --repo      Build and install from a remote GitHub repo (uses default branch if no other options are set)
     -p, --path      Build and install a local repository
     -j, --jobs      Number of CPUs to use for building Foundry (default: all CPUs)
+    -n, --network   Deprecated and ignored; installs the regular Foundry release
+    -f, --force     Skip SHA verification for downloaded binaries (INSECURE - use with caution)
     --arch          Install a specific architecture (supports amd64 and arm64)
     --platform      Install a specific platform (supports win32, linux, darwin and alpine)
 EOF
@@ -284,15 +414,36 @@ version() {
 update() {
   say "updating foundryup..."
 
-  # Download to a temporary file first
+  current_version="$FOUNDRYUP_INSTALLER_VERSION"
+
+  # Download the new version.
   tmp_file="$(mktemp)"
   ensure download "$FOUNDRY_BIN_URL" "$tmp_file"
 
-  # Replace the current foundryup with the downloaded file
+  # Extract new version from downloaded file.
+  new_version=$(grep -Eo 'FOUNDRYUP_INSTALLER_VERSION="[0-9]+\.[0-9]+\.[0-9]+"' "$tmp_file" | cut -d'"' -f2)
+
+  # If the new version could not be determined, exit gracefully.
+  # This prevents from upgrading to an empty or invalid version.
+  if [ -z "$new_version" ]; then
+    warn "could not determine new foundryup version. Exiting."
+    rm -f "$tmp_file"
+    exit 0
+  fi
+
+  # If the new version is not greater than the current version, skip the update.
+  # This is to prevent downgrades or unnecessary updates.
+  if ! version_gt "$new_version" "$current_version"; then
+    say "foundryup is already up to date (installed: $current_version, remote: $new_version)."
+    rm -f "$tmp_file"
+    exit 0
+  fi
+
+  # Overwrite existing foundryup
   ensure mv "$tmp_file" "$FOUNDRY_BIN_PATH"
   ensure chmod +x "$FOUNDRY_BIN_PATH"
 
-  say "successfully updated foundryup"
+  say "successfully updated foundryup: $current_version → $new_version"
   exit 0
 }
 
@@ -317,6 +468,18 @@ list() {
 
 use() {
   [ -z "$FOUNDRYUP_VERSION" ] && err "no version provided"
+
+  # If the requested version is a channel (`latest`, `stable`, `nightly`) or a bare semver
+  # version (e.g. `1.7.0`, `1.6.0-rc1`), resolve it to the immutable tag directory created by
+  # `--install` (channels hit the GitHub API; semver versions get a `v` prefix).
+  # Falls back to the literal value for locally-built versions (branches, PRs, commits, custom names).
+  case "$FOUNDRYUP_VERSION" in
+    latest|stable|nightly|[0-9]*.[0-9]*.[0-9]*)
+      resolve_version_and_tag
+      FOUNDRYUP_VERSION="$FOUNDRYUP_TAG"
+      ;;
+  esac
+
   FOUNDRY_VERSION_DIR="$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_VERSION"
   if [ -d "$FOUNDRY_VERSION_DIR" ]; then
 
@@ -365,6 +528,15 @@ tolower() {
   echo "$1" | awk '{print tolower($0)}'
 }
 
+compute_sha256() {
+  if check_cmd sha256sum; then
+    # Use sed to strip leading backslash (sha256sum on Windows/Git Bash outputs \ prefix for binary files)
+    sha256sum "$1" | cut -d' ' -f1 | sed 's/^\\//'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 need_cmd() {
   if ! check_cmd "$1"; then
     err "need '$1' (command not found)"
@@ -373,6 +545,99 @@ need_cmd() {
 
 check_cmd() {
   command -v "$1" &>/dev/null
+}
+
+detect_platform_arch() {
+  uname_s=$(uname -s)
+  PLATFORM=$(tolower "${FOUNDRYUP_PLATFORM:-$uname_s}")
+  EXT="tar.gz"
+  case $PLATFORM in
+    linux|alpine) ;;
+    darwin|mac*)
+      PLATFORM="darwin"
+      ;;
+    mingw*|win*)
+      EXT="zip"
+      PLATFORM="win32"
+      ;;
+    *)
+      err "unsupported platform: $PLATFORM"
+      ;;
+  esac
+
+  uname_m=$(uname -m)
+  ARCHITECTURE=$(tolower "${FOUNDRYUP_ARCH:-$uname_m}")
+  if [ "${ARCHITECTURE}" = "x86_64" ]; then
+    # Redirect stderr to /dev/null to avoid printing errors if non Rosetta.
+    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+      ARCHITECTURE="arm64" # Rosetta.
+    else
+      ARCHITECTURE="amd64" # Intel.
+    fi
+  elif [ "${ARCHITECTURE}" = "arm64" ] ||[ "${ARCHITECTURE}" = "aarch64" ] ; then
+    ARCHITECTURE="arm64" # Arm.
+  else
+    ARCHITECTURE="amd64" # Amd.
+  fi
+}
+
+check_installer_up_to_date() {
+  say "checking if foundryup is up to date..."
+
+  remote_version=$(fetch "$FOUNDRY_BIN_URL" | grep -Eo 'FOUNDRYUP_INSTALLER_VERSION="[0-9]+\.[0-9]+\.[0-9]+"' | cut -d'"' -f2 || true)
+
+  if [ -z "$remote_version" ]; then
+    warn "Could not determine remote foundryup version. Skipping version check."
+    return 0
+  fi
+
+  if version_gt "$remote_version" "$FOUNDRYUP_INSTALLER_VERSION"; then
+    printf '
+Your installation of foundryup is out of date.
+
+Installed: %s → Latest: %s
+
+To update, run:
+
+  foundryup --update
+
+Updating is highly recommended as it gives you access to the latest features and bug fixes.
+
+' "$FOUNDRYUP_INSTALLER_VERSION" "$remote_version" >&2
+  else
+    say "foundryup is up to date."
+  fi
+}
+
+# Compares two version strings in the format "major.minor.patch".
+# Returns 0 if $1 is greater than $2, 1 if $1 is less than $2, and 1 if they are equal.
+#
+# Assumes that the version strings are well-formed and contain three numeric components separated by dots.
+#
+# Example: version_gt "1.2.3" "1.2.4"
+#          returns 1 (1.2.3 < 1.2.4)
+#          version_gt "1.2.3" "1.2.3"
+#          returns 1 (1.2.3 == 1.2.3)
+#          version_gt "1.2.4" "1.2.3"
+#          returns 0 (1.2.4 > 1.2.3)
+version_gt() {
+  [ "$1" = "$2" ] && return 1
+
+  IFS=. read -r major1 minor1 patch1 <<EOF
+$1
+EOF
+  IFS=. read -r major2 minor2 patch2 <<EOF
+$2
+EOF
+
+  [ "$major1" -gt "$major2" ] && return 0
+  [ "$major1" -lt "$major2" ] && return 1
+  [ "$minor1" -gt "$minor2" ] && return 0
+  [ "$minor1" -lt "$minor2" ] && return 1
+  [ "$patch1" -gt "$patch2" ] && return 0
+  [ "$patch1" -lt "$patch2" ] && return 1
+
+  return 1
 }
 
 check_bins_in_use() {
@@ -391,6 +656,73 @@ check_bins_in_use() {
 # will immediately terminate with an error showing the failing command.
 ensure() {
   if ! "$@"; then err "command failed: $*"; fi
+}
+
+# Normalizes `FOUNDRYUP_VERSION` and resolves it to a concrete release tag,
+# populating `FOUNDRYUP_TAG`. Handles the `latest`/`stable`/`nightly` channels
+# (looked up via the GitHub API).
+resolve_version_and_tag() {
+  FOUNDRYUP_REPO=${FOUNDRYUP_REPO:-foundry-rs/foundry}
+  if [[ "$FOUNDRYUP_VERSION" == "latest" || "$FOUNDRYUP_VERSION" == "stable" ]]; then
+    # Resolve to the latest release (non-prerelease) via the GitHub API.
+    say "fetching latest release tag from ${FOUNDRYUP_REPO}..."
+    FOUNDRYUP_TAG=$(fetch "https://api.github.com/repos/${FOUNDRYUP_REPO}/releases/latest" | awk '
+      /"tag_name"[[:space:]]*:/ && !found { gsub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, ""); gsub(/".*/, ""); print; found=1 }
+    ') || err "failed to fetch release tags from GitHub API"
+    if [ -z "$FOUNDRYUP_TAG" ]; then
+      err "could not find a latest release tag for ${FOUNDRYUP_REPO}"
+    fi
+    say "resolved release tag: ${FOUNDRYUP_TAG}"
+    FOUNDRYUP_VERSION="$FOUNDRYUP_TAG"
+  elif [[ "$FOUNDRYUP_VERSION" == "nightly" ]]; then
+    # Resolve to the latest nightly (prerelease) release via the GitHub API.
+    # The GitHub API does not guarantee that releases are returned in
+    # chronological order, so we collect all matching nightlies along with
+    # their `published_at` timestamps and sort them ourselves.
+    say "fetching latest nightly release tags from ${FOUNDRYUP_REPO}..."
+    FOUNDRYUP_TAG=$(fetch "https://api.github.com/repos/${FOUNDRYUP_REPO}/releases" | awk '
+      /"tag_name"[[:space:]]*:/ { gsub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, ""); gsub(/".*/, ""); tag=$0 }
+      /"published_at"[[:space:]]*:[[:space:]]*"/ {
+        pub=$0
+        gsub(/.*"published_at"[[:space:]]*:[[:space:]]*"/, "", pub)
+        gsub(/".*/, "", pub)
+        if (tag ~ /^nightly-/) print pub "\t" tag
+        tag=""
+      }
+    ' | sort -r | awk -F '\t' 'NR==1 { print $2 }') || err "failed to fetch release tags from GitHub API"
+    if [ -z "$FOUNDRYUP_TAG" ]; then
+      err "could not find a nightly release tag for ${FOUNDRYUP_REPO}"
+    fi
+    say "resolved nightly release tag: ${FOUNDRYUP_TAG}"
+    FOUNDRYUP_VERSION="nightly"
+  elif [[ "$FOUNDRYUP_VERSION" =~ ^nightly- ]]; then
+    # Specific nightly tag (e.g. nightly-abc123...)
+    FOUNDRYUP_TAG="$FOUNDRYUP_VERSION"
+    FOUNDRYUP_VERSION="nightly"
+  elif [[ "$FOUNDRYUP_VERSION" == [[:digit:]]* ]]; then
+    # Add v prefix
+    FOUNDRYUP_VERSION="v${FOUNDRYUP_VERSION}"
+    FOUNDRYUP_TAG="${FOUNDRYUP_VERSION}"
+  else
+    FOUNDRYUP_TAG="${FOUNDRYUP_VERSION}"
+  fi
+}
+
+# Silently fetches $1 to stdout.
+fetch() {
+  if check_cmd curl; then
+    curl -fsSL \
+      --retry "$FOUNDRYUP_MAX_RETRIES" \
+      --retry-delay "$FOUNDRYUP_RETRY_DELAY" \
+      --retry-max-time "$FOUNDRYUP_RETRY_MAX_TIME" \
+      --retry-all-errors \
+      "$1"
+  else
+    wget --tries="$FOUNDRYUP_MAX_RETRIES" \
+         --waitretry="$FOUNDRYUP_RETRY_DELAY" \
+         --retry-on-http-error=403,408,429,500,502,503,504 \
+         -qO- "$1"
+  fi
 }
 
 # Downloads $1 into $2 or stdout
@@ -412,7 +744,7 @@ download() {
   fi
 }
 
-# Banner Function for Foundry
+# Banner prompt for Foundry
 banner() {
   printf '
 
@@ -428,7 +760,7 @@ Repo       : https://github.com/foundry-rs/foundry
 Book       : https://book.getfoundry.sh/
 Chat       : https://t.me/foundry_rs/
 Support    : https://t.me/foundry_support/
-Contribute : https://github.com/foundry-rs/foundry/blob/master/CONTRIBUTING.md
+Contribute : https://github.com/foundry-rs/foundry/blob/HEAD/CONTRIBUTING.md
 
 .xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx
 

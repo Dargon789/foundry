@@ -1,12 +1,11 @@
 //! IPC handling
 
-use crate::{error::RequestError, pubsub::PubSubConnection, PubSubRpcHandler};
+use crate::{PubSubRpcHandler, error::RequestError, pubsub::PubSubConnection};
 use anvil_rpc::request::Request;
 use bytes::{BufMut, BytesMut};
-use futures::{ready, Sink, Stream, StreamExt};
+use futures::{Sink, Stream, StreamExt, ready};
 use interprocess::local_socket::{self as ls, tokio::prelude::*};
 use std::{
-    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
@@ -24,7 +23,7 @@ pub struct IpcEndpoint<Handler> {
 
 impl<Handler: PubSubRpcHandler> IpcEndpoint<Handler> {
     /// Creates a new endpoint with the given handler
-    pub fn new(handler: Handler, path: String) -> Self {
+    pub const fn new(handler: Handler, path: String) -> Self {
         Self { handler, path }
     }
 
@@ -159,7 +158,7 @@ impl tokio_util::codec::Decoder for JsonRpcCodec {
                 return match String::from_utf8(bts.as_ref().to_vec()) {
                     Ok(val) => Ok(Some(val)),
                     Err(_) => Ok(None),
-                }
+                };
             }
         }
         Ok(None)

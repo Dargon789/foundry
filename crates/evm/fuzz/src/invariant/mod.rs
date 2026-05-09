@@ -1,16 +1,25 @@
 use alloy_json_abi::{Function, JsonAbi};
-use alloy_primitives::{Address, Bytes, Selector};
+use alloy_primitives::{Address, Selector, map::HashMap};
+use foundry_compilers::artifacts::StorageLayout;
 use itertools::Either;
 use parking_lot::Mutex;
-use std::{collections::BTreeMap, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 mod call_override;
 pub use call_override::RandomCallGenerator;
 
 mod filters;
+use crate::BasicTxDetails;
 pub use filters::{ArtifactFilters, SenderFilters};
 use foundry_common::{ContractsByAddress, ContractsByArtifact};
-use foundry_evm_core::utils::{get_function, StateChangeset};
+use foundry_evm_core::utils::{StateChangeset, get_function};
+
+/// Returns true if the function returns `int256`, indicating optimization mode.
+/// In optimization mode, the fuzzer maximizes the return value instead of checking invariants.
+pub fn is_optimization_invariant(func: &Function) -> bool {
+    func.outputs.len() == 1 && func.outputs[0].ty == "int256"
+}
 
 /// Contracts identified as targets during a fuzz run.
 ///
@@ -74,6 +83,7 @@ impl FuzzRunIdentifiedContracts {
                 abi: contract.abi.clone(),
                 targeted_functions: functions,
                 excluded_functions: Vec::new(),
+                storage_layout: contract.storage_layout.as_ref().map(Arc::clone),
             };
             targets.insert(*address, contract);
         }
@@ -126,6 +136,14 @@ impl TargetedContracts {
             .flat_map(|(contract, c)| c.abi_fuzzed_functions().map(move |f| (contract, f)))
     }
 
+    /// Returns whether the given transaction can be replayed or not with known contracts.
+    pub fn can_replay(&self, tx: &BasicTxDetails) -> bool {
+        match self.inner.get(&tx.call_details.target) {
+            Some(c) => c.abi.functions().any(|f| f.selector() == tx.call_details.calldata[..4]),
+            None => false,
+        }
+    }
+
     /// Identifies fuzzed contract and function based on given tx details and returns unique metric
     /// key composed from contract identifier and function name.
     pub fn fuzzed_metric_key(&self, tx: &BasicTxDetails) -> Option<String> {
@@ -136,6 +154,16 @@ impl TargetedContracts {
                 .find(|f| f.selector() == tx.call_details.calldata[..4])
                 .map(|function| format!("{}.{}", contract.identifier.clone(), function.name))
         })
+    }
+
+    /// Returns a map of contract addresses to their storage layouts.
+    pub fn get_storage_layouts(&self) -> HashMap<Address, Arc<StorageLayout>> {
+        self.inner
+            .iter()
+            .filter_map(|(addr, c)| {
+                c.storage_layout.as_ref().map(|layout| (*addr, Arc::clone(layout)))
+            })
+            .collect()
     }
 }
 
@@ -164,27 +192,48 @@ pub struct TargetedContract {
     pub targeted_functions: Vec<Function>,
     /// The excluded functions of the contract.
     pub excluded_functions: Vec<Function>,
+    /// The contract's storage layout, if available.
+    pub storage_layout: Option<Arc<StorageLayout>>,
 }
 
 impl TargetedContract {
     /// Returns a new `TargetedContract` instance.
-    pub fn new(identifier: String, abi: JsonAbi) -> Self {
-        Self { identifier, abi, targeted_functions: Vec::new(), excluded_functions: Vec::new() }
+    pub const fn new(identifier: String, abi: JsonAbi) -> Self {
+        Self {
+            identifier,
+            abi,
+            targeted_functions: Vec::new(),
+            excluded_functions: Vec::new(),
+            storage_layout: None,
+        }
+    }
+
+    /// Determines contract storage layout from project contracts. Needs `storageLayout` to be
+    /// enabled as extra output in project configuration.
+    pub fn with_project_contracts(mut self, project_contracts: &ContractsByArtifact) -> Self {
+        if let Some((src, name)) = self.identifier.split_once(':')
+            && let Some((_, contract_data)) = project_contracts.iter().find(|(artifact, _)| {
+                artifact.name == name && artifact.source.as_path().ends_with(src)
+            })
+        {
+            self.storage_layout = contract_data.storage_layout.as_ref().map(Arc::clone);
+        }
+        self
     }
 
     /// Helper to retrieve functions to fuzz for specified abi.
     /// Returns specified targeted functions if any, else mutable abi functions that are not
     /// marked as excluded.
     pub fn abi_fuzzed_functions(&self) -> impl Iterator<Item = &Function> {
-        if !self.targeted_functions.is_empty() {
-            Either::Left(self.targeted_functions.iter())
-        } else {
+        if self.targeted_functions.is_empty() {
             Either::Right(self.abi.functions().filter(|&func| {
                 !matches!(
                     func.state_mutability,
                     alloy_json_abi::StateMutability::Pure | alloy_json_abi::StateMutability::View
                 ) && !self.excluded_functions.contains(func)
             }))
+        } else {
+            Either::Left(self.targeted_functions.iter())
         }
     }
 
@@ -210,33 +259,156 @@ impl TargetedContract {
     }
 }
 
-/// Details of a transaction generated by invariant strategy for fuzzing a target.
-#[derive(Clone, Debug)]
-pub struct BasicTxDetails {
-    // Transaction sender address.
-    pub sender: Address,
-    // Transaction call details.
-    pub call_details: CallDetails,
-}
-
-/// Call details of a transaction generated to fuzz invariant target.
-#[derive(Clone, Debug)]
-pub struct CallDetails {
-    // Address of target contract.
-    pub target: Address,
-    // The data of the transaction.
-    pub calldata: Bytes,
-}
-
 /// Test contract which is testing its invariants.
 #[derive(Clone, Debug)]
 pub struct InvariantContract<'a> {
     /// Address of the test contract.
     pub address: Address,
+    /// Name of the test contract.
+    pub name: &'a str,
     /// Invariant function present in the test contract.
     pub invariant_function: &'a Function,
     /// If true, `afterInvariant` function is called after each invariant run.
     pub call_after_invariant: bool,
     /// ABI of the test contract.
     pub abi: &'a JsonAbi,
+}
+
+impl<'a> InvariantContract<'a> {
+    /// Creates a new invariant contract.
+    pub const fn new(
+        address: Address,
+        name: &'a str,
+        invariant_function: &'a Function,
+        call_after_invariant: bool,
+        abi: &'a JsonAbi,
+    ) -> Self {
+        Self { address, name, invariant_function, call_after_invariant, abi }
+    }
+
+    /// Returns true if this is an optimization mode invariant (returns int256).
+    pub fn is_optimization(&self) -> bool {
+        is_optimization_invariant(self.invariant_function)
+    }
+}
+
+/// Settings that determine the validity of a persisted invariant counterexample.
+///
+/// When a counterexample is replayed, it's only valid if the same contracts, selectors,
+/// senders, and fail_on_revert settings are used. Changes to unrelated code (e.g., adding
+/// a log statement) should not invalidate the counterexample.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvariantSettings {
+    /// Target contracts with their addresses and identifiers.
+    pub target_contracts: BTreeMap<Address, String>,
+    /// Target selectors per contract address.
+    pub target_selectors: BTreeMap<Address, Vec<Selector>>,
+    /// Target senders for the invariant test.
+    pub target_senders: Vec<Address>,
+    /// Excluded senders for the invariant test.
+    pub excluded_senders: Vec<Address>,
+    /// Whether the test should fail on any revert.
+    pub fail_on_revert: bool,
+}
+
+impl InvariantSettings {
+    /// Creates new invariant settings from the given components.
+    pub fn new(
+        targeted_contracts: &TargetedContracts,
+        sender_filters: &SenderFilters,
+        fail_on_revert: bool,
+    ) -> Self {
+        let target_contracts = targeted_contracts
+            .inner
+            .iter()
+            .map(|(addr, contract)| (*addr, contract.identifier.clone()))
+            .collect();
+
+        let target_selectors = targeted_contracts
+            .inner
+            .iter()
+            .map(|(addr, contract)| {
+                let selectors: Vec<Selector> =
+                    contract.abi_fuzzed_functions().map(|f| f.selector()).collect();
+                (*addr, selectors)
+            })
+            .collect();
+
+        let mut target_senders = sender_filters.targeted.clone();
+        target_senders.sort();
+
+        let mut excluded_senders = sender_filters.excluded.clone();
+        excluded_senders.sort();
+
+        Self {
+            target_contracts,
+            target_selectors,
+            target_senders,
+            excluded_senders,
+            fail_on_revert,
+        }
+    }
+
+    /// Compares these settings with another and returns a description of what changed.
+    /// Returns `None` if the settings are equivalent.
+    pub fn diff(&self, other: &Self) -> Option<String> {
+        let mut changes = Vec::new();
+
+        if self.target_contracts != other.target_contracts {
+            let added: Vec<_> = other
+                .target_contracts
+                .iter()
+                .filter(|(addr, _)| !self.target_contracts.contains_key(*addr))
+                .map(|(_, name)| name.as_str())
+                .collect();
+            let removed: Vec<_> = self
+                .target_contracts
+                .iter()
+                .filter(|(addr, _)| !other.target_contracts.contains_key(*addr))
+                .map(|(_, name)| name.as_str())
+                .collect();
+
+            if !added.is_empty() {
+                changes.push(format!("added target contracts: {}", added.join(", ")));
+            }
+            if !removed.is_empty() {
+                changes.push(format!("removed target contracts: {}", removed.join(", ")));
+            }
+        }
+
+        if self.target_selectors != other.target_selectors {
+            changes.push("target selectors changed".to_string());
+        }
+
+        if self.target_senders != other.target_senders {
+            changes.push("target senders changed".to_string());
+        }
+
+        if self.excluded_senders != other.excluded_senders {
+            changes.push("excluded senders changed".to_string());
+        }
+
+        if self.fail_on_revert != other.fail_on_revert {
+            changes.push(format!(
+                "fail_on_revert changed from {} to {}",
+                self.fail_on_revert, other.fail_on_revert
+            ));
+        }
+
+        if changes.is_empty() { None } else { Some(changes.join(", ")) }
+    }
+}
+
+impl fmt::Display for InvariantSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "targets: {}, selectors: {}, senders: {}, excluded: {}, fail_on_revert: {}",
+            self.target_contracts.len(),
+            self.target_selectors.values().map(|v| v.len()).sum::<usize>(),
+            self.target_senders.len(),
+            self.excluded_senders.len(),
+            self.fail_on_revert,
+        )
+    }
 }

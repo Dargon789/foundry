@@ -463,6 +463,16 @@
           "name": "depth",
           "ty": "uint64",
           "description": "Call depth traversed during the recording of state differences"
+        },
+        {
+          "name": "oldNonce",
+          "ty": "uint64",
+          "description": "The previous nonce of the accessed account."
+        },
+        {
+          "name": "newNonce",
+          "ty": "uint64",
+          "description": "The new nonce of the accessed account."
         }
       ]
     },
@@ -754,9 +764,9 @@
       "func": {
         "id": "accesses",
         "description": "Gets all accessed reads and write slot from a `vm.record` session, for a given address.",
-        "declaration": "function accesses(address target) external returns (bytes32[] memory readSlots, bytes32[] memory writeSlots);",
+        "declaration": "function accesses(address target) external view returns (bytes32[] memory readSlots, bytes32[] memory writeSlots);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "accesses(address)",
         "selector": "0x65bc9481",
         "selectorBytes": [
@@ -854,7 +864,7 @@
       "func": {
         "id": "assertApproxEqAbsDecimal_1",
         "description": "Compares two `uint256` values. Expects difference to be less than or equal to `maxDelta`.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertApproxEqAbsDecimal(uint256 left, uint256 right, uint256 maxDelta, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertApproxEqAbsDecimal(uint256 left, uint256 right, uint256 maxDelta, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqAbsDecimal(uint256,uint256,uint256,uint256,string)",
@@ -894,7 +904,7 @@
       "func": {
         "id": "assertApproxEqAbsDecimal_3",
         "description": "Compares two `int256` values. Expects difference to be less than or equal to `maxDelta`.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertApproxEqAbsDecimal(int256 left, int256 right, uint256 maxDelta, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertApproxEqAbsDecimal(int256 left, int256 right, uint256 maxDelta, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqAbsDecimal(int256,int256,uint256,uint256,string)",
@@ -934,7 +944,7 @@
       "func": {
         "id": "assertApproxEqAbs_1",
         "description": "Compares two `uint256` values. Expects difference to be less than or equal to `maxDelta`.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertApproxEqAbs(uint256 left, uint256 right, uint256 maxDelta, string calldata error) external pure;",
+        "declaration": "function assertApproxEqAbs(uint256 left, uint256 right, uint256 maxDelta, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqAbs(uint256,uint256,uint256,string)",
@@ -974,7 +984,7 @@
       "func": {
         "id": "assertApproxEqAbs_3",
         "description": "Compares two `int256` values. Expects difference to be less than or equal to `maxDelta`.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertApproxEqAbs(int256 left, int256 right, uint256 maxDelta, string calldata error) external pure;",
+        "declaration": "function assertApproxEqAbs(int256 left, int256 right, uint256 maxDelta, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqAbs(int256,int256,uint256,string)",
@@ -1014,7 +1024,7 @@
       "func": {
         "id": "assertApproxEqRelDecimal_1",
         "description": "Compares two `uint256` values. Expects relative difference in percents to be less than or equal to `maxPercentDelta`.\n`maxPercentDelta` is an 18 decimal fixed point number, where 1e18 == 100%\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertApproxEqRelDecimal(uint256 left, uint256 right, uint256 maxPercentDelta, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertApproxEqRelDecimal(uint256 left, uint256 right, uint256 maxPercentDelta, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqRelDecimal(uint256,uint256,uint256,uint256,string)",
@@ -1054,7 +1064,7 @@
       "func": {
         "id": "assertApproxEqRelDecimal_3",
         "description": "Compares two `int256` values. Expects relative difference in percents to be less than or equal to `maxPercentDelta`.\n`maxPercentDelta` is an 18 decimal fixed point number, where 1e18 == 100%\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertApproxEqRelDecimal(int256 left, int256 right, uint256 maxPercentDelta, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertApproxEqRelDecimal(int256 left, int256 right, uint256 maxPercentDelta, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqRelDecimal(int256,int256,uint256,uint256,string)",
@@ -1094,7 +1104,7 @@
       "func": {
         "id": "assertApproxEqRel_1",
         "description": "Compares two `uint256` values. Expects relative difference in percents to be less than or equal to `maxPercentDelta`.\n`maxPercentDelta` is an 18 decimal fixed point number, where 1e18 == 100%\nIncludes error message into revert string on failure.",
-        "declaration": "function assertApproxEqRel(uint256 left, uint256 right, uint256 maxPercentDelta, string calldata error) external pure;",
+        "declaration": "function assertApproxEqRel(uint256 left, uint256 right, uint256 maxPercentDelta, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqRel(uint256,uint256,uint256,string)",
@@ -1134,7 +1144,7 @@
       "func": {
         "id": "assertApproxEqRel_3",
         "description": "Compares two `int256` values. Expects relative difference in percents to be less than or equal to `maxPercentDelta`.\n`maxPercentDelta` is an 18 decimal fixed point number, where 1e18 == 100%\nIncludes error message into revert string on failure.",
-        "declaration": "function assertApproxEqRel(int256 left, int256 right, uint256 maxPercentDelta, string calldata error) external pure;",
+        "declaration": "function assertApproxEqRel(int256 left, int256 right, uint256 maxPercentDelta, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertApproxEqRel(int256,int256,uint256,string)",
@@ -1174,7 +1184,7 @@
       "func": {
         "id": "assertEqDecimal_1",
         "description": "Asserts that two `uint256` values are equal, formatting them with decimals in failure message.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertEqDecimal(uint256 left, uint256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertEqDecimal(uint256 left, uint256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEqDecimal(uint256,uint256,uint256,string)",
@@ -1214,7 +1224,7 @@
       "func": {
         "id": "assertEqDecimal_3",
         "description": "Asserts that two `int256` values are equal, formatting them with decimals in failure message.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertEqDecimal(int256 left, int256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertEqDecimal(int256 left, int256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEqDecimal(int256,int256,uint256,string)",
@@ -1254,7 +1264,7 @@
       "func": {
         "id": "assertEq_1",
         "description": "Asserts that two `bool` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(bool left, bool right, string calldata error) external pure;",
+        "declaration": "function assertEq(bool left, bool right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(bool,bool,string)",
@@ -1294,7 +1304,7 @@
       "func": {
         "id": "assertEq_11",
         "description": "Asserts that two `string` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(string calldata left, string calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(string calldata left, string calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(string,string,string)",
@@ -1334,7 +1344,7 @@
       "func": {
         "id": "assertEq_13",
         "description": "Asserts that two `bytes` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(bytes calldata left, bytes calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(bytes calldata left, bytes calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(bytes,bytes,string)",
@@ -1374,7 +1384,7 @@
       "func": {
         "id": "assertEq_15",
         "description": "Asserts that two arrays of `bool` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(bool[] calldata left, bool[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(bool[] calldata left, bool[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(bool[],bool[],string)",
@@ -1414,7 +1424,7 @@
       "func": {
         "id": "assertEq_17",
         "description": "Asserts that two arrays of `uint256` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(uint256[] calldata left, uint256[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(uint256[] calldata left, uint256[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(uint256[],uint256[],string)",
@@ -1454,7 +1464,7 @@
       "func": {
         "id": "assertEq_19",
         "description": "Asserts that two arrays of `int256` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(int256[] calldata left, int256[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(int256[] calldata left, int256[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(int256[],int256[],string)",
@@ -1514,7 +1524,7 @@
       "func": {
         "id": "assertEq_21",
         "description": "Asserts that two arrays of `address` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(address[] calldata left, address[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(address[] calldata left, address[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(address[],address[],string)",
@@ -1554,7 +1564,7 @@
       "func": {
         "id": "assertEq_23",
         "description": "Asserts that two arrays of `bytes32` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(bytes32[] calldata left, bytes32[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(bytes32[] calldata left, bytes32[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(bytes32[],bytes32[],string)",
@@ -1594,7 +1604,7 @@
       "func": {
         "id": "assertEq_25",
         "description": "Asserts that two arrays of `string` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(string[] calldata left, string[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(string[] calldata left, string[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(string[],string[],string)",
@@ -1634,7 +1644,7 @@
       "func": {
         "id": "assertEq_27",
         "description": "Asserts that two arrays of `bytes` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(bytes[] calldata left, bytes[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertEq(bytes[] calldata left, bytes[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(bytes[],bytes[],string)",
@@ -1654,7 +1664,7 @@
       "func": {
         "id": "assertEq_3",
         "description": "Asserts that two `uint256` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(uint256 left, uint256 right, string calldata error) external pure;",
+        "declaration": "function assertEq(uint256 left, uint256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(uint256,uint256,string)",
@@ -1694,7 +1704,7 @@
       "func": {
         "id": "assertEq_5",
         "description": "Asserts that two `int256` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(int256 left, int256 right, string calldata error) external pure;",
+        "declaration": "function assertEq(int256 left, int256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(int256,int256,string)",
@@ -1734,7 +1744,7 @@
       "func": {
         "id": "assertEq_7",
         "description": "Asserts that two `address` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(address left, address right, string calldata error) external pure;",
+        "declaration": "function assertEq(address left, address right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(address,address,string)",
@@ -1774,7 +1784,7 @@
       "func": {
         "id": "assertEq_9",
         "description": "Asserts that two `bytes32` values are equal and includes error message into revert string on failure.",
-        "declaration": "function assertEq(bytes32 left, bytes32 right, string calldata error) external pure;",
+        "declaration": "function assertEq(bytes32 left, bytes32 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertEq(bytes32,bytes32,string)",
@@ -1814,7 +1824,7 @@
       "func": {
         "id": "assertFalse_1",
         "description": "Asserts that the given condition is false and includes error message into revert string on failure.",
-        "declaration": "function assertFalse(bool condition, string calldata error) external pure;",
+        "declaration": "function assertFalse(bool condition, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertFalse(bool,string)",
@@ -1854,7 +1864,7 @@
       "func": {
         "id": "assertGeDecimal_1",
         "description": "Compares two `uint256` values. Expects first value to be greater than or equal to second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertGeDecimal(uint256 left, uint256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertGeDecimal(uint256 left, uint256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGeDecimal(uint256,uint256,uint256,string)",
@@ -1894,7 +1904,7 @@
       "func": {
         "id": "assertGeDecimal_3",
         "description": "Compares two `int256` values. Expects first value to be greater than or equal to second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertGeDecimal(int256 left, int256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertGeDecimal(int256 left, int256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGeDecimal(int256,int256,uint256,string)",
@@ -1934,7 +1944,7 @@
       "func": {
         "id": "assertGe_1",
         "description": "Compares two `uint256` values. Expects first value to be greater than or equal to second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertGe(uint256 left, uint256 right, string calldata error) external pure;",
+        "declaration": "function assertGe(uint256 left, uint256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGe(uint256,uint256,string)",
@@ -1974,7 +1984,7 @@
       "func": {
         "id": "assertGe_3",
         "description": "Compares two `int256` values. Expects first value to be greater than or equal to second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertGe(int256 left, int256 right, string calldata error) external pure;",
+        "declaration": "function assertGe(int256 left, int256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGe(int256,int256,string)",
@@ -2014,7 +2024,7 @@
       "func": {
         "id": "assertGtDecimal_1",
         "description": "Compares two `uint256` values. Expects first value to be greater than second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertGtDecimal(uint256 left, uint256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertGtDecimal(uint256 left, uint256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGtDecimal(uint256,uint256,uint256,string)",
@@ -2054,7 +2064,7 @@
       "func": {
         "id": "assertGtDecimal_3",
         "description": "Compares two `int256` values. Expects first value to be greater than second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertGtDecimal(int256 left, int256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertGtDecimal(int256 left, int256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGtDecimal(int256,int256,uint256,string)",
@@ -2094,7 +2104,7 @@
       "func": {
         "id": "assertGt_1",
         "description": "Compares two `uint256` values. Expects first value to be greater than second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertGt(uint256 left, uint256 right, string calldata error) external pure;",
+        "declaration": "function assertGt(uint256 left, uint256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGt(uint256,uint256,string)",
@@ -2134,7 +2144,7 @@
       "func": {
         "id": "assertGt_3",
         "description": "Compares two `int256` values. Expects first value to be greater than second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertGt(int256 left, int256 right, string calldata error) external pure;",
+        "declaration": "function assertGt(int256 left, int256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertGt(int256,int256,string)",
@@ -2174,7 +2184,7 @@
       "func": {
         "id": "assertLeDecimal_1",
         "description": "Compares two `uint256` values. Expects first value to be less than or equal to second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertLeDecimal(uint256 left, uint256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertLeDecimal(uint256 left, uint256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLeDecimal(uint256,uint256,uint256,string)",
@@ -2214,7 +2224,7 @@
       "func": {
         "id": "assertLeDecimal_3",
         "description": "Compares two `int256` values. Expects first value to be less than or equal to second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertLeDecimal(int256 left, int256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertLeDecimal(int256 left, int256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLeDecimal(int256,int256,uint256,string)",
@@ -2254,7 +2264,7 @@
       "func": {
         "id": "assertLe_1",
         "description": "Compares two `uint256` values. Expects first value to be less than or equal to second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertLe(uint256 left, uint256 right, string calldata error) external pure;",
+        "declaration": "function assertLe(uint256 left, uint256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLe(uint256,uint256,string)",
@@ -2294,7 +2304,7 @@
       "func": {
         "id": "assertLe_3",
         "description": "Compares two `int256` values. Expects first value to be less than or equal to second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertLe(int256 left, int256 right, string calldata error) external pure;",
+        "declaration": "function assertLe(int256 left, int256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLe(int256,int256,string)",
@@ -2334,7 +2344,7 @@
       "func": {
         "id": "assertLtDecimal_1",
         "description": "Compares two `uint256` values. Expects first value to be less than second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertLtDecimal(uint256 left, uint256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertLtDecimal(uint256 left, uint256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLtDecimal(uint256,uint256,uint256,string)",
@@ -2374,7 +2384,7 @@
       "func": {
         "id": "assertLtDecimal_3",
         "description": "Compares two `int256` values. Expects first value to be less than second.\nFormats values with decimals in failure message. Includes error message into revert string on failure.",
-        "declaration": "function assertLtDecimal(int256 left, int256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertLtDecimal(int256 left, int256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLtDecimal(int256,int256,uint256,string)",
@@ -2414,7 +2424,7 @@
       "func": {
         "id": "assertLt_1",
         "description": "Compares two `uint256` values. Expects first value to be less than second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertLt(uint256 left, uint256 right, string calldata error) external pure;",
+        "declaration": "function assertLt(uint256 left, uint256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLt(uint256,uint256,string)",
@@ -2454,7 +2464,7 @@
       "func": {
         "id": "assertLt_3",
         "description": "Compares two `int256` values. Expects first value to be less than second.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertLt(int256 left, int256 right, string calldata error) external pure;",
+        "declaration": "function assertLt(int256 left, int256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertLt(int256,int256,string)",
@@ -2494,7 +2504,7 @@
       "func": {
         "id": "assertNotEqDecimal_1",
         "description": "Asserts that two `uint256` values are not equal, formatting them with decimals in failure message.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertNotEqDecimal(uint256 left, uint256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertNotEqDecimal(uint256 left, uint256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEqDecimal(uint256,uint256,uint256,string)",
@@ -2534,7 +2544,7 @@
       "func": {
         "id": "assertNotEqDecimal_3",
         "description": "Asserts that two `int256` values are not equal, formatting them with decimals in failure message.\nIncludes error message into revert string on failure.",
-        "declaration": "function assertNotEqDecimal(int256 left, int256 right, uint256 decimals, string calldata error) external pure;",
+        "declaration": "function assertNotEqDecimal(int256 left, int256 right, uint256 decimals, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEqDecimal(int256,int256,uint256,string)",
@@ -2574,7 +2584,7 @@
       "func": {
         "id": "assertNotEq_1",
         "description": "Asserts that two `bool` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(bool left, bool right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(bool left, bool right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(bool,bool,string)",
@@ -2614,7 +2624,7 @@
       "func": {
         "id": "assertNotEq_11",
         "description": "Asserts that two `string` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(string calldata left, string calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(string calldata left, string calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(string,string,string)",
@@ -2654,7 +2664,7 @@
       "func": {
         "id": "assertNotEq_13",
         "description": "Asserts that two `bytes` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(bytes calldata left, bytes calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(bytes calldata left, bytes calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(bytes,bytes,string)",
@@ -2694,7 +2704,7 @@
       "func": {
         "id": "assertNotEq_15",
         "description": "Asserts that two arrays of `bool` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(bool[] calldata left, bool[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(bool[] calldata left, bool[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(bool[],bool[],string)",
@@ -2734,7 +2744,7 @@
       "func": {
         "id": "assertNotEq_17",
         "description": "Asserts that two arrays of `uint256` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(uint256[] calldata left, uint256[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(uint256[] calldata left, uint256[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(uint256[],uint256[],string)",
@@ -2774,7 +2784,7 @@
       "func": {
         "id": "assertNotEq_19",
         "description": "Asserts that two arrays of `int256` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(int256[] calldata left, int256[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(int256[] calldata left, int256[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(int256[],int256[],string)",
@@ -2834,7 +2844,7 @@
       "func": {
         "id": "assertNotEq_21",
         "description": "Asserts that two arrays of `address` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(address[] calldata left, address[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(address[] calldata left, address[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(address[],address[],string)",
@@ -2874,7 +2884,7 @@
       "func": {
         "id": "assertNotEq_23",
         "description": "Asserts that two arrays of `bytes32` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(bytes32[] calldata left, bytes32[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(bytes32[] calldata left, bytes32[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(bytes32[],bytes32[],string)",
@@ -2914,7 +2924,7 @@
       "func": {
         "id": "assertNotEq_25",
         "description": "Asserts that two arrays of `string` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(string[] calldata left, string[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(string[] calldata left, string[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(string[],string[],string)",
@@ -2954,7 +2964,7 @@
       "func": {
         "id": "assertNotEq_27",
         "description": "Asserts that two arrays of `bytes` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(bytes[] calldata left, bytes[] calldata right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(bytes[] calldata left, bytes[] calldata right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(bytes[],bytes[],string)",
@@ -2974,7 +2984,7 @@
       "func": {
         "id": "assertNotEq_3",
         "description": "Asserts that two `uint256` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(uint256 left, uint256 right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(uint256 left, uint256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(uint256,uint256,string)",
@@ -3014,7 +3024,7 @@
       "func": {
         "id": "assertNotEq_5",
         "description": "Asserts that two `int256` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(int256 left, int256 right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(int256 left, int256 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(int256,int256,string)",
@@ -3054,7 +3064,7 @@
       "func": {
         "id": "assertNotEq_7",
         "description": "Asserts that two `address` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(address left, address right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(address left, address right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(address,address,string)",
@@ -3094,7 +3104,7 @@
       "func": {
         "id": "assertNotEq_9",
         "description": "Asserts that two `bytes32` values are not equal and includes error message into revert string on failure.",
-        "declaration": "function assertNotEq(bytes32 left, bytes32 right, string calldata error) external pure;",
+        "declaration": "function assertNotEq(bytes32 left, bytes32 right, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertNotEq(bytes32,bytes32,string)",
@@ -3134,7 +3144,7 @@
       "func": {
         "id": "assertTrue_1",
         "description": "Asserts that the given condition is true and includes error message into revert string on failure.",
-        "declaration": "function assertTrue(bool condition, string calldata error) external pure;",
+        "declaration": "function assertTrue(bool condition, string calldata err) external pure;",
         "visibility": "external",
         "mutability": "pure",
         "signature": "assertTrue(bool,string)",
@@ -3329,6 +3339,46 @@
       "group": "evm",
       "status": "stable",
       "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "bound_0",
+        "description": "Returns an uint256 value bounded in given range and different from the current one.",
+        "declaration": "function bound(uint256 current, uint256 min, uint256 max) external view returns (uint256);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "bound(uint256,uint256,uint256)",
+        "selector": "0x5a6c1eed",
+        "selectorBytes": [
+          90,
+          108,
+          30,
+          237
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "bound_1",
+        "description": "Returns an int256 value bounded in given range and different from the current one.",
+        "declaration": "function bound(int256 current, int256 min, int256 max) external view returns (int256);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "bound(int256,int256,int256)",
+        "selector": "0x8f48fc07",
+        "selectorBytes": [
+          143,
+          72,
+          252,
+          7
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
     },
     {
       "func": {
@@ -3614,9 +3664,9 @@
       "func": {
         "id": "contains",
         "description": "Returns true if `search` is found in `subject`, false otherwise.",
-        "declaration": "function contains(string calldata subject, string calldata search) external returns (bool result);",
+        "declaration": "function contains(string calldata subject, string calldata search) external pure returns (bool result);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "pure",
         "signature": "contains(string,string)",
         "selector": "0x3fb18aec",
         "selectorBytes": [
@@ -3708,7 +3758,7 @@
       },
       "group": "utilities",
       "status": "stable",
-      "safety": "safe"
+      "safety": "unsafe"
     },
     {
       "func": {
@@ -3727,6 +3777,26 @@
         ]
       },
       "group": "filesystem",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "createEd25519Key",
+        "description": "Generates an Ed25519 key pair from a deterministic salt.\nReturns (publicKey, privateKey) as 32-byte values.",
+        "declaration": "function createEd25519Key(bytes32 salt) external pure returns (bytes32 publicKey, bytes32 privateKey);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "createEd25519Key(bytes32)",
+        "selector": "0x1ef3f27a",
+        "selectorBytes": [
+          30,
+          243,
+          242,
+          122
+        ]
+      },
+      "group": "crypto",
       "status": "stable",
       "safety": "safe"
     },
@@ -3912,6 +3982,26 @@
     },
     {
       "func": {
+        "id": "currentFilePath",
+        "description": "Get the source file path of the currently running test or script contract,\nrelative to the project root.",
+        "declaration": "function currentFilePath() external view returns (string memory path);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "currentFilePath()",
+        "selector": "0x9b45555c",
+        "selectorBytes": [
+          155,
+          69,
+          85,
+          92
+        ]
+      },
+      "group": "filesystem",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "deal",
         "description": "Sets an address' balance.",
         "declaration": "function deal(address account, uint256 newBalance) external;",
@@ -4017,7 +4107,7 @@
     {
       "func": {
         "id": "deployCode_0",
-        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.",
+        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.",
         "declaration": "function deployCode(string calldata artifactPath) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4037,7 +4127,7 @@
     {
       "func": {
         "id": "deployCode_1",
-        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nAdditionally accepts abi-encoded constructor arguments.",
+        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.\nAdditionally accepts abi-encoded constructor arguments.",
         "declaration": "function deployCode(string calldata artifactPath, bytes calldata constructorArgs) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4057,7 +4147,7 @@
     {
       "func": {
         "id": "deployCode_2",
-        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nAdditionally accepts `msg.value`.",
+        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.\nAdditionally accepts `msg.value`.",
         "declaration": "function deployCode(string calldata artifactPath, uint256 value) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4077,7 +4167,7 @@
     {
       "func": {
         "id": "deployCode_3",
-        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nAdditionally accepts abi-encoded constructor arguments and `msg.value`.",
+        "description": "Deploys a contract from an artifact file. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.\nAdditionally accepts abi-encoded constructor arguments and `msg.value`.",
         "declaration": "function deployCode(string calldata artifactPath, bytes calldata constructorArgs, uint256 value) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4097,7 +4187,7 @@
     {
       "func": {
         "id": "deployCode_4",
-        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.",
+        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.",
         "declaration": "function deployCode(string calldata artifactPath, bytes32 salt) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4117,7 +4207,7 @@
     {
       "func": {
         "id": "deployCode_5",
-        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nAdditionally accepts abi-encoded constructor arguments.",
+        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.\nAdditionally accepts abi-encoded constructor arguments.",
         "declaration": "function deployCode(string calldata artifactPath, bytes calldata constructorArgs, bytes32 salt) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4137,7 +4227,7 @@
     {
       "func": {
         "id": "deployCode_6",
-        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nAdditionally accepts `msg.value`.",
+        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.\nAdditionally accepts `msg.value`.",
         "declaration": "function deployCode(string calldata artifactPath, uint256 value, bytes32 salt) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4157,7 +4247,7 @@
     {
       "func": {
         "id": "deployCode_7",
-        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nAdditionally accepts abi-encoded constructor arguments and `msg.value`.",
+        "description": "Deploys a contract from an artifact file, using the CREATE2 salt. Takes in the relative path to the json file or the path to the\nartifact in the form of <path>:<contract>:<version> where <contract> and <version> parts are optional.\nReverts if the target artifact contains unlinked library placeholders.\nAdditionally accepts abi-encoded constructor arguments and `msg.value`.",
         "declaration": "function deployCode(string calldata artifactPath, bytes calldata constructorArgs, uint256 value, bytes32 salt) external returns (address deployedAddress);",
         "visibility": "external",
         "mutability": "",
@@ -4177,7 +4267,7 @@
     {
       "func": {
         "id": "deriveKey_0",
-        "description": "Derive a private key from a provided mnenomic string (or mnenomic file path)\nat the derivation path `m/44'/60'/0'/0/{index}`.",
+        "description": "Derive a private key from a provided mnemonic string (or mnemonic file path)\nat the derivation path `m/44'/60'/0'/0/{index}`.",
         "declaration": "function deriveKey(string calldata mnemonic, uint32 index) external pure returns (uint256 privateKey);",
         "visibility": "external",
         "mutability": "pure",
@@ -4197,7 +4287,7 @@
     {
       "func": {
         "id": "deriveKey_1",
-        "description": "Derive a private key from a provided mnenomic string (or mnenomic file path)\nat `{derivationPath}{index}`.",
+        "description": "Derive a private key from a provided mnemonic string (or mnemonic file path)\nat `{derivationPath}{index}`.",
         "declaration": "function deriveKey(string calldata mnemonic, string calldata derivationPath, uint32 index) external pure returns (uint256 privateKey);",
         "visibility": "external",
         "mutability": "pure",
@@ -4217,7 +4307,7 @@
     {
       "func": {
         "id": "deriveKey_2",
-        "description": "Derive a private key from a provided mnenomic string (or mnenomic file path) in the specified language\nat the derivation path `m/44'/60'/0'/0/{index}`.",
+        "description": "Derive a private key from a provided mnemonic string (or mnemonic file path) in the specified language\nat the derivation path `m/44'/60'/0'/0/{index}`.",
         "declaration": "function deriveKey(string calldata mnemonic, uint32 index, string calldata language) external pure returns (uint256 privateKey);",
         "visibility": "external",
         "mutability": "pure",
@@ -4237,7 +4327,7 @@
     {
       "func": {
         "id": "deriveKey_3",
-        "description": "Derive a private key from a provided mnenomic string (or mnenomic file path) in the specified language\nat `{derivationPath}{index}`.",
+        "description": "Derive a private key from a provided mnemonic string (or mnemonic file path) in the specified language\nat `{derivationPath}{index}`.",
         "declaration": "function deriveKey(string calldata mnemonic, string calldata derivationPath, uint32 index, string calldata language) external pure returns (uint256 privateKey);",
         "visibility": "external",
         "mutability": "pure",
@@ -4293,6 +4383,106 @@
       "group": "evm",
       "status": "stable",
       "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "eip712HashStruct_0",
+        "description": "Generates the struct hash of the canonical EIP-712 type representation and its abi-encoded data.\nSupports 2 different inputs:\n 1. Name of the type (i.e. \"PermitSingle\"):\n    * requires previous binding generation with `forge bind-json`.\n    * bindings will be retrieved from the path configured in `foundry.toml`.\n 2. String representation of the type (i.e. \"Foo(Bar bar) Bar(uint256 baz)\").\n    * Note: the cheatcode will use the canonical type even if the input is malformated\n            with the wrong order of elements or with extra whitespaces.",
+        "declaration": "function eip712HashStruct(string calldata typeNameOrDefinition, bytes calldata abiEncodedData) external pure returns (bytes32 typeHash);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "eip712HashStruct(string,bytes)",
+        "selector": "0xaedeaebc",
+        "selectorBytes": [
+          174,
+          222,
+          174,
+          188
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "eip712HashStruct_1",
+        "description": "Generates the struct hash of the canonical EIP-712 type representation and its abi-encoded data.\nRequires previous binding generation with `forge bind-json`.\nParams:\n * `bindingsPath`: path where the output of `forge bind-json` is stored.\n * `typeName`: Name of the type (i.e. \"PermitSingle\").\n * `abiEncodedData`: ABI-encoded data for the struct that is being hashed.",
+        "declaration": "function eip712HashStruct(string calldata bindingsPath, string calldata typeName, bytes calldata abiEncodedData) external pure returns (bytes32 typeHash);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "eip712HashStruct(string,string,bytes)",
+        "selector": "0x6d06c57c",
+        "selectorBytes": [
+          109,
+          6,
+          197,
+          124
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "eip712HashType_0",
+        "description": "Generates the hash of the canonical EIP-712 type representation.\nSupports 2 different inputs:\n 1. Name of the type (i.e. \"Transaction\"):\n    * requires previous binding generation with `forge bind-json`.\n    * bindings will be retrieved from the path configured in `foundry.toml`.\n 2. String representation of the type (i.e. \"Foo(Bar bar) Bar(uint256 baz)\").\n    * Note: the cheatcode will output the canonical type even if the input is malformated\n            with the wrong order of elements or with extra whitespaces.",
+        "declaration": "function eip712HashType(string calldata typeNameOrDefinition) external pure returns (bytes32 typeHash);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "eip712HashType(string)",
+        "selector": "0x6792e9e2",
+        "selectorBytes": [
+          103,
+          146,
+          233,
+          226
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "eip712HashType_1",
+        "description": "Generates the hash of the canonical EIP-712 type representation.\nRequires previous binding generation with `forge bind-json`.\nParams:\n * `bindingsPath`: path where the output of `forge bind-json` is stored.\n * `typeName`: Name of the type (i.e. \"Transaction\").",
+        "declaration": "function eip712HashType(string calldata bindingsPath, string calldata typeName) external pure returns (bytes32 typeHash);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "eip712HashType(string,string)",
+        "selector": "0x18fb6406",
+        "selectorBytes": [
+          24,
+          251,
+          100,
+          6
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "eip712HashTypedData",
+        "description": "Generates a ready-to-sign digest of human-readable typed data following the EIP-712 standard.",
+        "declaration": "function eip712HashTypedData(string calldata jsonData) external pure returns (bytes32 digest);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "eip712HashTypedData(string)",
+        "selector": "0xea25e615",
+        "selectorBytes": [
+          234,
+          37,
+          230,
+          21
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
     },
     {
       "func": {
@@ -4918,9 +5108,9 @@
       "func": {
         "id": "eth_getLogs",
         "description": "Gets all the logs according to specified filter.",
-        "declaration": "function eth_getLogs(uint256 fromBlock, uint256 toBlock, address target, bytes32[] calldata topics) external returns (EthGetLogs[] memory logs);",
+        "declaration": "function eth_getLogs(uint256 fromBlock, uint256 toBlock, address target, bytes32[] calldata topics) external view returns (EthGetLogs[] memory logs);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "eth_getLogs(uint256,uint256,address,bytes32[])",
         "selector": "0x35e1349b",
         "selectorBytes": [
@@ -4933,6 +5123,26 @@
       "group": "evm",
       "status": "stable",
       "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "executeTransaction",
+        "description": "Executes an RLP-encoded signed transaction with full EVM semantics (like `--isolate` mode).\nThe transaction is decoded from EIP-2718 format (type byte prefix + RLP payload) or legacy RLP.\nReturns the execution output bytes.\nThis cheatcode is not allowed in `forge script` contexts.",
+        "declaration": "function executeTransaction(bytes calldata rawTx) external returns (bytes memory);",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "executeTransaction(bytes)",
+        "selector": "0x943d7209",
+        "selectorBytes": [
+          148,
+          61,
+          114,
+          9
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
     },
     {
       "func": {
@@ -5237,7 +5447,7 @@
     {
       "func": {
         "id": "expectEmit_0",
-        "description": "Prepare an expected log with (bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData.).\nCall this function, then emit an event, then call a function. Internally after the call, we check if\nlogs were emitted in the expected order with the expected topics and data (as specified by the booleans).",
+        "description": "Prepare an expected log with (bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData.).\nCall this function, then emit an event, then call a function. Internally after the call, we check if\nlogs were emitted in the expected order with the expected topics and data (as specified by the booleans).\nMust be placed immediately before the call you want to assert on. If the next call reverts and the\nrevert is caught by the caller (low-level call or try/catch), the expectation remains active and may\nbe satisfied by a log emitted from a later call.",
         "declaration": "function expectEmit(bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData) external;",
         "visibility": "external",
         "mutability": "",
@@ -5277,7 +5487,7 @@
     {
       "func": {
         "id": "expectEmit_2",
-        "description": "Prepare an expected log with all topic and data checks enabled.\nCall this function, then emit an event, then call a function. Internally after the call, we check if\nlogs were emitted in the expected order with the expected topics and data.",
+        "description": "Prepare an expected log with all topic and data checks enabled.\nCall this function, then emit an event, then call a function. Internally after the call, we check if\nlogs were emitted in the expected order with the expected topics and data.\nMust be placed immediately before the call you want to assert on. If the next call reverts and the\nrevert is caught by the caller (low-level call or try/catch), the expectation remains active and may\nbe satisfied by a log emitted from a later call.",
         "declaration": "function expectEmit() external;",
         "visibility": "external",
         "mutability": "",
@@ -5796,6 +6006,26 @@
     },
     {
       "func": {
+        "id": "fromRlp",
+        "description": "RLP decodes an RLP payload into a list of bytes.",
+        "declaration": "function fromRlp(bytes calldata rlp) external pure returns (bytes[] memory data);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "fromRlp(bytes)",
+        "selector": "0x1e1d8b63",
+        "selectorBytes": [
+          30,
+          29,
+          139,
+          99
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "fsMetadata",
         "description": "Given a path, query the file system to get information about a file, directory, etc.",
         "declaration": "function fsMetadata(string calldata path) external view returns (FsMetadata memory metadata);",
@@ -5996,6 +6226,26 @@
     },
     {
       "func": {
+        "id": "getChainId",
+        "description": "Gets the current `block.chainid` of the currently selected environment.\nYou should use this instead of `block.chainid` if you use `vm.selectFork` or `vm.createSelectFork`, as `block.chainid` could be assumed\nto be constant across a transaction, and as a result will get optimized out by the compiler.\nSee https://github.com/foundry-rs/foundry/issues/6180",
+        "declaration": "function getChainId() external view returns (uint256 blockChainId);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "getChainId()",
+        "selector": "0x3408e470",
+        "selectorBytes": [
+          52,
+          8,
+          228,
+          112
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "getChain_0",
         "description": "Returns a Chain struct for specific alias",
         "declaration": "function getChain(string calldata chainAlias) external view returns (Chain memory chain);",
@@ -6136,6 +6386,26 @@
     },
     {
       "func": {
+        "id": "getEvmVersion",
+        "description": "Returns the test or script execution evm version.\n**Note:** The execution evm version is not the same as the compilation one.",
+        "declaration": "function getEvmVersion() external pure returns (string memory evm);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "getEvmVersion()",
+        "selector": "0xaa2bb222",
+        "selectorBytes": [
+          170,
+          43,
+          178,
+          34
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "getFoundryVersion",
         "description": "Returns the Foundry version.\nFormat: <cargo_version>-<tag>+<git_sha_short>.<unix_build_timestamp>.<profile>\nSample output: 0.3.0-nightly+3cb96bde9b.1737036656.debug\nNote: Build timestamps may vary slightly across platforms due to separate CI jobs.\nFor reliable version comparisons, use UNIX format (e.g., >= 1700000000)\nto compare timestamps while ignoring minor time differences.",
         "declaration": "function getFoundryVersion() external view returns (string memory version);",
@@ -6178,9 +6448,9 @@
       "func": {
         "id": "getMappingKeyAndParentOf",
         "description": "Gets the map key and parent of a mapping at a given slot, for a given address.",
-        "declaration": "function getMappingKeyAndParentOf(address target, bytes32 elementSlot) external returns (bool found, bytes32 key, bytes32 parent);",
+        "declaration": "function getMappingKeyAndParentOf(address target, bytes32 elementSlot) external view returns (bool found, bytes32 key, bytes32 parent);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "getMappingKeyAndParentOf(address,bytes32)",
         "selector": "0x876e24e6",
         "selectorBytes": [
@@ -6198,9 +6468,9 @@
       "func": {
         "id": "getMappingLength",
         "description": "Gets the number of elements in the mapping at the given slot, for a given address.",
-        "declaration": "function getMappingLength(address target, bytes32 mappingSlot) external returns (uint256 length);",
+        "declaration": "function getMappingLength(address target, bytes32 mappingSlot) external view returns (uint256 length);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "getMappingLength(address,bytes32)",
         "selector": "0x2f2fd63f",
         "selectorBytes": [
@@ -6218,9 +6488,9 @@
       "func": {
         "id": "getMappingSlotAt",
         "description": "Gets the elements at index idx of the mapping at the given slot, for a given address. The\nindex must be less than the length of the mapping (i.e. the number of keys in the mapping).",
-        "declaration": "function getMappingSlotAt(address target, bytes32 mappingSlot, uint256 idx) external returns (bytes32 value);",
+        "declaration": "function getMappingSlotAt(address target, bytes32 mappingSlot, uint256 idx) external view returns (bytes32 value);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "getMappingSlotAt(address,bytes32,uint256)",
         "selector": "0xebc73ab4",
         "selectorBytes": [
@@ -6258,9 +6528,9 @@
       "func": {
         "id": "getNonce_1",
         "description": "Get the nonce of a `Wallet`.",
-        "declaration": "function getNonce(Wallet calldata wallet) external returns (uint64 nonce);",
+        "declaration": "function getNonce(Wallet calldata wallet) external view returns (uint64 nonce);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "getNonce((address,uint256,uint256,uint256))",
         "selector": "0xa5748aad",
         "selectorBytes": [
@@ -6276,11 +6546,31 @@
     },
     {
       "func": {
+        "id": "getRawBlockHeader",
+        "description": "Gets the RLP encoded block header for a given block number.\nReturns the block header in the same format as `cast block <block_number> --raw`.",
+        "declaration": "function getRawBlockHeader(uint256 blockNumber) external view returns (bytes memory rlpHeader);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "getRawBlockHeader(uint256)",
+        "selector": "0x2c667606",
+        "selectorBytes": [
+          44,
+          102,
+          118,
+          6
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "getRecordedLogs",
         "description": "Gets all the recorded logs.",
-        "declaration": "function getRecordedLogs() external returns (Log[] memory logs);",
+        "declaration": "function getRecordedLogs() external view returns (Log[] memory logs);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "getRecordedLogs()",
         "selector": "0x191553a4",
         "selectorBytes": [
@@ -6288,6 +6578,26 @@
           21,
           83,
           164
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "getRecordedLogsJson",
+        "description": "Gets all the recorded logs, in JSON format.",
+        "declaration": "function getRecordedLogsJson() external view returns (string memory logsJson);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "getRecordedLogsJson()",
+        "selector": "0x3b171111",
+        "selectorBytes": [
+          59,
+          23,
+          17,
+          17
         ]
       },
       "group": "evm",
@@ -6336,11 +6646,51 @@
     },
     {
       "func": {
+        "id": "getStorageAccesses",
+        "description": "Returns an array of `StorageAccess` from current `vm.stateStateDiffRecording` session",
+        "declaration": "function getStorageAccesses() external view returns (StorageAccess[] memory storageAccesses);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "getStorageAccesses()",
+        "selector": "0x2899b1d0",
+        "selectorBytes": [
+          40,
+          153,
+          177,
+          208
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "getStorageSlots",
+        "description": "Returns an array of storage slots occupied by the specified variable.",
+        "declaration": "function getStorageSlots(address target, string calldata variableName) external view returns (uint256[] memory slots);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "getStorageSlots(address,string)",
+        "selector": "0xefa136d9",
+        "selectorBytes": [
+          239,
+          161,
+          54,
+          217
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "getWallets",
         "description": "Returns addresses of available unlocked wallets in the script environment.",
-        "declaration": "function getWallets() external returns (address[] memory wallets);",
+        "declaration": "function getWallets() external view returns (address[] memory wallets);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "getWallets()",
         "selector": "0xdb7a4605",
         "selectorBytes": [
@@ -8138,6 +8488,26 @@
     },
     {
       "func": {
+        "id": "publicKeyEd25519",
+        "description": "Derives the Ed25519 public key from a private key.",
+        "declaration": "function publicKeyEd25519(bytes32 privateKey) external pure returns (bytes32 publicKey);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "publicKeyEd25519(bytes32)",
+        "selector": "0x27f44236",
+        "selectorBytes": [
+          39,
+          244,
+          66,
+          54
+        ]
+      },
+      "group": "crypto",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "publicKeyP256",
         "description": "Derives secp256r1 public key from the provided `privateKey`.",
         "declaration": "function publicKeyP256(uint256 privateKey) external pure returns (uint256 publicKeyX, uint256 publicKeyY);",
@@ -8160,9 +8530,9 @@
       "func": {
         "id": "randomAddress",
         "description": "Returns a random `address`.",
-        "declaration": "function randomAddress() external returns (address);",
+        "declaration": "function randomAddress() external view returns (address);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "randomAddress()",
         "selector": "0xd5bee9f5",
         "selectorBytes": [
@@ -8300,9 +8670,9 @@
       "func": {
         "id": "randomUint_0",
         "description": "Returns a random uint256 value.",
-        "declaration": "function randomUint() external returns (uint256);",
+        "declaration": "function randomUint() external view returns (uint256);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "randomUint()",
         "selector": "0x25124730",
         "selectorBytes": [
@@ -8320,9 +8690,9 @@
       "func": {
         "id": "randomUint_1",
         "description": "Returns random uint256 value between the provided range (=min..=max).",
-        "declaration": "function randomUint(uint256 min, uint256 max) external returns (uint256);",
+        "declaration": "function randomUint(uint256 min, uint256 max) external view returns (uint256);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "randomUint(uint256,uint256)",
         "selector": "0xd61b051b",
         "selectorBytes": [
@@ -8360,9 +8730,9 @@
       "func": {
         "id": "readCallers",
         "description": "Reads the current `msg.sender` and `tx.origin` from state and reports if there is any active caller modification.",
-        "declaration": "function readCallers() external returns (CallerMode callerMode, address msgSender, address txOrigin);",
+        "declaration": "function readCallers() external view returns (CallerMode callerMode, address msgSender, address txOrigin);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "view",
         "signature": "readCallers()",
         "selector": "0x4ad0bac9",
         "selectorBytes": [
@@ -8715,6 +9085,26 @@
       "group": "evm",
       "status": "stable",
       "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "resolveEnv",
+        "description": "Resolves the env variable placeholders of a given input string.",
+        "declaration": "function resolveEnv(string calldata input) external returns (string memory);",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "resolveEnv(string)",
+        "selector": "0xddd2128d",
+        "selectorBytes": [
+          221,
+          210,
+          18,
+          141
+        ]
+      },
+      "group": "environment",
+      "status": "stable",
+      "safety": "safe"
     },
     {
       "func": {
@@ -9478,7 +9868,7 @@
       },
       "group": "utilities",
       "status": "stable",
-      "safety": "safe"
+      "safety": "unsafe"
     },
     {
       "func": {
@@ -9498,7 +9888,7 @@
       },
       "group": "utilities",
       "status": "stable",
-      "safety": "safe"
+      "safety": "unsafe"
     },
     {
       "func": {
@@ -9542,6 +9932,26 @@
     },
     {
       "func": {
+        "id": "setEvmVersion",
+        "description": "Set the exact test or script execution evm version, e.g. `berlin`, `cancun`.\n**Note:** The execution evm version is not the same as the compilation one.",
+        "declaration": "function setEvmVersion(string calldata evm) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "setEvmVersion(string)",
+        "selector": "0x43179f5a",
+        "selectorBytes": [
+          67,
+          23,
+          159,
+          90
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "setNonce",
         "description": "Sets the nonce of an account. Must be higher than the current nonce of the account.",
         "declaration": "function setNonce(address account, uint64 newNonce) external;",
@@ -9579,6 +9989,26 @@
       "group": "evm",
       "status": "stable",
       "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "setSeed",
+        "description": "Set RNG seed.",
+        "declaration": "function setSeed(uint256 seed) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "setSeed(uint256)",
+        "selector": "0xc32a50f9",
+        "selectorBytes": [
+          195,
+          42,
+          80,
+          249
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
     },
     {
       "func": {
@@ -9664,9 +10094,9 @@
       "func": {
         "id": "signCompact_0",
         "description": "Signs data with a `Wallet`.\nReturns a compact signature (`r`, `vs`) as per EIP-2098, where `vs` encodes both the\nsignature's `s` value, and the recovery id `v` in a single bytes32.\nThis format reduces the signature size from 65 to 64 bytes.",
-        "declaration": "function signCompact(Wallet calldata wallet, bytes32 digest) external returns (bytes32 r, bytes32 vs);",
+        "declaration": "function signCompact(Wallet calldata wallet, bytes32 digest) external pure returns (bytes32 r, bytes32 vs);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "pure",
         "signature": "signCompact((address,uint256,uint256,uint256),bytes32)",
         "selector": "0x3d0e292f",
         "selectorBytes": [
@@ -9802,6 +10232,26 @@
     },
     {
       "func": {
+        "id": "signEd25519",
+        "description": "Signs a message with namespace using Ed25519.\nThe signature covers namespace || message for domain separation.\nReturns a 64-byte Ed25519 signature.",
+        "declaration": "function signEd25519(bytes calldata namespace, bytes calldata message, bytes32 privateKey) external pure returns (bytes memory signature);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "signEd25519(bytes,bytes,bytes32)",
+        "selector": "0xef609c65",
+        "selectorBytes": [
+          239,
+          96,
+          156,
+          101
+        ]
+      },
+      "group": "crypto",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "signP256",
         "description": "Signs `digest` with `privateKey` using the secp256r1 curve.",
         "declaration": "function signP256(uint256 privateKey, bytes32 digest) external pure returns (bytes32 r, bytes32 s);",
@@ -9822,11 +10272,31 @@
     },
     {
       "func": {
+        "id": "signWithNonceUnsafe",
+        "description": "Signs `digest` with `privateKey` on the secp256k1 curve, using the given `nonce`\nas the raw ephemeral k value in ECDSA (instead of deriving it deterministically).",
+        "declaration": "function signWithNonceUnsafe(uint256 privateKey, bytes32 digest, uint256 nonce) external pure returns (uint8 v, bytes32 r, bytes32 s);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "signWithNonceUnsafe(uint256,bytes32,uint256)",
+        "selector": "0x2012783a",
+        "selectorBytes": [
+          32,
+          18,
+          120,
+          58
+        ]
+      },
+      "group": "crypto",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "sign_0",
         "description": "Signs data with a `Wallet`.",
-        "declaration": "function sign(Wallet calldata wallet, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);",
+        "declaration": "function sign(Wallet calldata wallet, bytes32 digest) external pure returns (uint8 v, bytes32 r, bytes32 s);",
         "visibility": "external",
-        "mutability": "",
+        "mutability": "pure",
         "signature": "sign((address,uint256,uint256,uint256),bytes32)",
         "selector": "0xb25c5a25",
         "selectorBytes": [
@@ -10684,6 +11154,26 @@
     },
     {
       "func": {
+        "id": "toRlp",
+        "description": "RLP encodes a list of bytes into an RLP payload.",
+        "declaration": "function toRlp(bytes[] calldata data) external pure returns (bytes memory);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "toRlp(bytes[])",
+        "selector": "0xa7ed3885",
+        "selectorBytes": [
+          167,
+          237,
+          56,
+          133
+        ]
+      },
+      "group": "utilities",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "toString_0",
         "description": "Converts the given value to a `string`.",
         "declaration": "function toString(address value) external pure returns (string memory stringifiedValue);",
@@ -10944,6 +11434,26 @@
     },
     {
       "func": {
+        "id": "verifyEd25519",
+        "description": "Verifies an Ed25519 signature over namespace || message.\nReturns true if signature is valid, false otherwise.",
+        "declaration": "function verifyEd25519(bytes calldata signature, bytes calldata namespace, bytes calldata message, bytes32 publicKey) external pure returns (bool valid);",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "verifyEd25519(bytes,bytes,bytes,bytes32)",
+        "selector": "0xd08c2888",
+        "selectorBytes": [
+          208,
+          140,
+          40,
+          136
+        ]
+      },
+      "group": "crypto",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "warmSlot",
         "description": "Utility cheatcode to mark specific storage slot as warm, simulating a prior read.",
         "declaration": "function warmSlot(address target, bytes32 slot) external;",
@@ -11045,7 +11555,7 @@
     {
       "func": {
         "id": "writeJson_1",
-        "description": "Write a serialized JSON object to an **existing** JSON file, replacing a value with key = <value_key.>\nThis is useful to replace a specific value of a JSON file, without having to parse the entire thing.",
+        "description": "Write a serialized JSON object to an **existing** JSON file, replacing a value with key = <value_key.>\nThis is useful to replace a specific value of a JSON file, without having to parse the entire thing.\nThis cheatcode will create new keys if they didn't previously exist.",
         "declaration": "function writeJson(string calldata json, string calldata path, string calldata valueKey) external;",
         "visibility": "external",
         "mutability": "",
@@ -11105,7 +11615,7 @@
     {
       "func": {
         "id": "writeToml_1",
-        "description": "Takes serialized JSON, converts to TOML and write a serialized TOML table to an **existing** TOML file, replacing a value with key = <value_key.>\nThis is useful to replace a specific value of a TOML file, without having to parse the entire thing.",
+        "description": "Takes serialized JSON, converts to TOML and write a serialized TOML table to an **existing** TOML file, replacing a value with key = <value_key.>\nThis is useful to replace a specific value of a TOML file, without having to parse the entire thing.\nThis cheatcode will create new keys if they didn't previously exist.",
         "declaration": "function writeToml(string calldata json, string calldata path, string calldata valueKey) external;",
         "visibility": "external",
         "mutability": "",

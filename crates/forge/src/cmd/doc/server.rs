@@ -1,5 +1,5 @@
-use axum::{routing::get_service, Router};
-use forge_doc::mdbook::{utils::fs::get_404_output_file, MDBook};
+use axum::{Router, routing::get_service};
+use forge_doc::mdbook_driver::MDBook;
 use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
@@ -38,13 +38,13 @@ impl Server {
     }
 
     /// Set the port to serve on.
-    pub fn with_port(mut self, port: usize) -> Self {
+    pub const fn with_port(mut self, port: usize) -> Self {
         self.port = port;
         self
     }
 
     /// Set whether to open the browser after serving.
-    pub fn open(mut self, open: bool) -> Self {
+    pub const fn open(mut self, open: bool) -> Self {
         self.open = open;
         self
     }
@@ -67,12 +67,11 @@ impl Server {
             .next()
             .ok_or_else(|| eyre::eyre!("no address found for {}", address))?;
         let build_dir = book.build_dir_for("html");
-        let input_404 = book
+        let file_404 = book
             .config
-            .get("output.html.input-404")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string);
-        let file_404 = get_404_output_file(&input_404);
+            .html_config()
+            .map(|c| c.get_404_output_file())
+            .unwrap_or_else(|| "404.html".to_string());
 
         let serving_url = format!("http://{address}");
         sh_println!("Serving on: {serving_url}")?;
@@ -94,7 +93,7 @@ impl Server {
 async fn serve(build_dir: PathBuf, address: SocketAddr, file_404: &str) -> io::Result<()> {
     let file_404 = build_dir.join(file_404);
     let svc = ServeDir::new(build_dir).not_found_service(ServeFile::new(file_404));
-    let app = Router::new().nest_service("/", get_service(svc));
+    let app = Router::new().fallback_service(get_service(svc));
     let tcp_listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(tcp_listener, app.into_make_service()).await
 }

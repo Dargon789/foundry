@@ -55,10 +55,14 @@ contract WhileStatement {
 
         while (condition) {
             doIt();
+            doIt();
         }
 
-        while (
-            // comment1
+        while (condition) {
+            doIt();
+        }
+
+        while ( // comment1
             condition
         ) {
             doIt();

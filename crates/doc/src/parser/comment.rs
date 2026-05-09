@@ -1,6 +1,5 @@
 use alloy_primitives::map::HashMap;
-use derive_more::{derive::Display, Deref, DerefMut};
-use solang_parser::doccomment::DocCommentTag;
+use derive_more::{Deref, DerefMut, derive::Display};
 
 /// The natspec comment tag explaining the purpose of the comment.
 /// See: <https://docs.soliditylang.org/en/v0.8.17/natspec-format.html#tags>.
@@ -46,7 +45,7 @@ impl CommentTag {
             }
             _ => {
                 warn!(target: "forge::doc", tag=trimmed, "unknown comment tag. custom tags must be preceded by `custom:`");
-                return None
+                return None;
             }
         };
         Some(tag)
@@ -66,14 +65,14 @@ pub struct Comment {
 
 impl Comment {
     /// Create new instance of [Comment].
-    pub fn new(tag: CommentTag, value: String) -> Self {
+    pub const fn new(tag: CommentTag, value: String) -> Self {
         Self { tag, value }
     }
 
-    /// Create new instance of [Comment] from [DocCommentTag]
+    /// Create new instance of [Comment] from a tag string and value,
     /// if it has a valid natspec tag.
-    pub fn from_doc_comment(value: DocCommentTag) -> Option<Self> {
-        CommentTag::from_str(&value.tag).map(|tag| Self { tag, value: value.value })
+    pub fn from_tag_and_value(tag: &str, value: String) -> Option<Self> {
+        CommentTag::from_str(tag).map(|tag| Self { tag, value })
     }
 
     /// Split the comment at first word.
@@ -86,25 +85,17 @@ impl Comment {
     /// Returns [None] if the word doesn't match.
     /// Useful for [CommentTag::Param] and [CommentTag::Return] comments.
     pub fn match_first_word(&self, expected: &str) -> Option<&str> {
-        self.split_first_word().and_then(
-            |(word, rest)| {
-                if word == expected {
-                    Some(rest)
-                } else {
-                    None
-                }
-            },
-        )
+        self.split_first_word().and_then(|(word, rest)| (word == expected).then_some(rest))
     }
 
     /// Check if this comment is a custom tag.
-    pub fn is_custom(&self) -> bool {
+    pub const fn is_custom(&self) -> bool {
         matches!(self.tag, CommentTag::Custom(_))
     }
 }
 
 /// The collection of natspec [Comment] items.
-#[derive(Clone, Debug, Default, PartialEq, Deref, DerefMut)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deref, DerefMut)]
 pub struct Comments(Vec<Comment>);
 
 /// Forward the [Comments] function implementation to the [CommentsRef]
@@ -125,16 +116,18 @@ impl Comments {
     ref_fn!(pub fn contains_tag(&self, tag: &Comment) -> bool);
     ref_fn!(pub fn find_inheritdoc_base(&self) -> Option<&'_ str>);
 
-    /// Attempt to lookup
+    /// Attempts to lookup inherited comments and merge them with the current collection.
     ///
-    /// Merges two comments collections by inserting [CommentTag] from the second collection
-    /// into the first unless they are present.
+    /// Looks up comments in `inheritdocs` using the key `{base}.{ident}` where `base` is
+    /// extracted from an `@inheritdoc` tag. Merges the found comments by inserting
+    /// [CommentTag] from the inherited collection into the current one unless they are
+    /// already present.
     pub fn merge_inheritdoc(
         &self,
         ident: &str,
         inheritdocs: Option<HashMap<String, Self>>,
     ) -> Self {
-        let mut result = Self(Vec::from_iter(self.iter().cloned()));
+        let mut result = self.clone();
 
         if let (Some(inheritdocs), Some(base)) = (inheritdocs, self.find_inheritdoc_base()) {
             let key = format!("{base}.{ident}");
@@ -151,14 +144,69 @@ impl Comments {
     }
 }
 
-impl From<Vec<DocCommentTag>> for Comments {
-    fn from(value: Vec<DocCommentTag>) -> Self {
-        Self(value.into_iter().flat_map(Comment::from_doc_comment).collect())
+impl Comments {
+    /// Parse natspec comments from raw doc comment lines.
+    ///
+    /// Each line should be the raw text content of a `///` or `/** */` doc comment
+    /// with the comment delimiters already stripped (as provided by solar's `DocComment::symbol`).
+    ///
+    /// Natspec tags start with `@` (e.g. `@notice`, `@dev`, `@param`).
+    /// Lines without a tag at the start are treated as continuations of the previous tag,
+    /// or as `@notice` if no previous tag exists.
+    pub fn from_doc_lines(lines: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let mut comments = Vec::new();
+        let mut current_tag: Option<String> = None;
+        let mut current_value = String::new();
+
+        let flush = |tag: &Option<String>, value: &str, out: &mut Vec<Comment>| {
+            let value = value.trim();
+            if value.is_empty() && tag.is_none() {
+                return;
+            }
+            let tag_str = tag.as_deref().unwrap_or("notice");
+            // Filter out `@solidity` tags and empty tags
+            if tag_str.trim() == "solidity" || tag_str.trim().is_empty() {
+                return;
+            }
+            if let Some(c) = Comment::from_tag_and_value(tag_str, value.to_string()) {
+                out.push(c);
+            }
+        };
+
+        for raw_line in lines {
+            let raw = raw_line.as_ref();
+            // For block comments, process each line individually
+            for line in raw.lines() {
+                let trimmed = line.trim().trim_start_matches('*').trim();
+
+                if let Some(rest) = trimmed.strip_prefix('@') {
+                    // Flush previous
+                    flush(&current_tag, &current_value, &mut comments);
+                    // Parse new tag
+                    let (tag, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    current_tag = Some(tag.to_string());
+                    current_value = value.trim().to_string();
+                } else if !trimmed.is_empty() {
+                    // Continuation of current tag
+                    if current_value.is_empty() {
+                        current_value = trimmed.to_string();
+                    } else {
+                        current_value.push('\n');
+                        current_value.push_str(trimmed);
+                    }
+                }
+            }
+        }
+
+        // Flush last
+        flush(&current_tag, &current_value, &mut comments);
+
+        Self(comments)
     }
 }
 
 /// The collection of references to natspec [Comment] items.
-#[derive(Debug, Default, PartialEq, Deref)]
+#[derive(Debug, Default, PartialEq, Eq, Deref)]
 pub struct CommentsRef<'a>(Vec<&'a Comment>);
 
 impl<'a> CommentsRef<'a> {
@@ -170,13 +218,13 @@ impl<'a> CommentsRef<'a> {
     /// Filter a collection of comments and return only those that match provided tags.
     pub fn include_tags(&self, tags: &[CommentTag]) -> Self {
         // Cloning only references here
-        CommentsRef(self.iter().cloned().filter(|c| tags.contains(&c.tag)).collect())
+        CommentsRef(self.iter().copied().filter(|c| tags.contains(&c.tag)).collect())
     }
 
     /// Filter a collection of comments and return only those that do not match provided tags.
     pub fn exclude_tags(&self, tags: &[CommentTag]) -> Self {
         // Cloning only references here
-        CommentsRef(self.iter().cloned().filter(|c| !tags.contains(&c.tag)).collect())
+        CommentsRef(self.iter().copied().filter(|c| !tags.contains(&c.tag)).collect())
     }
 
     /// Check if the collection contains a target comment.
@@ -184,8 +232,8 @@ impl<'a> CommentsRef<'a> {
         self.iter().any(|c| match (&c.tag, &target.tag) {
             (CommentTag::Inheritdoc, CommentTag::Inheritdoc) => c.value == target.value,
             (CommentTag::Param, CommentTag::Param) | (CommentTag::Return, CommentTag::Return) => {
-                c.split_first_word().map(|(name, _)| name) ==
-                    target.split_first_word().map(|(name, _)| name)
+                c.split_first_word().map(|(name, _)| name)
+                    == target.split_first_word().map(|(name, _)| name)
             }
             (tag1, tag2) => tag1 == tag2,
         })
@@ -200,7 +248,7 @@ impl<'a> CommentsRef<'a> {
 
     /// Filter a collection of comments and only return the custom tags.
     pub fn get_custom_tags(&self) -> Self {
-        CommentsRef(self.iter().cloned().filter(|c| c.is_custom()).collect())
+        CommentsRef(self.iter().copied().filter(|c| c.is_custom()).collect())
     }
 }
 

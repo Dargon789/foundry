@@ -1,14 +1,19 @@
 //! Support for polling based filters
 use crate::{
+    StorageInfo,
     eth::{backend::notifications::NewBlockNotifications, error::ToRpcResponseResult},
     pubsub::filter_logs,
-    StorageInfo,
 };
-use alloy_primitives::{map::HashMap, TxHash};
+use alloy_consensus::TxReceipt;
+use alloy_network::Network;
+use alloy_primitives::{TxHash, map::HashMap};
 use alloy_rpc_types::{Filter, FilteredParams, Log};
 use anvil_core::eth::subscription::SubscriptionId;
-use anvil_rpc::response::ResponseResult;
-use futures::{channel::mpsc::Receiver, Stream, StreamExt};
+use anvil_rpc::{
+    error::{ErrorCode, RpcError},
+    response::ResponseResult,
+};
+use futures::{Stream, StreamExt, channel::mpsc::Receiver};
 use std::{
     pin::Pin,
     sync::Arc,
@@ -18,23 +23,34 @@ use std::{
 use tokio::sync::Mutex;
 
 /// Type alias for filters identified by their id and their expiration timestamp
-type FilterMap = Arc<Mutex<HashMap<String, (EthFilter, Instant)>>>;
+type FilterMap<N> = Arc<Mutex<HashMap<String, (EthFilter<N>, Instant)>>>;
 
 /// timeout after which to remove an active filter if it wasn't polled since then
 pub const ACTIVE_FILTER_TIMEOUT_SECS: u64 = 60 * 5;
 
 /// Contains all registered filters
-#[derive(Clone, Debug)]
-pub struct Filters {
+pub struct Filters<N: Network> {
     /// all currently active filters
-    active_filters: FilterMap,
+    active_filters: FilterMap<N>,
     /// How long we keep a live the filter after the last poll
     keepalive: Duration,
 }
 
-impl Filters {
+impl<N: Network> Clone for Filters<N> {
+    fn clone(&self) -> Self {
+        Self { active_filters: self.active_filters.clone(), keepalive: self.keepalive }
+    }
+}
+
+impl<N: Network> std::fmt::Debug for Filters<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Filters").field("keepalive", &self.keepalive).finish_non_exhaustive()
+    }
+}
+
+impl<N: Network> Filters<N> {
     /// Adds a new `EthFilter` to the set
-    pub async fn add_filter(&self, filter: EthFilter) -> String {
+    pub async fn add_filter(&self, filter: EthFilter<N>) -> String {
         let id = new_id();
         trace!(target: "node::filter", "Adding new filter id {}", id);
         let mut filters = self.active_filters.lock().await;
@@ -42,39 +58,23 @@ impl Filters {
         id
     }
 
-    pub async fn get_filter_changes(&self, id: &str) -> ResponseResult {
-        {
-            let mut filters = self.active_filters.lock().await;
-            if let Some((filter, deadline)) = filters.get_mut(id) {
-                let resp = filter
-                    .next()
-                    .await
-                    .unwrap_or_else(|| ResponseResult::success(Vec::<()>::new()));
-                *deadline = self.next_deadline();
-                return resp
-            }
-        }
-        warn!(target: "node::filter", "No filter found for {}", id);
-        ResponseResult::success(Vec::<()>::new())
-    }
-
     /// Returns the original `Filter` of an `eth_newFilter`
     pub async fn get_log_filter(&self, id: &str) -> Option<Filter> {
         let filters = self.active_filters.lock().await;
-        if let Some((EthFilter::Logs(ref log), _)) = filters.get(id) {
-            return log.filter.filter.clone()
+        if let Some((EthFilter::Logs(log), _)) = filters.get(id) {
+            return log.filter.filter.clone();
         }
         None
     }
 
     /// Removes the filter identified with the `id`
-    pub async fn uninstall_filter(&self, id: &str) -> Option<EthFilter> {
+    pub async fn uninstall_filter(&self, id: &str) -> Option<EthFilter<N>> {
         trace!(target: "node::filter", "Uninstalling filter id {}", id);
         self.active_filters.lock().await.remove(id).map(|(f, _)| f)
     }
 
     /// The duration how long to keep alive stale filters
-    pub fn keep_alive(&self) -> Duration {
+    pub const fn keep_alive(&self) -> Duration {
         self.keepalive
     }
 
@@ -91,14 +91,39 @@ impl Filters {
         active_filters.retain(|id, (_, deadline)| {
             if now > *deadline {
                 trace!(target: "node::filter",?id, "Evicting stale filter");
-                return false
+                return false;
             }
             true
         });
     }
 }
 
-impl Default for Filters {
+impl<N: Network> Filters<N>
+where
+    N::ReceiptEnvelope: TxReceipt<Log = alloy_primitives::Log>,
+{
+    pub async fn get_filter_changes(&self, id: &str) -> ResponseResult {
+        {
+            let mut filters = self.active_filters.lock().await;
+            if let Some((filter, deadline)) = filters.get_mut(id) {
+                let resp = filter
+                    .next()
+                    .await
+                    .unwrap_or_else(|| ResponseResult::success(Vec::<()>::new()));
+                *deadline = self.next_deadline();
+                return resp;
+            }
+        }
+        warn!(target: "node::filter", "No filter found for {}", id);
+        ResponseResult::error(RpcError {
+            code: ErrorCode::ServerError(-32000),
+            message: "filter not found".into(),
+            data: None,
+        })
+    }
+}
+
+impl<N: Network> Default for Filters<N> {
     fn default() -> Self {
         Self {
             active_filters: Arc::new(Default::default()),
@@ -113,14 +138,26 @@ fn new_id() -> String {
 }
 
 /// Represents a poll based filter
-#[derive(Debug)]
-pub enum EthFilter {
-    Logs(Box<LogsFilter>),
+pub enum EthFilter<N: Network> {
+    Logs(Box<LogsFilter<N>>),
     Blocks(NewBlockNotifications),
     PendingTransactions(Receiver<TxHash>),
 }
 
-impl Stream for EthFilter {
+impl<N: Network> std::fmt::Debug for EthFilter<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Logs(_) => f.debug_tuple("Logs").finish(),
+            Self::Blocks(_) => f.debug_tuple("Blocks").finish(),
+            Self::PendingTransactions(_) => f.debug_tuple("PendingTransactions").finish(),
+        }
+    }
+}
+
+impl<N: Network> Stream for EthFilter<N>
+where
+    N::ReceiptEnvelope: TxReceipt<Log = alloy_primitives::Log>,
+{
     type Item = ResponseResult;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -146,21 +183,29 @@ impl Stream for EthFilter {
 }
 
 /// Listens for new blocks and matching logs emitted in that block
-#[derive(Debug)]
-pub struct LogsFilter {
+pub struct LogsFilter<N: Network> {
     /// listener for new blocks
     pub blocks: NewBlockNotifications,
     /// accessor for block storage
-    pub storage: StorageInfo,
+    pub storage: StorageInfo<N>,
     /// matcher with all provided filter params
     pub filter: FilteredParams,
     /// existing logs that matched the filter when the listener was installed
     ///
-    /// They'll be returned on the first pill
+    /// They'll be returned on the first poll
     pub historic: Option<Vec<Log>>,
 }
 
-impl LogsFilter {
+impl<N: Network> std::fmt::Debug for LogsFilter<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogsFilter").field("filter", &self.filter).finish_non_exhaustive()
+    }
+}
+
+impl<N: Network> LogsFilter<N>
+where
+    N::ReceiptEnvelope: TxReceipt<Log = alloy_primitives::Log>,
+{
     /// Returns all the logs since the last time this filter was polled
     pub fn poll(&mut self, cx: &mut Context<'_>) -> Vec<Log> {
         let mut logs = self.historic.take().unwrap_or_default();

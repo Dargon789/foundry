@@ -1,27 +1,39 @@
 //! various fork related test
 
 use crate::{
-    abi::{Greeter, ERC721},
+    abi::{ERC721, Greeter},
     utils::{http_provider, http_provider_with_signer},
 };
 use alloy_chains::NamedChain;
+use alloy_eips::{
+    eip7840::BlobParams,
+    eip7910::{EthConfig, SystemContract},
+};
 use alloy_network::{EthereumWallet, ReceiptResponse, TransactionBuilder, TransactionResponse};
-use alloy_primitives::{address, b256, bytes, uint, Address, Bytes, TxHash, TxKind, U256, U64};
+use alloy_primitives::{Address, Bytes, TxHash, TxKind, U64, U256, address, b256, bytes, uint};
 use alloy_provider::Provider;
 use alloy_rpc_types::{
+    AccountInfo, BlockId, BlockNumberOrTag,
     anvil::Forking,
     request::{TransactionInput, TransactionRequest},
     state::EvmOverrides,
-    BlockId, BlockNumberOrTag,
 };
 use alloy_serde::WithOtherFields;
 use alloy_signer_local::PrivateKeySigner;
-use anvil::{eth::EthApi, spawn, NodeConfig, NodeHandle};
+use anvil::{EthereumHardfork, NodeConfig, NodeHandle, PrecompileFactory, eth::EthApi, spawn};
 use foundry_common::provider::get_http_provider;
 use foundry_config::Config;
+use foundry_evm_networks::NetworkConfigs;
+use foundry_primitives::FoundryNetwork;
 use foundry_test_utils::rpc::{self, next_http_rpc_endpoint, next_rpc_endpoint};
 use futures::StreamExt;
-use std::{sync::Arc, thread::sleep, time::Duration};
+use revm::precompile::PrecompileStatus;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    thread::sleep,
+    time::Duration,
+};
 
 const BLOCK_NUMBER: u64 = 14_608_400u64;
 const DEAD_BALANCE_AT_BLOCK_NUMBER: u128 = 12_556_069_338_441_120_059_867u128;
@@ -31,9 +43,9 @@ const BLOCK_TIMESTAMP: u64 = 1_650_274_250u64;
 /// Represents an anvil fork of an anvil node
 #[expect(unused)]
 pub struct LocalFork {
-    origin_api: EthApi,
+    origin_api: EthApi<FoundryNetwork>,
     origin_handle: NodeHandle,
-    fork_api: EthApi,
+    fork_api: EthApi<FoundryNetwork>,
     fork_handle: NodeHandle,
 }
 
@@ -546,7 +558,7 @@ async fn can_reset_fork_to_new_fork() {
     let optimism = next_rpc_endpoint(NamedChain::Optimism);
 
     api.anvil_reset(Some(Forking {
-        json_rpc_url: Some(optimism.to_string()),
+        json_rpc_url: Some(optimism.clone()),
         block_number: Some(124659890),
     }))
     .await
@@ -820,7 +832,40 @@ async fn test_fork_init_base_fee() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reset_fork_on_new_blocks() {
+async fn test_fork_init_blob_base_fee_with_explicit_base_fee() {
+    let fork_rpc_url = rpc::next_http_archive_rpc_url();
+    let fork_block_number = 24_127_158u64;
+    let (default_api, _) = spawn(
+        NodeConfig::test()
+            .with_eth_rpc_url(Some(fork_rpc_url.clone()))
+            .with_fork_block_number(Some(fork_block_number)),
+    )
+    .await;
+    let explicit_base_fee = default_api
+        .block_by_number(BlockNumberOrTag::Latest)
+        .await
+        .unwrap()
+        .unwrap()
+        .header
+        .base_fee_per_gas
+        .unwrap();
+    let (explicit_api, _) = spawn(
+        NodeConfig::test()
+            .with_eth_rpc_url(Some(fork_rpc_url))
+            .with_fork_block_number(Some(fork_block_number))
+            .with_base_fee(Some(explicit_base_fee)),
+    )
+    .await;
+
+    let default_blob_base_fee = default_api.blob_base_fee().unwrap();
+    let explicit_blob_base_fee = explicit_api.blob_base_fee().unwrap();
+
+    assert!(default_blob_base_fee > U256::from(1));
+    assert_eq!(explicit_blob_base_fee, default_blob_base_fee);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flaky_test_reset_fork_on_new_blocks() {
     let (api, handle) =
         spawn(NodeConfig::test().with_eth_rpc_url(Some(rpc::next_http_archive_rpc_url()))).await;
 
@@ -830,7 +875,9 @@ async fn test_reset_fork_on_new_blocks() {
 
     let current_block = anvil_provider.get_block_number().await.unwrap();
 
-    handle.task_manager().spawn_reset_on_new_polled_blocks(provider.clone(), api);
+    handle
+        .task_manager()
+        .spawn_reset_on_new_polled_blocks::<alloy_network::AnyNetwork, _>(provider.clone(), api);
 
     let mut stream = provider
         .watch_blocks()
@@ -1192,7 +1239,7 @@ async fn test_fork_reset_basefee() {
 
 // <https://github.com/foundry-rs/foundry/issues/6795>
 #[tokio::test(flavor = "multi_thread")]
-async fn test_arbitrum_fork_dev_balance() {
+async fn flaky_test_arbitrum_fork_dev_balance() {
     let (api, handle) = spawn(
         fork_config()
             .with_fork_block_number(None::<u64>)
@@ -1209,8 +1256,8 @@ async fn test_arbitrum_fork_dev_balance() {
 
 // <https://github.com/foundry-rs/foundry/issues/9152>
 #[tokio::test(flavor = "multi_thread")]
-async fn test_arb_fork_mining() {
-    let fork_block_number = 266137031u64;
+async fn flaky_test_arb_fork_mining() {
+    let fork_block_number = 394274860u64;
     let fork_rpc = next_rpc_endpoint(NamedChain::Arbitrum);
     let (api, _handle) = spawn(
         fork_config()
@@ -1230,7 +1277,7 @@ async fn test_arb_fork_mining() {
 
 // <https://github.com/foundry-rs/foundry/issues/6749>
 #[tokio::test(flavor = "multi_thread")]
-async fn test_arbitrum_fork_block_number() {
+async fn flaky_test_arbitrum_fork_block_number() {
     // fork to get initial block for test
     let (_, handle) = spawn(
         fork_config()
@@ -1402,6 +1449,31 @@ async fn test_immutable_fork_transaction_hash() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_block_by_number_full_refetches_missing_cached_transactions() {
+    let (api, _) = spawn(fork_config()).await;
+
+    let block =
+        api.block_by_number_full(BlockNumberOrTag::Number(BLOCK_NUMBER)).await.unwrap().unwrap();
+    let block_txs = block.transactions.as_transactions().unwrap();
+    let original_len = block_txs.len();
+    let missing_hash = *block_txs[0].tx_hash();
+
+    let fork = api.backend.get_fork().unwrap();
+    {
+        let mut storage = fork.storage.write();
+        assert!(storage.transactions.remove(&missing_hash).is_some());
+    }
+
+    let refreshed =
+        api.block_by_number_full(BlockNumberOrTag::Number(BLOCK_NUMBER)).await.unwrap().unwrap();
+    let refreshed_txs = refreshed.transactions.as_transactions().unwrap();
+
+    assert_eq!(refreshed_txs.len(), original_len);
+    assert_eq!(refreshed_txs[0].tx_hash(), &missing_hash);
+    assert!(fork.storage.read().transactions.contains_key(&missing_hash));
+}
+
 // <https://github.com/foundry-rs/foundry/issues/4700>
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fork_query_at_fork_block() {
@@ -1491,6 +1563,31 @@ async fn test_set_erc20_balance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_set_erc20_allowance() {
+    let config: NodeConfig = fork_config();
+    let owner = config.genesis_accounts[0].address();
+    let spender = config.genesis_accounts[1].address();
+    let (api, handle) = spawn(config).await;
+
+    let provider = handle.http_provider();
+
+    alloy_sol_types::sol! {
+       #[sol(rpc)]
+       contract ERC20 {
+            function allowance(address owner, address spender) external view returns (uint256);
+       }
+    }
+    let dai = address!("0x6B175474E89094C44Da98b954EedeAC495271d0F");
+    let erc20 = ERC20::new(dai, provider);
+    let value = U256::from(500);
+
+    api.anvil_set_erc20_allowance(owner, spender, dai, value).await.unwrap();
+
+    let allowance = erc20.allowance(owner, spender).call().await.unwrap();
+    assert_eq!(allowance, value);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_add_balance() {
     let config: NodeConfig = fork_config();
     let address = config.genesis_accounts[0].address();
@@ -1515,7 +1612,7 @@ async fn test_reset_updates_cache_path_when_rpc_url_not_provided() {
     let number = info.fork_config.fork_block_number.unwrap();
     assert_eq!(number, BLOCK_NUMBER);
 
-    async fn get_block_from_cache_path(api: &mut EthApi) -> u64 {
+    async fn get_block_from_cache_path(api: &mut EthApi<FoundryNetwork>) -> u64 {
         let db = api.backend.get_db().read().await;
         let cache_path = db.maybe_inner().unwrap().cache().cache_path().unwrap();
         cache_path
@@ -1572,13 +1669,404 @@ async fn test_fork_get_account() {
 
     assert_eq!(
         alice_acc.balance,
-        alice_bal -
-            (U256::from(142) +
-                U256::from(receipt.gas_used as u128 * receipt.effective_gas_price)),
+        alice_bal
+            - (U256::from(142)
+                + U256::from(receipt.gas_used as u128 * receipt.effective_gas_price)),
     );
     assert_eq!(alice_acc.nonce, alice_nonce + 1);
 
     let alice_acc_prev_block = provider.get_account(alice).number(init_block).await.unwrap();
 
     assert_eq!(alice_acc_init, alice_acc_prev_block);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fork_get_account_info() {
+    let (api, handle) = spawn(fork_config()).await;
+    let provider = handle.http_provider();
+
+    let info = provider
+        .get_account_info(address!("0x19e53a7397bE5AA7908fE9eA991B03710bdC74Fd"))
+        // predates fork
+        .number(BLOCK_NUMBER - 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        info,
+        AccountInfo {
+            balance: U256::from(14353753764795095694u64),
+            nonce: 6689,
+            code: Default::default(),
+        }
+    );
+
+    // Check account info at block number, see https://github.com/foundry-rs/foundry/issues/12072
+    let info = provider
+        .get_account_info(address!("0x19e53a7397bE5AA7908fE9eA991B03710bdC74Fd"))
+        // predates fork
+        .number(BLOCK_NUMBER)
+        .await
+        .unwrap();
+    assert_eq!(
+        info,
+        AccountInfo {
+            balance: U256::from(14352720829244098514u64),
+            nonce: 6690,
+            code: Default::default(),
+        }
+    );
+
+    // Mine and check account info at new block number, see https://github.com/foundry-rs/foundry/issues/12148
+    api.evm_mine(None).await.unwrap();
+    let info = provider
+        .get_account_info(address!("0x19e53a7397bE5AA7908fE9eA991B03710bdC74Fd"))
+        // predates fork
+        .number(BLOCK_NUMBER + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        info,
+        AccountInfo {
+            balance: U256::from(14352720829244098514u64),
+            nonce: 6690,
+            code: Default::default(),
+        }
+    );
+}
+
+fn assert_hardfork_config(
+    config: &EthConfig,
+    expected_blob_params: &BlobParams,
+    expected_precompiles: &[Address],
+    expected_system_contracts: &BTreeMap<SystemContract, Address>,
+) {
+    assert!(config.next.is_none());
+    assert!(config.last.is_none());
+
+    let current = &config.current;
+
+    assert_eq!(current.activation_time, 0);
+    assert_eq!(current.chain_id, 31337);
+    assert_eq!(current.fork_id, Bytes::from(vec![0, 0, 0, 0]));
+
+    assert_eq!(&current.blob_schedule, expected_blob_params);
+
+    assert_eq!(
+        current.precompiles.values().copied().collect::<BTreeSet<_>>(),
+        expected_precompiles.iter().copied().collect::<BTreeSet<_>>(),
+    );
+
+    assert_eq!(current.system_contracts, *expected_system_contracts);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_config_with_cancun_hardfork() {
+    let (api, _handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Cancun.into()))).await;
+
+    let config = api.config().unwrap();
+
+    let expected_blob_params = BlobParams {
+        target_blob_count: 3,
+        max_blob_count: 6,
+        update_fraction: 3338477,
+        min_blob_fee: 1,
+        max_blobs_per_tx: 6,
+        blob_base_cost: 0,
+    };
+
+    // <= Cancun precompiles
+    let expected_precompiles = [
+        address!("0000000000000000000000000000000000000001"),
+        address!("0000000000000000000000000000000000000002"),
+        address!("0000000000000000000000000000000000000003"),
+        address!("0000000000000000000000000000000000000004"),
+        address!("0000000000000000000000000000000000000005"),
+        address!("0000000000000000000000000000000000000006"),
+        address!("0000000000000000000000000000000000000007"),
+        address!("0000000000000000000000000000000000000008"),
+        address!("0000000000000000000000000000000000000009"),
+        address!("000000000000000000000000000000000000000a"),
+    ];
+
+    let expected_system_contracts = BTreeMap::from([(
+        SystemContract::BeaconRoots,
+        address!("000f3df6d732807ef1319fb7b8bb8522d0beac02"),
+    )]);
+
+    assert_hardfork_config(
+        &config,
+        &expected_blob_params,
+        &expected_precompiles,
+        &expected_system_contracts,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_config_with_prague_hardfork_with_celo() {
+    let (api, _handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .with_networks(NetworkConfigs::with_celo()),
+    )
+    .await;
+
+    let config = api.config().unwrap();
+
+    let expected_blob_params = BlobParams {
+        target_blob_count: 6,
+        max_blob_count: 9,
+        update_fraction: 5007716,
+        min_blob_fee: 1,
+        max_blobs_per_tx: 9,
+        blob_base_cost: 0,
+    };
+
+    // <= Prague + Celo precompiles
+    let expected_precompiles = [
+        address!("0000000000000000000000000000000000000001"),
+        address!("0000000000000000000000000000000000000002"),
+        address!("0000000000000000000000000000000000000003"),
+        address!("0000000000000000000000000000000000000004"),
+        address!("0000000000000000000000000000000000000005"),
+        address!("0000000000000000000000000000000000000006"),
+        address!("0000000000000000000000000000000000000007"),
+        address!("0000000000000000000000000000000000000008"),
+        address!("0000000000000000000000000000000000000009"),
+        address!("000000000000000000000000000000000000000a"),
+        address!("000000000000000000000000000000000000000b"),
+        address!("000000000000000000000000000000000000000c"),
+        address!("000000000000000000000000000000000000000d"),
+        address!("000000000000000000000000000000000000000e"),
+        address!("000000000000000000000000000000000000000f"),
+        address!("0000000000000000000000000000000000000010"),
+        address!("0000000000000000000000000000000000000011"),
+        address!("00000000000000000000000000000000000000fd"), // `celo transfer`
+    ];
+
+    let expected_system_contracts = BTreeMap::from([
+        (SystemContract::BeaconRoots, address!("000f3df6d732807ef1319fb7b8bb8522d0beac02")),
+        (
+            SystemContract::ConsolidationRequestPredeploy,
+            address!("0000bbddc7ce488642fb579f8b00f3a590007251"),
+        ),
+        (SystemContract::DepositContract, address!("00000000219ab540356cbb839cbe05303d7705fa")),
+        (SystemContract::HistoryStorage, address!("0000f90827f1c53a10cb7a02335b175320002935")),
+        (
+            SystemContract::WithdrawalRequestPredeploy,
+            address!("00000961ef480eb55e80d19ad83579a64c007002"),
+        ),
+    ]);
+
+    assert_hardfork_config(
+        &config,
+        &expected_blob_params,
+        &expected_precompiles,
+        &expected_system_contracts,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_config_with_osaka_hardfork() {
+    let (api, _handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Osaka.into()))).await;
+
+    let config = api.config().unwrap();
+
+    let expected_blob_params = BlobParams {
+        target_blob_count: 6,
+        max_blob_count: 9,
+        update_fraction: 5007716,
+        min_blob_fee: 1,
+        max_blobs_per_tx: 6,
+        blob_base_cost: 8192,
+    };
+
+    // <= Osaka precompiles
+    let expected_precompiles = [
+        address!("0000000000000000000000000000000000000001"),
+        address!("0000000000000000000000000000000000000002"),
+        address!("0000000000000000000000000000000000000003"),
+        address!("0000000000000000000000000000000000000004"),
+        address!("0000000000000000000000000000000000000005"),
+        address!("0000000000000000000000000000000000000006"),
+        address!("0000000000000000000000000000000000000007"),
+        address!("0000000000000000000000000000000000000008"),
+        address!("0000000000000000000000000000000000000009"),
+        address!("000000000000000000000000000000000000000a"),
+        address!("000000000000000000000000000000000000000b"),
+        address!("000000000000000000000000000000000000000c"),
+        address!("000000000000000000000000000000000000000d"),
+        address!("000000000000000000000000000000000000000e"),
+        address!("000000000000000000000000000000000000000f"),
+        address!("0000000000000000000000000000000000000010"),
+        address!("0000000000000000000000000000000000000011"),
+        address!("0000000000000000000000000000000000000100"),
+    ];
+
+    let expected_system_contracts = BTreeMap::from([
+        (SystemContract::BeaconRoots, address!("000f3df6d732807ef1319fb7b8bb8522d0beac02")),
+        (
+            SystemContract::ConsolidationRequestPredeploy,
+            address!("0000bbddc7ce488642fb579f8b00f3a590007251"),
+        ),
+        (SystemContract::DepositContract, address!("00000000219ab540356cbb839cbe05303d7705fa")),
+        (SystemContract::HistoryStorage, address!("0000f90827f1c53a10cb7a02335b175320002935")),
+        (
+            SystemContract::WithdrawalRequestPredeploy,
+            address!("00000961ef480eb55e80d19ad83579a64c007002"),
+        ),
+    ]);
+
+    assert_hardfork_config(
+        &config,
+        &expected_blob_params,
+        &expected_precompiles,
+        &expected_system_contracts,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_config_with_osaka_hardfork_with_precompile_factory() {
+    #[derive(Debug)]
+    struct CustomPrecompileFactory;
+
+    impl PrecompileFactory for CustomPrecompileFactory {
+        fn precompiles(&self) -> Vec<(Address, alloy_evm::precompiles::DynPrecompile)> {
+            vec![(
+                address!("0x0000000000000000000000000000000000000071"),
+                alloy_evm::precompiles::DynPrecompile::from(
+                    |input: alloy_evm::precompiles::PrecompileInput<'_>| {
+                        Ok(revm::precompile::PrecompileOutput {
+                            bytes: Bytes::copy_from_slice(input.data),
+                            gas_used: 0,
+                            gas_refunded: 0,
+                            status: PrecompileStatus::Success,
+                            state_gas_used: 0,
+                            reservoir: input.reservoir,
+                        })
+                    },
+                ),
+            )]
+        }
+    }
+
+    let (api, _handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Osaka.into()))
+            .with_precompile_factory(CustomPrecompileFactory),
+    )
+    .await;
+
+    let config = api.config().unwrap();
+
+    let expected_blob_params = BlobParams {
+        target_blob_count: 6,
+        max_blob_count: 9,
+        update_fraction: 5007716,
+        min_blob_fee: 1,
+        max_blobs_per_tx: 6,
+        blob_base_cost: 8192,
+    };
+
+    // <= Osaka precompiles + custom precompile
+    let expected_precompiles = [
+        address!("0000000000000000000000000000000000000001"),
+        address!("0000000000000000000000000000000000000002"),
+        address!("0000000000000000000000000000000000000003"),
+        address!("0000000000000000000000000000000000000004"),
+        address!("0000000000000000000000000000000000000005"),
+        address!("0000000000000000000000000000000000000006"),
+        address!("0000000000000000000000000000000000000007"),
+        address!("0000000000000000000000000000000000000008"),
+        address!("0000000000000000000000000000000000000009"),
+        address!("000000000000000000000000000000000000000a"),
+        address!("000000000000000000000000000000000000000b"),
+        address!("000000000000000000000000000000000000000c"),
+        address!("000000000000000000000000000000000000000d"),
+        address!("000000000000000000000000000000000000000e"),
+        address!("000000000000000000000000000000000000000f"),
+        address!("0000000000000000000000000000000000000010"),
+        address!("0000000000000000000000000000000000000011"),
+        address!("0000000000000000000000000000000000000071"), // `custom_echo`
+        address!("0000000000000000000000000000000000000100"),
+    ];
+    let expected_system_contracts = BTreeMap::from([
+        (SystemContract::BeaconRoots, address!("000f3df6d732807ef1319fb7b8bb8522d0beac02")),
+        (
+            SystemContract::ConsolidationRequestPredeploy,
+            address!("0000bbddc7ce488642fb579f8b00f3a590007251"),
+        ),
+        (SystemContract::DepositContract, address!("00000000219ab540356cbb839cbe05303d7705fa")),
+        (SystemContract::HistoryStorage, address!("0000f90827f1c53a10cb7a02335b175320002935")),
+        (
+            SystemContract::WithdrawalRequestPredeploy,
+            address!("00000961ef480eb55e80d19ad83579a64c007002"),
+        ),
+    ]);
+
+    assert_hardfork_config(
+        &config,
+        &expected_blob_params,
+        &expected_precompiles,
+        &expected_system_contracts,
+    );
+}
+
+// Regression tests: verify that `anvil_setRpcUrl` and `anvil_reset` keep
+// `ClientForkConfig.fork_urls` in sync so that subsequent resets don't
+// silently revert to stale URLs.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_anvil_set_rpc_url_syncs_fork_config() {
+    // Spawn an origin node and fork off it
+    let (_origin_api, origin_handle) = spawn(NodeConfig::test()).await;
+    let origin_url = origin_handle.http_endpoint();
+
+    let (api, _handle) = spawn(NodeConfig::test().with_eth_rpc_url(Some(origin_url.clone()))).await;
+
+    // Verify initial fork URL
+    let fork = api.backend.get_fork().unwrap();
+    assert_eq!(fork.config.read().fork_urls, vec![origin_url.clone()]);
+
+    // Spawn a second origin to use as the new URL
+    let (_origin2_api, origin2_handle) = spawn(NodeConfig::test()).await;
+    let new_url = origin2_handle.http_endpoint();
+
+    // Set RPC URL via the API
+    api.anvil_set_rpc_url(new_url.clone()).await.unwrap();
+
+    // Verify ClientForkConfig is updated
+    let fork = api.backend.get_fork().unwrap();
+    assert_eq!(
+        fork.config.read().fork_urls,
+        vec![new_url.clone()],
+        "ClientForkConfig.fork_urls should be updated after anvil_setRpcUrl"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_anvil_reset_with_url_updates_fork_urls() {
+    // Spawn an origin node and fork off it
+    let (_origin_api, origin_handle) = spawn(NodeConfig::test()).await;
+    let origin_url = origin_handle.http_endpoint();
+
+    let (api, _handle) = spawn(NodeConfig::test().with_eth_rpc_url(Some(origin_url.clone()))).await;
+
+    // Spawn a second origin
+    let (_origin2_api, origin2_handle) = spawn(NodeConfig::test()).await;
+    let new_url = origin2_handle.http_endpoint();
+
+    // Reset fork with a new URL
+    api.anvil_reset(Some(Forking { json_rpc_url: Some(new_url.clone()), block_number: None }))
+        .await
+        .unwrap();
+
+    // Verify the fork config uses the new URL, not the old one
+    let fork = api.backend.get_fork().unwrap();
+    assert_eq!(
+        fork.config.read().fork_urls,
+        vec![new_url.clone()],
+        "ClientForkConfig.fork_urls should reflect the new URL after anvil_reset"
+    );
 }

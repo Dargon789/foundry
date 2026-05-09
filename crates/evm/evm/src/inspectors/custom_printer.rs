@@ -2,18 +2,16 @@
 //! It is a great tool if some debugging is needed.
 
 use foundry_common::sh_println;
-use foundry_evm_core::backend::DatabaseError;
 use revm::{
+    Inspector,
     bytecode::opcode::OpCode,
     context::{ContextTr, JournalTr},
-    inspector::{inspectors::GasInspector, JournalExt},
+    inspector::inspectors::GasInspector,
     interpreter::{
-        interpreter::EthInterpreter,
-        interpreter_types::{Jumps, LoopControl, MemoryTr},
         CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
+        interpreter_types::{Jumps, MemoryTr},
     },
     primitives::{Address, U256},
-    Database, Inspector,
 };
 
 /// Custom print [Inspector], it has step level information of execution.
@@ -24,14 +22,9 @@ pub struct CustomPrintTracer {
     gas_inspector: GasInspector,
 }
 
-impl<CTX, D> Inspector<CTX, EthInterpreter> for CustomPrintTracer
-where
-    D: Database<Error = DatabaseError>,
-    CTX: ContextTr<Db = D>,
-    CTX::Journal: JournalExt,
-{
+impl<CTX: ContextTr> Inspector<CTX> for CustomPrintTracer {
     fn initialize_interp(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
-        self.gas_inspector.initialize_interp(&interp.control.gas);
+        self.gas_inspector.initialize_interp(&interp.gas);
     }
 
     // get opcode by calling `interp.contract.opcode(interp.program_counter())`.
@@ -52,17 +45,17 @@ where
             gas_remaining,
             name,
             opcode,
-            interp.control.gas.refunded(),
-            interp.control.gas.refunded(),
+            interp.gas.refunded(),
+            interp.gas.refunded(),
             interp.stack.data(),
             memory_size,
         );
 
-        self.gas_inspector.step(&interp.control.gas);
+        self.gas_inspector.step(&interp.gas);
     }
 
-    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
-        self.gas_inspector.step_end(interp.control.gas_mut());
+    fn step_end(&mut self, interpreter: &mut Interpreter, _context: &mut CTX) {
+        self.gas_inspector.step_end(&interpreter.gas);
     }
 
     fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
@@ -94,11 +87,11 @@ where
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let _ = sh_println!(
             "CREATE CALL: caller:{:?}, scheme:{:?}, value:{:?}, init_code:{:?}, gas:{:?}",
-            inputs.caller,
-            inputs.scheme,
-            inputs.value,
-            inputs.init_code,
-            inputs.gas_limit
+            inputs.caller(),
+            inputs.scheme(),
+            inputs.value(),
+            inputs.init_code(),
+            inputs.gas_limit()
         );
         None
     }

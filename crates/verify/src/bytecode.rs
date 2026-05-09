@@ -2,29 +2,36 @@
 use crate::{
     etherscan::EtherscanVerificationProvider,
     utils::{
-        check_and_encode_args, check_explorer_args, configure_env_block, maybe_predeploy_contract,
-        BytecodeType, JsonResult,
+        BytecodeType, JsonResult, check_and_encode_args, check_explorer_args, configure_env_block,
+        maybe_predeploy_contract,
     },
     verify::VerifierArgs,
 };
-use alloy_primitives::{hex, Address, Bytes, TxKind, U256};
+use alloy_consensus::BlockHeader;
+use alloy_evm::{FromRecoveredTx, rpc::TryIntoTxEnv};
+use alloy_primitives::{Address, Bytes, TxKind, U256, hex};
 use alloy_provider::{
-    network::{AnyTxEnvelope, TransactionBuilder},
     Provider,
+    ext::TraceApi,
+    network::{
+        AnyTxEnvelope, TransactionBuilder, TransactionResponse, primitives::BlockTransactions,
+    },
 };
-use alloy_rpc_types::{BlockId, BlockNumberOrTag, TransactionInput, TransactionRequest};
+use alloy_rpc_types::{
+    BlockId, BlockNumberOrTag, TransactionInput, TransactionRequest, TransactionTrait,
+    trace::parity::{Action, CreateAction, CreateOutput, TraceOutput},
+};
 use clap::{Parser, ValueHint};
 use eyre::{Context, OptionExt, Result};
 use foundry_cli::{
     opts::EtherscanOpts,
-    utils::{self, read_constructor_args_file, LoadConfig},
+    utils::{self, LoadConfig, read_constructor_args_file},
 };
-use foundry_common::shell;
+use foundry_common::{SYSTEM_TRANSACTION_TYPE, is_known_system_sender, shell};
 use foundry_compilers::{artifacts::EvmVersion, info::ContractInfo};
-use foundry_config::{figment, impl_figment_convert, Config};
-use foundry_evm::{constants::DEFAULT_CREATE2_DEPLOYER, utils::configure_tx_req_env};
-use foundry_evm_core::AsEnvMut;
-use revm::state::AccountInfo;
+use foundry_config::{Config, figment, impl_figment_convert};
+use foundry_evm::{constants::DEFAULT_CREATE2_DEPLOYER, executors::EvmError};
+use revm::{context::TxEnv, state::AccountInfo};
 use std::path::PathBuf;
 
 impl_figment_convert!(VerifyBytecodeArgs);
@@ -106,15 +113,11 @@ impl figment::Provider for VerifyBytecodeArgs {
             dict.insert("etherscan_api_key".into(), api_key.as_str().into());
         }
 
-        if let Some(api_version) = &self.verifier.verifier_api_version {
-            dict.insert("etherscan_api_version".into(), api_version.to_string().into());
-        }
-
         if let Some(block) = &self.block {
             dict.insert("block".into(), figment::value::Value::serialize(block)?);
         }
         if let Some(rpc_url) = &self.rpc_url {
-            dict.insert("eth_rpc_url".into(), rpc_url.to_string().into());
+            dict.insert("eth_rpc_url".into(), rpc_url.clone().into());
         }
 
         Ok(figment::value::Map::from([(Config::selected_profile(), dict)]))
@@ -172,7 +175,7 @@ impl VerifyBytecodeArgs {
         let source_code = etherscan.contract_source_code(self.address).await?;
 
         // Check if the contract name matches.
-        let name = source_code.items.first().map(|item| item.contract_name.to_owned());
+        let name = source_code.items.first().map(|item| item.contract_name.clone());
         if name.as_ref() != Some(&self.contract.name) {
             eyre::bail!("Contract name mismatch");
         }
@@ -181,14 +184,7 @@ impl VerifyBytecodeArgs {
         let etherscan_metadata = source_code.items.first().unwrap();
 
         // Obtain local artifact
-        let artifact = if let Ok(local_bytecode) =
-            crate::utils::build_using_cache(&self, etherscan_metadata, &config)
-        {
-            trace!("using cache");
-            local_bytecode
-        } else {
-            crate::utils::build_project(&self, &config)?
-        };
+        let artifact = crate::utils::build_project(&self, &config)?;
 
         // Get local bytecode (creation code)
         let local_bytecode = artifact
@@ -198,15 +194,15 @@ impl VerifyBytecodeArgs {
             .ok_or_eyre("Unlinked bytecode is not supported for verification")?;
 
         // Get and encode user provided constructor args
-        let provided_constructor_args = if let Some(path) = self.constructor_args_path.to_owned() {
+        let provided_constructor_args = if let Some(path) = self.constructor_args_path.clone() {
             // Read from file
             Some(read_constructor_args_file(path)?)
         } else {
-            self.constructor_args.to_owned()
+            self.constructor_args.clone()
         }
         .map(|args| check_and_encode_args(&artifact, args))
         .transpose()?
-        .or(self.encoded_constructor_args.to_owned().map(hex::decode).transpose()?);
+        .or(self.encoded_constructor_args.clone().map(hex::decode).transpose()?);
 
         let mut constructor_args = if let Some(provided) = provided_constructor_args {
             provided.into()
@@ -235,7 +231,7 @@ impl VerifyBytecodeArgs {
             // Deploy at genesis
             let gen_blk_num = 0_u64;
             let (mut fork_config, evm_opts) = config.clone().load_config_and_evm_opts()?;
-            let (mut env, mut executor) = crate::utils::get_tracing_executor(
+            let (mut evm_env, _, mut executor) = crate::utils::get_tracing_executor(
                 &mut fork_config,
                 gen_blk_num,
                 etherscan_metadata.evm_version()?.unwrap_or(EvmVersion::default()),
@@ -243,10 +239,10 @@ impl VerifyBytecodeArgs {
             )
             .await?;
 
-            env.evm_env.block_env.number = 0;
+            evm_env.block_env.number = U256::ZERO;
             let genesis_block = provider.get_block(gen_blk_num.into()).full().await?;
 
-            // Setup genesis tx and env.
+            // Setup genesis tx_env and evm_evm.
             let deployer = Address::with_last_byte(0x1);
             let mut gen_tx_req = TransactionRequest::default()
                 .with_from(deployer)
@@ -254,14 +250,14 @@ impl VerifyBytecodeArgs {
                 .into_create();
 
             if let Some(ref block) = genesis_block {
-                configure_env_block(&mut env.as_env_mut(), block);
-                gen_tx_req.max_fee_per_gas = block.header.base_fee_per_gas.map(|g| g as u128);
-                gen_tx_req.gas = Some(block.header.gas_limit);
-                gen_tx_req.gas_price = block.header.base_fee_per_gas.map(|g| g as u128);
+                configure_env_block(&mut evm_env, block, config.networks);
+                gen_tx_req.max_fee_per_gas = block.header.base_fee_per_gas().map(|g| g as u128);
+                gen_tx_req.gas = Some(block.header.gas_limit());
+                gen_tx_req.gas_price = block.header.base_fee_per_gas().map(|g| g as u128);
             }
 
-            configure_tx_req_env(&mut env.as_env_mut(), &gen_tx_req, None)
-                .wrap_err("Failed to configure tx request env")?;
+            let kind = gen_tx_req.kind();
+            let tx_env = gen_tx_req.try_into_tx_env(&evm_env)?;
 
             // Seed deployer account with funds
             let account_info = AccountInfo {
@@ -273,9 +269,10 @@ impl VerifyBytecodeArgs {
 
             let fork_address = crate::utils::deploy_contract(
                 &mut executor,
-                &env,
+                &evm_env,
+                &tx_env,
                 config.evm_spec_id(),
-                gen_tx_req.to,
+                kind,
             )?;
 
             // Compare runtime bytecode
@@ -322,6 +319,7 @@ impl VerifyBytecodeArgs {
             .ok_or_else(|| {
                 eyre::eyre!("Transaction not found for hash {}", creation_data.transaction_hash)
             })?;
+        let tx_hash = transaction.tx_hash();
         let receipt = provider
             .get_transaction_receipt(creation_data.transaction_hash)
             .await
@@ -335,29 +333,48 @@ impl VerifyBytecodeArgs {
             );
         };
 
+        let creation_block = transaction.block_number;
         let mut transaction: TransactionRequest = match transaction.inner.inner.inner() {
             AnyTxEnvelope::Ethereum(tx) => tx.clone().into(),
             AnyTxEnvelope::Unknown(_) => unreachable!("Unknown transaction type"),
         };
 
         // Extract creation code from creation tx input.
-        let maybe_creation_code =
-            if receipt.to.is_none() && receipt.contract_address == Some(self.address) {
-                match &transaction.input.input {
-                    Some(input) => &input[..],
-                    None => unreachable!("creation tx input is None"),
-                }
-            } else if receipt.to == Some(DEFAULT_CREATE2_DEPLOYER) {
-                match &transaction.input.input {
-                    Some(input) => &input[32..],
-                    None => unreachable!("creation tx input is None"),
-                }
-            } else {
-                eyre::bail!(
+        let maybe_creation_code = if receipt.to.is_none()
+            && receipt.contract_address == Some(self.address)
+        {
+            match &transaction.input.input {
+                Some(input) => &input[..],
+                None => unreachable!("creation tx input is None"),
+            }
+        } else if receipt.to == Some(DEFAULT_CREATE2_DEPLOYER) {
+            match &transaction.input.input {
+                Some(input) => &input[32..],
+                None => unreachable!("creation tx input is None"),
+            }
+        } else {
+            // Try to get creation bytecode from tx trace.
+            let traces = provider
+                .trace_transaction(creation_data.transaction_hash)
+                .await
+                .unwrap_or_default();
+
+            let creation_bytecode =
+                traces.iter().find_map(|trace| match (&trace.trace.result, &trace.trace.action) {
+                    (
+                        Some(TraceOutput::Create(CreateOutput { address, .. })),
+                        Action::Create(CreateAction { init, .. }),
+                    ) if *address == self.address => Some(init.clone()),
+                    _ => None,
+                });
+
+            &creation_bytecode.ok_or_else(|| {
+                eyre::eyre!(
                     "Could not extract the creation code for contract at address {}",
                     self.address
-                );
-            };
+                )
+            })?
+        };
 
         // In some cases, Etherscan will return incorrect constructor arguments. If this
         // happens, try extracting arguments ourselves.
@@ -422,13 +439,7 @@ impl VerifyBytecodeArgs {
                 Some(BlockId::Number(BlockNumberOrTag::Number(block))) => block,
                 Some(_) => eyre::bail!("Invalid block number"),
                 None => {
-                    let provider = utils::get_provider(&config)?;
-                    provider
-                    .get_transaction_by_hash(creation_data.transaction_hash)
-                    .await.or_else(|e| eyre::bail!("Couldn't fetch transaction from RPC: {:?}", e))?.ok_or_else(|| {
-                        eyre::eyre!("Transaction not found for hash {}", creation_data.transaction_hash)
-                    })?
-                    .block_number.ok_or_else(|| {
+                    creation_block.ok_or_else(|| {
                         eyre::eyre!("Failed to get block number of the contract creation tx, specify using the --block flag")
                     })?
                 }
@@ -436,14 +447,14 @@ impl VerifyBytecodeArgs {
 
             // Fork the chain at `simulation_block`.
             let (mut fork_config, evm_opts) = config.clone().load_config_and_evm_opts()?;
-            let (mut env, mut executor) = crate::utils::get_tracing_executor(
+            let (mut evm_env, mut tx_env, mut executor) = crate::utils::get_tracing_executor(
                 &mut fork_config,
                 simulation_block - 1, // env.fork_block_number
                 etherscan_metadata.evm_version()?.unwrap_or(EvmVersion::default()),
                 evm_opts,
             )
             .await?;
-            env.evm_env.block_env.number = simulation_block;
+            evm_env.block_env.number = U256::from(simulation_block);
             let block = provider.get_block(simulation_block.into()).full().await?;
 
             // Workaround for the NonceTooHigh issue as we're not simulating prior txs of the same
@@ -459,7 +470,56 @@ impl VerifyBytecodeArgs {
             transaction.set_nonce(prev_block_nonce);
 
             if let Some(ref block) = block {
-                configure_env_block(&mut env.as_env_mut(), block)
+                configure_env_block(&mut evm_env, block, config.networks);
+
+                let BlockTransactions::Full(ref txs) = block.transactions else {
+                    return Err(eyre::eyre!("Could not get block txs"));
+                };
+
+                // Replay txes in block until the contract creation one.
+                for tx in txs {
+                    trace!("replay tx::: {}", tx.tx_hash());
+                    if is_known_system_sender(tx.from())
+                        || tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE)
+                    {
+                        continue;
+                    }
+                    if tx.tx_hash() == tx_hash {
+                        break;
+                    }
+
+                    if let Some(tx_envelope) = tx.as_envelope() {
+                        tx_env = TxEnv::from_recovered_tx(tx_envelope, tx.from());
+                    }
+
+                    if let TxKind::Call(_) = tx.inner.kind() {
+                        executor.transact_with_env(evm_env.clone(), tx_env.clone()).wrap_err_with(
+                            || {
+                                format!(
+                                    "Failed to execute transaction: {:?} in block {}",
+                                    tx.tx_hash(),
+                                    evm_env.block_env.number
+                                )
+                            },
+                        )?;
+                    } else if let Err(error) =
+                        executor.deploy_with_env(evm_env.clone(), tx_env.clone(), None)
+                    {
+                        match error {
+                            // Reverted transactions should be skipped
+                            EvmError::Execution(_) => (),
+                            error => {
+                                return Err(error).wrap_err_with(|| {
+                                    format!(
+                                        "Failed to deploy transaction: {:?} in block {}",
+                                        tx.tx_hash(),
+                                        evm_env.block_env.number
+                                    )
+                                });
+                            }
+                        }
+                    }
+                }
             }
 
             // Replace the `input` with local creation code in the creation tx.
@@ -476,15 +536,15 @@ impl VerifyBytecodeArgs {
                 transaction.input = TransactionInput::both(Bytes::from(local_bytecode_vec));
             }
 
-            // configure_req__env(&mut env, &transaction.inner);
-            configure_tx_req_env(&mut env.as_env_mut(), &transaction, None)
-                .wrap_err("Failed to configure tx request env")?;
+            let kind = transaction.kind();
+            tx_env = transaction.try_into_tx_env(&evm_env)?;
 
             let fork_address = crate::utils::deploy_contract(
                 &mut executor,
-                &env,
+                &evm_env,
+                &tx_env,
                 config.evm_spec_id(),
-                transaction.to,
+                kind,
             )?;
 
             // State committed using deploy_with_env, now get the runtime bytecode from the db.

@@ -1,5 +1,6 @@
 use super::UIfmt;
 use alloy_primitives::{Address, Bytes, FixedBytes, I256, U256};
+use comfy_table::{Table, TableComponent, presets::UTF8_FULL};
 use std::fmt::{self, Write};
 
 /// A piece is a portion of the format string which represents the next part to emit.
@@ -184,10 +185,10 @@ impl ConsoleFmt for String {
         match spec {
             FormatSpec::String => self.clone(),
             FormatSpec::Object => format!("'{}'", self.clone()),
-            FormatSpec::Number |
-            FormatSpec::Integer |
-            FormatSpec::Exponential(_) |
-            FormatSpec::Hexadecimal => Self::from("NaN"),
+            FormatSpec::Number
+            | FormatSpec::Integer
+            | FormatSpec::Exponential(_)
+            | FormatSpec::Hexadecimal => Self::from("NaN"),
         }
     }
 }
@@ -222,10 +223,10 @@ impl ConsoleFmt for U256 {
                 let integer = amount / exp10;
                 let decimal = (amount % exp10).to_string();
                 let decimal = format!("{decimal:0>log$}").trim_end_matches('0').to_string();
-                if !decimal.is_empty() {
-                    format!("{integer}.{decimal}e{log}")
-                } else {
+                if decimal.is_empty() {
                     format!("{integer}e{log}")
+                } else {
+                    format!("{integer}.{decimal}e{log}")
                 }
             }
             FormatSpec::Exponential(Some(precision)) => {
@@ -234,10 +235,10 @@ impl ConsoleFmt for U256 {
                 let integer = amount / exp10;
                 let decimal = (amount % exp10).to_string();
                 let decimal = format!("{decimal:0>precision$}").trim_end_matches('0').to_string();
-                if !decimal.is_empty() {
-                    format!("{integer}.{decimal}")
-                } else {
+                if decimal.is_empty() {
                     format!("{integer}")
+                } else {
+                    format!("{integer}.{decimal}")
                 }
             }
         }
@@ -266,10 +267,10 @@ impl ConsoleFmt for I256 {
                 let integer = (amount / exp10).twos_complement();
                 let decimal = (amount % exp10).twos_complement().to_string();
                 let decimal = format!("{decimal:0>log$}").trim_end_matches('0').to_string();
-                if !decimal.is_empty() {
-                    format!("{sign}{integer}.{decimal}e{log}")
-                } else {
+                if decimal.is_empty() {
                     format!("{sign}{integer}e{log}")
+                } else {
+                    format!("{sign}{integer}.{decimal}e{log}")
                 }
             }
             FormatSpec::Exponential(Some(precision)) => {
@@ -279,10 +280,10 @@ impl ConsoleFmt for I256 {
                 let integer = (amount / exp10).twos_complement();
                 let decimal = (amount % exp10).twos_complement().to_string();
                 let decimal = format!("{decimal:0>precision$}").trim_end_matches('0').to_string();
-                if !decimal.is_empty() {
-                    format!("{sign}{integer}.{decimal}")
-                } else {
+                if decimal.is_empty() {
                     format!("{sign}{integer}")
+                } else {
+                    format!("{sign}{integer}.{decimal}")
                 }
             }
         }
@@ -407,10 +408,40 @@ fn format_spec<'a>(
     }
 }
 
+pub fn console_table_format(
+    keys: Option<&[&dyn ConsoleFmt]>,
+    values: &[&dyn ConsoleFmt],
+) -> String {
+    let keys_strings: Vec<String> = match keys {
+        Some(keys) => keys.iter().map(|k| k.fmt(FormatSpec::String)).collect(),
+        None => (0..values.len()).map(|i| i.to_string()).collect(),
+    };
+    let values_strings: Vec<String> = values.iter().map(|v| v.fmt(FormatSpec::String)).collect();
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_style(TableComponent::VerticalLines, '│');
+    table.set_style(TableComponent::HeaderLines, '─');
+    table.set_style(TableComponent::MiddleHeaderIntersections, '┼');
+    table.set_style(TableComponent::LeftHeaderIntersection, '├');
+    table.set_style(TableComponent::RightHeaderIntersection, '┤');
+    table.set_header(vec!["(index)", "Values"]);
+    table.remove_style(TableComponent::HorizontalLines);
+    table.remove_style(TableComponent::MiddleIntersections);
+    table.remove_style(TableComponent::LeftBorderIntersections);
+    table.remove_style(TableComponent::RightBorderIntersections);
+    for i in 0..keys_strings.len().max(values_strings.len()) {
+        let key = keys_strings.get(i).map(String::as_str).unwrap_or("");
+        let value = values_strings.get(i).map(String::as_str).unwrap_or("");
+        table.add_row(vec![key, value]);
+    }
+    table.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, B256};
+    use alloy_primitives::{B256, address};
     use foundry_macros::ConsoleFmt;
     use std::str::FromStr;
 
@@ -609,5 +640,81 @@ mod tests {
         assert_eq!(log1.fmt(Default::default()), "foo 42 bar");
         let call = Logs::Log1(log1);
         assert_eq!(call.fmt(Default::default()), "foo 42 bar");
+    }
+
+    #[test]
+    fn test_console_table_format() {
+        // auto-indexed, uint256 values
+        let values: &[&dyn ConsoleFmt] = &[&U256::from(100), &U256::from(200), &U256::from(300)];
+        assert_eq!(
+            console_table_format(None, values),
+            "┌─────────┬────────┐\n\
+             │ (index) │ Values │\n\
+             ├─────────┼────────┤\n\
+             │ 0       │ 100    │\n\
+             │ 1       │ 200    │\n\
+             │ 2       │ 300    │\n\
+             └─────────┴────────┘"
+        );
+
+        // string keys, uint256 values
+        // key col expands to fit "charlie123" and value col expands to fit "20000000000000000"
+        let keys: &[&dyn ConsoleFmt] =
+            &[&String::from("alice"), &String::from("bob"), &String::from("charlie123")];
+        let values: &[&dyn ConsoleFmt] = &[
+            &U256::from(1),
+            &U256::from_str("20000000000000000").unwrap(),
+            &U256::from_str("30000000000").unwrap(),
+        ];
+        assert_eq!(
+            console_table_format(Some(keys), values),
+            "┌────────────┬───────────────────┐\n\
+             │ (index)    │ Values            │\n\
+             ├────────────┼───────────────────┤\n\
+             │ alice      │ 1                 │\n\
+             │ bob        │ 20000000000000000 │\n\
+             │ charlie123 │ 30000000000       │\n\
+             └────────────┴───────────────────┘"
+        );
+
+        // empty table
+        assert_eq!(
+            console_table_format(None, &[]),
+            "┌─────────┬────────┐\n\
+             │ (index) │ Values │\n\
+             ├─────────┼────────┤\n\
+             └─────────┴────────┘"
+        );
+
+        // more keys than values
+        let keys: &[&dyn ConsoleFmt] =
+            &[&String::from("alice"), &String::from("bob"), &String::from("charlie")];
+        let values: &[&dyn ConsoleFmt] = &[&U256::from(1), &U256::from(2)];
+        assert_eq!(
+            console_table_format(Some(keys), values),
+            "┌─────────┬────────┐\n\
+             │ (index) │ Values │\n\
+             ├─────────┼────────┤\n\
+             │ alice   │ 1      │\n\
+             │ bob     │ 2      │\n\
+             │ charlie │        │\n\
+             └─────────┴────────┘"
+        );
+
+        // more values than keys
+        let keys: &[&dyn ConsoleFmt] = &[&String::from("alice"), &String::from("bob")];
+        let values: &[&dyn ConsoleFmt] =
+            &[&U256::from(1), &U256::from(2), &U256::from(3), &U256::from(4)];
+        assert_eq!(
+            console_table_format(Some(keys), values),
+            "┌─────────┬────────┐\n\
+             │ (index) │ Values │\n\
+             ├─────────┼────────┤\n\
+             │ alice   │ 1      │\n\
+             │ bob     │ 2      │\n\
+             │         │ 3      │\n\
+             │         │ 4      │\n\
+             └─────────┴────────┘"
+        );
     }
 }

@@ -1,34 +1,37 @@
+use std::collections::HashMap;
+
 use crate::{
     abi::{Multicall, SimpleStorage},
     fork::fork_config,
     utils::http_provider_with_signer,
 };
 use alloy_eips::BlockId;
-use alloy_hardforks::EthereumHardfork;
 use alloy_network::{EthereumWallet, TransactionBuilder};
 use alloy_primitives::{
-    hex::{self, FromHex},
     Address, Bytes, U256,
+    hex::{self, FromHex},
 };
 use alloy_provider::{
-    ext::{DebugApi, TraceApi},
     Provider,
+    ext::{DebugApi, TraceApi},
 };
 use alloy_rpc_types::{
+    BlockNumberOrTag, TransactionRequest,
     state::StateOverride,
     trace::{
         filter::{TraceFilter, TraceFilterMode},
         geth::{
-            CallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
-            GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
+            AccountState, CallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
+            GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, PreStateConfig,
+            PreStateFrame,
         },
-        parity::{Action, LocalizedTransactionTrace},
+        parity::{Action, ChangedType, LocalizedTransactionTrace, TraceType},
     },
-    TransactionRequest,
 };
 use alloy_serde::WithOtherFields;
 use alloy_sol_types::sol;
-use anvil::{spawn, NodeConfig};
+use anvil::{NodeConfig, spawn};
+use foundry_evm::hardfork::EthereumHardfork;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_transfer_parity_traces() {
@@ -799,11 +802,11 @@ async fn test_trace_filter() {
     for i in 0..=5 {
         let tx = TransactionRequest::default().to(to).value(U256::from(i)).from(from);
         let tx = WithOtherFields::new(tx);
-        api.send_transaction(tx).await.unwrap();
+        provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
     }
 
     let traces = api.trace_filter(tracer).await.unwrap();
-    assert_eq!(traces.len(), 5);
+    assert_eq!(traces.len(), 6);
 
     // Test filtering by address
     let tracer = TraceFilter {
@@ -927,4 +930,508 @@ async fn test_trace_filter() {
 
     let traces = api.trace_filter(tracer).await.unwrap();
     assert_eq!(traces.len(), 5);
+}
+
+#[cfg(feature = "js-tracer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_call_tracer_debug_trace_call_js_tracer() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let deployer: EthereumWallet = wallets[0].clone().into();
+    let provider = http_provider_with_signer(&handle.http_endpoint(), deployer);
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata);
+
+    let js_tracer_code = r#"
+{
+data: [],
+step: function(log) {
+    var op = log.op.toString();
+    if (op === "SLOAD") {
+    this.data.push(log.getPC() + ": SLOAD " + log.contract.getAddress() + ":" + log.stack.peek(0));
+    this.data.push("    Result: " + log.stack.peek(0));
+    } else if (op === "SSTORE") {
+    this.data.push(log.getPC() + ": SSTORE " + log.contract.getAddress() + ":" + log.stack.peek(1) + " <- " + log.stack.peek(0));
+    }
+},
+result: function() {
+    return this.data;
+},
+fault: function(log) {}
+}
+"#;
+
+    let result = api
+        .debug_trace_call(
+            WithOtherFields::new(internal_call_tx),
+            Some(BlockId::latest()),
+            GethDebugTracingCallOptions::default()
+                .with_tracing_options(GethDebugTracingOptions::js_tracer(js_tracer_code)),
+        )
+        .await
+        .unwrap();
+
+    let expected = vec![
+        "547: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "1907: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "772: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "835: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:44498830125527143464827115118378702402016761369235290884359940707316142178310 <- 1",
+        "919: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0 <- 80084422859880547211683076133703299733277748156566366325829078699459944778998",
+        "712: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "765: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:546584486846459126461364135121053344201067465379 <- 0",
+    ];
+
+    let actual: Vec<String> = result
+        .try_into_json_value()
+        .ok()
+        .and_then(|val| val.as_array().cloned())
+        .map(|arr| arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "js-tracer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_transaction_js_tracer() {
+    let node_config = NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()));
+    let (api, handle) = spawn(node_config).await;
+    let provider = crate::utils::http_provider(&handle.http_endpoint());
+
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let from = wallets[0].address();
+    api.anvil_add_balance(from, U256::MAX).await.unwrap();
+    api.anvil_add_balance(wallets[1].address(), U256::MAX).await.unwrap();
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata)
+        .with_gas_limit(1_000_000)
+        .with_max_fee_per_gas(100_000_000_000)
+        .with_max_priority_fee_per_gas(100_000_000_000);
+
+    let receipt = provider
+        .send_transaction(internal_call_tx.into())
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let js_tracer_code = r#"
+{
+data: [],
+step: function(log) {
+    var op = log.op.toString();
+    var pc = log.getPC();
+    var addr = log.contract.getAddress();
+
+    if (op === "SLOAD") {
+        this.data.push(pc + ": SLOAD " + addr + ":" + log.stack.peek(0));
+        this.data.push("    Result: " + log.stack.peek(0));
+    } else if (op === "SSTORE") {
+        this.data.push(pc + ": SSTORE " + addr + ":" + log.stack.peek(1) + " <- " + log.stack.peek(0));
+    } 
+},
+result: function() {
+    return this.data;
+},
+fault: function(log) {}
+}
+"#;
+
+    let expected = vec![
+        "547: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "1907: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "772: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "835: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:44498830125527143464827115118378702402016761369235290884359940707316142178310 <- 1",
+        "919: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0 <- 80084422859880547211683076133703299733277748156566366325829078699459944778998",
+        "712: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "765: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:546584486846459126461364135121053344201067465379 <- 0",
+    ];
+    let result = api
+        .debug_trace_transaction(
+            receipt.transaction_hash,
+            GethDebugTracingOptions::js_tracer(js_tracer_code),
+        )
+        .await
+        .unwrap();
+
+    let actual: Vec<String> = result
+        .try_into_json_value()
+        .ok()
+        .and_then(|val| val.as_array().cloned())
+        .map(|arr| arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_call_tracer_debug_trace_call_pre_state_tracer() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let deployer: EthereumWallet = wallets[0].clone().into();
+    let provider = http_provider_with_signer(&handle.http_endpoint(), deployer);
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata);
+
+    let result = api
+        .debug_trace_call(
+            WithOtherFields::new(internal_call_tx),
+            Some(BlockId::latest()),
+            GethDebugTracingCallOptions::default().with_tracing_options(
+                GethDebugTracingOptions::prestate_tracer(PreStateConfig::default()),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let expected = r#"
+{
+  "0x0000000000000000000000000000000000000000": {
+    "balance": "0x12670f"
+  },
+  "0x5fbdb2315678afecb367f032d93f642f64180aa3": {
+    "balance": "0x0",
+    "nonce": 1
+  },
+  "0x70997970c51812dc3a010c7d01b50e0d17dc79c8": {
+    "balance": "0x56bc75e2d63100000"
+  },
+  "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512": {
+    "balance": "0x0",
+    "nonce": 1,
+    "storage": {
+      "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "0x0000000000000000000000000000000000000000000000000000000000000001": "0x696e69742076616c756500000000000000000000000000000000000000000014",
+      "0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}
+    "#;
+    let expected: HashMap<Address, AccountState> = serde_json::from_str(expected).unwrap();
+
+    match result {
+        GethTrace::PreStateTracer(PreStateFrame::Default(pre_state_mode)) => {
+            for (addr, acc) in pre_state_mode.0 {
+                let expected_acc = expected.get(&addr).unwrap();
+                assert_eq!(acc.balance, expected_acc.balance);
+                assert_eq!(acc.nonce, expected_acc.nonce);
+                let expected_storage = &expected_acc.storage;
+                for (slot, value) in acc.storage {
+                    assert_eq!(value, *expected_storage.get(&slot).unwrap())
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_transaction_pre_state_tracer() {
+    let node_config = NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()));
+    let (api, handle) = spawn(node_config).await;
+    let provider = crate::utils::http_provider(&handle.http_endpoint());
+
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let from = wallets[0].address();
+    api.anvil_add_balance(from, U256::MAX).await.unwrap();
+    api.anvil_add_balance(wallets[1].address(), U256::MAX).await.unwrap();
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata)
+        .with_gas_limit(1_000_000)
+        .with_max_fee_per_gas(100_000_000_000)
+        .with_max_priority_fee_per_gas(100_000_000_000);
+
+    let receipt = provider
+        .send_transaction(internal_call_tx.into())
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+    let result = api
+        .debug_trace_transaction(
+            receipt.transaction_hash,
+            GethDebugTracingOptions::prestate_tracer(PreStateConfig::default()),
+        )
+        .await
+        .unwrap();
+
+    let expected = r#"
+{
+  "0x0000000000000000000000000000000000000000": {
+    "balance": "1206031000000000"
+  },
+  "0x5fbdb2315678afecb367f032d93f642f64180aa3": {
+    "balance": "0x0",
+    "nonce": 1
+  },
+  "0x70997970c51812dc3a010c7d01b50e0d17dc79c8": {
+    "balance": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512": {
+    "balance": "0x0",
+    "nonce": 1,
+    "storage": {
+      "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "0x0000000000000000000000000000000000000000000000000000000000000001": "0x696e69742076616c756500000000000000000000000000000000000000000014",
+      "0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}
+    "#;
+    let expected: HashMap<Address, AccountState> = serde_json::from_str(expected).unwrap();
+
+    match result {
+        GethTrace::PreStateTracer(PreStateFrame::Default(pre_state_mode)) => {
+            for (addr, acc) in pre_state_mode.0 {
+                let expected_acc = expected.get(&addr).unwrap();
+                assert_eq!(acc.balance, expected_acc.balance);
+                assert_eq!(acc.nonce, expected_acc.nonce);
+                let expected_storage = &expected_acc.storage;
+                for (slot, value) in acc.storage {
+                    assert_eq!(value, *expected_storage.get(&slot).unwrap())
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_trace_replay_block_transactions_local() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    api.anvil_set_auto_mine(false).await.unwrap();
+
+    let accounts = handle.dev_wallets().collect::<Vec<_>>();
+    let from = accounts[0].address();
+    let to = accounts[1].address();
+    let amount = U256::from(1000000u64);
+
+    // Send first transaction
+    let tx1 = TransactionRequest::default().to(to).value(amount).from(from);
+    let tx1 = WithOtherFields::new(tx1);
+    let pending_tx1 = provider.send_transaction(tx1).await.unwrap();
+
+    // Send second transaction with different value
+    let tx2 = TransactionRequest::default().to(to).value(amount).from(from);
+    let tx2 = WithOtherFields::new(tx2);
+    let pending_tx2 = provider.send_transaction(tx2).await.unwrap();
+
+    api.mine_one().await;
+    let receipt1 = pending_tx1.get_receipt().await.unwrap();
+    let receipt2 = pending_tx2.get_receipt().await.unwrap();
+
+    let block_number = receipt2.block_number.unwrap();
+
+    // Replay the block transactions with call trace type
+    // Pass block number as hex string as per Ethereum RPC spec
+    let results = api
+        .trace_replay_block_transactions(
+            block_number.into(),
+            vec![TraceType::Trace, TraceType::VmTrace, TraceType::StateDiff].into_iter().collect(),
+        )
+        .await
+        .unwrap();
+
+    // Verify we have traces for both transactions
+    assert_eq!(results.len(), 2, "Should have traces for 2 transactions");
+
+    // Verify first transaction hash matches
+    assert_eq!(results[0].transaction_hash, receipt1.transaction_hash);
+
+    // Verify second transaction hash matches
+    assert_eq!(results[1].transaction_hash, receipt2.transaction_hash);
+
+    // Verify trace types are present and accurate
+    for result in results {
+        let full_trace = &result.full_trace;
+
+        // Verify Trace (call trace) is present and accurate
+        assert!(!full_trace.trace.is_empty(), "Trace should not be empty");
+        let first_trace = &full_trace.trace[0];
+        match &first_trace.action {
+            Action::Call(call) => {
+                assert_eq!(call.from, from, "Call from address should match");
+                assert_eq!(call.to, to, "Call to address should match");
+            }
+            _ => panic!("Expected Call action, got {:?}", first_trace.action),
+        }
+
+        // Verify VmTrace is present
+        assert!(full_trace.vm_trace.is_some(), "VmTrace should be present when requested");
+
+        // Verify StateDiff is present
+        assert!(full_trace.state_diff.is_some(), "StateDiff should be present when requested");
+        // Verify balance change is correct in state diff
+        let ChangedType::<U256> { from, to } =
+            full_trace.state_diff.as_ref().unwrap().get(&to).unwrap().balance.as_changed().unwrap();
+        assert_eq!(
+            to.checked_sub(*from).unwrap(),
+            amount,
+            "Incorrect balance change in state diff"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_block_by_number() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let accounts = handle.dev_wallets().collect::<Vec<_>>();
+    let from = accounts[0].address();
+    let to = accounts[1].address();
+    let amount = U256::from(1000);
+
+    let tx = TransactionRequest::default().to(to).value(amount).from(from);
+    let tx = WithOtherFields::new(tx);
+    let receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    let block_number = receipt.block_number.unwrap();
+
+    let traces = api
+        .backend
+        .debug_trace_block_by_number(
+            BlockNumberOrTag::Number(block_number),
+            GethDebugTracingOptions::default()
+                .with_tracer(GethDebugTracerType::from(GethDebugBuiltInTracerType::CallTracer)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(traces.len(), 1);
+
+    match &traces[0] {
+        alloy_rpc_types::trace::geth::TraceResult::Success { result, .. } => match result {
+            GethTrace::CallTracer(call_frame) => {
+                assert_eq!(call_frame.from, from);
+                assert_eq!(call_frame.to.unwrap(), to);
+                assert_eq!(call_frame.value, Some(amount));
+            }
+            _ => unreachable!("expected CallTracer"),
+        },
+        alloy_rpc_types::trace::geth::TraceResult::Error { error, .. } => {
+            panic!("trace failed: {error}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_block_by_hash() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let accounts = handle.dev_wallets().collect::<Vec<_>>();
+    let from = accounts[0].address();
+    let to = accounts[1].address();
+    let amount = U256::from(2000);
+
+    let tx = TransactionRequest::default().to(to).value(amount).from(from);
+    let tx = WithOtherFields::new(tx);
+    let receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    let block_hash = receipt.block_hash.unwrap();
+
+    let traces = api
+        .backend
+        .debug_trace_block_by_hash(
+            block_hash,
+            GethDebugTracingOptions::default()
+                .with_tracer(GethDebugTracerType::from(GethDebugBuiltInTracerType::CallTracer)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(traces.len(), 1);
+
+    match &traces[0] {
+        alloy_rpc_types::trace::geth::TraceResult::Success { result, .. } => match result {
+            GethTrace::CallTracer(call_frame) => {
+                assert_eq!(call_frame.from, from);
+                assert_eq!(call_frame.to.unwrap(), to);
+                assert_eq!(call_frame.value, Some(amount));
+            }
+            _ => unreachable!("expected CallTracer"),
+        },
+        alloy_rpc_types::trace::geth::TraceResult::Error { error, .. } => {
+            panic!("trace failed: {error}");
+        }
+    }
 }

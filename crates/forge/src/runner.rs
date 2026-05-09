@@ -1,49 +1,54 @@
 //! The Forge test runner.
 
 use crate::{
-    fuzz::{invariant::BasicTxDetails, BaseCounterExample},
-    multi_runner::{is_matching_test, TestContract, TestRunnerConfig},
-    progress::{start_fuzz_progress, TestsProgress},
-    result::{SuiteResult, TestResult, TestSetup},
     MultiContractRunner, TestFilter,
+    coverage::HitMaps,
+    fuzz::{BaseCounterExample, FuzzTestResult},
+    multi_runner::{TestContract, TestRunnerConfig},
+    progress::{TestsProgress, start_fuzz_progress},
+    result::{SuiteResult, TestResult, TestSetup},
 };
-use alloy_dyn_abi::DynSolValue;
+use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
 use alloy_json_abi::Function;
-use alloy_primitives::{address, map::HashMap, Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256, address, map::HashMap};
 use eyre::Result;
-use foundry_common::{contracts::ContractsByAddress, TestFunctionExt, TestFunctionKind};
+use foundry_common::{TestFunctionExt, TestFunctionKind, contracts::ContractsByAddress};
 use foundry_compilers::utils::canonicalized;
-use foundry_config::{Config, InvariantConfig};
+use foundry_config::{Config, FuzzCorpusConfig};
 use foundry_evm::{
     constants::CALLER,
+    core::evm::FoundryEvmNetwork,
     decode::RevertDecoder,
     executors::{
+        CallResult, EvmError, Executor, ITest, RawCallResult,
         fuzz::FuzzedExecutor,
         invariant::{
-            check_sequence, replay_error, replay_run, InvariantExecutor, InvariantFuzzError,
+            CheckSequenceOptions, InvariantExecutor, InvariantFuzzError, check_sequence,
+            replay_error, replay_run,
         },
-        CallResult, EvmError, Executor, ITest, RawCallResult,
     },
     fuzz::{
-        fixture_name,
-        invariant::{CallDetails, InvariantContract},
-        CounterExample, FuzzFixtures,
+        BasicTxDetails, CallDetails, CounterExample, FuzzFixtures, fixture_name,
+        invariant::{InvariantContract, InvariantSettings},
+        strategies::EvmFuzzState,
     },
-    traces::{load_contracts, TraceKind, TraceMode},
+    revm::primitives::hardfork::SpecId,
+    traces::{TraceKind, TraceMode, load_contracts},
 };
-use proptest::test_runner::{
-    FailurePersistence, FileFailurePersistence, RngAlgorithm, TestError, TestRng, TestRunner,
-};
+use itertools::Itertools;
+use proptest::test_runner::{RngAlgorithm, TestError, TestRng, TestRunner};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     cmp::min,
     collections::BTreeMap,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
+use tokio::signal;
 use tracing::Span;
 
 /// When running tests, we deploy all external libraries present in the project. To avoid additional
@@ -54,13 +59,13 @@ use tracing::Span;
 pub const LIBRARY_DEPLOYER: Address = address!("0x1F95D37F27EA0dEA9C252FC09D5A6eaA97647353");
 
 /// A type that executes all tests of a contract
-pub struct ContractRunner<'a> {
+pub struct ContractRunner<'a, FEN: FoundryEvmNetwork> {
     /// The name of the contract.
     name: &'a str,
     /// The data of the contract.
     contract: &'a TestContract,
     /// The EVM executor.
-    executor: Executor,
+    executor: Executor<FEN>,
     /// Overall test run progress.
     progress: Option<&'a TestsProgress>,
     /// The handle to the tokio runtime.
@@ -68,13 +73,13 @@ pub struct ContractRunner<'a> {
     /// The span of the contract.
     span: tracing::Span,
     /// The contract-level configuration.
-    tcfg: Cow<'a, TestRunnerConfig>,
+    tcfg: Cow<'a, TestRunnerConfig<FEN>>,
     /// The parent runner.
-    mcr: &'a MultiContractRunner,
+    mcr: &'a MultiContractRunner<FEN>,
 }
 
-impl<'a> std::ops::Deref for ContractRunner<'a> {
-    type Target = Cow<'a, TestRunnerConfig>;
+impl<'a, FEN: FoundryEvmNetwork> Deref for ContractRunner<'a, FEN> {
+    type Target = Cow<'a, TestRunnerConfig<FEN>>;
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
@@ -82,15 +87,15 @@ impl<'a> std::ops::Deref for ContractRunner<'a> {
     }
 }
 
-impl<'a> ContractRunner<'a> {
-    pub fn new(
+impl<'a, FEN: FoundryEvmNetwork> ContractRunner<'a, FEN> {
+    pub const fn new(
         name: &'a str,
         contract: &'a TestContract,
-        executor: Executor,
+        executor: Executor<FEN>,
         progress: Option<&'a TestsProgress>,
         tokio_handle: &'a tokio::runtime::Handle,
         span: Span,
-        mcr: &'a MultiContractRunner,
+        mcr: &'a MultiContractRunner<FEN>,
     ) -> Self {
         Self {
             name,
@@ -101,6 +106,25 @@ impl<'a> ContractRunner<'a> {
             span,
             tcfg: Cow::Borrowed(&mcr.tcfg),
             mcr,
+        }
+    }
+
+    /// Returns `true` if `func` should run in the current multi-network pass.
+    ///
+    /// In single-pass mode (no inline network overrides) every function passes.
+    /// In multi-pass mode:
+    /// - Default pass (`pass_network = None`): includes functions *without* an override annotation.
+    /// - Override pass (`pass_network = Some(v)`): includes only functions annotated with `v`.
+    fn function_matches_network_pass(&self, func: &Function) -> bool {
+        let multi = &self.mcr.tcfg.multi_network;
+        if multi.all_override_networks.is_empty() {
+            return true;
+        }
+        let profile = &self.tcfg.config.profile;
+        let func_network = self.mcr.inline_config.network_for(profile, self.name, &func.name);
+        match &multi.pass_network {
+            None => func_network.is_none_or(|n| !multi.all_override_networks.contains(&n)),
+            Some(target) => func_network.as_ref() == Some(target),
         }
     }
 
@@ -148,6 +172,7 @@ impl<'a> ContractRunner<'a> {
             let (raw, reason) = RawCallResult::from_evm_result(deploy_result.map(Into::into))?;
             result.extend(raw, TraceKind::Deployment);
             if reason.is_some() {
+                debug!(?reason, "deployment of library failed");
                 result.reason = reason;
                 return Ok(result);
             }
@@ -176,6 +201,7 @@ impl<'a> ContractRunner<'a> {
         let (raw, reason) = RawCallResult::from_evm_result(deploy_result.map(Into::into))?;
         result.extend(raw, TraceKind::Deployment);
         if reason.is_some() {
+            debug!(?reason, "deployment of test contract failed");
             result.reason = reason;
             return Ok(result);
         }
@@ -221,8 +247,9 @@ impl<'a> ContractRunner<'a> {
     /// Returns the configuration for a contract or function.
     fn inline_config(&self, func: Option<&Function>) -> Result<Config> {
         let function = func.map(|f| f.name.as_str()).unwrap_or("");
-        let config =
-            self.mcr.inline_config.merge(self.name, function, &self.config).extract::<Config>()?;
+        let config = self
+            .config
+            .merge_inline_provider(self.mcr.inline_config.provide(self.name, function))?;
         Ok(config)
     }
 
@@ -306,7 +333,7 @@ impl<'a> ContractRunner<'a> {
                 [("setUp()".to_string(), TestResult::fail("multiple setUp functions".to_string()))]
                     .into(),
                 warnings,
-            )
+            );
         }
 
         // Check if `afterInvariant` function with valid signature declared.
@@ -322,7 +349,7 @@ impl<'a> ContractRunner<'a> {
                 )]
                 .into(),
                 warnings,
-            )
+            );
         }
         let call_after_invariant = after_invariant_fns.first().is_some_and(|after_invariant_fn| {
             let match_sig = after_invariant_fn.name == "afterInvariant";
@@ -352,16 +379,16 @@ impl<'a> ContractRunner<'a> {
 
         if setup.reason.is_some() {
             // The setup failed, so we return a single test result for `setUp`
-            let fail_msg = if !setup.deployment_failure {
-                "setUp()".to_string()
-            } else {
+            let fail_msg = if setup.deployment_failure {
                 "constructor()".to_string()
+            } else {
+                "setUp()".to_string()
             };
             return SuiteResult::new(
                 start.elapsed(),
                 [(fail_msg, TestResult::setup_result(setup))].into(),
                 warnings,
-            )
+            );
         }
 
         // Filter out functions sequentially since it's very fast and there is no need to do it
@@ -371,7 +398,8 @@ impl<'a> ContractRunner<'a> {
             .contract
             .abi
             .functions()
-            .filter(|func| is_matching_test(func, filter))
+            .filter(|func| filter.matches_test_function(func))
+            .filter(|func| self.function_matches_network_pass(func))
             .collect::<Vec<_>>();
         debug!(
             "Found {} test functions out of {} in {:?}",
@@ -384,28 +412,34 @@ impl<'a> ContractRunner<'a> {
             load_contracts(setup.traces.iter().map(|(_, t)| &t.arena), &self.mcr.known_contracts)
         });
 
-        let test_fail_instances = functions
-            .iter()
-            .filter_map(|func| {
-                TestFunctionKind::classify(&func.name, !func.inputs.is_empty())
-                    .is_any_test_fail()
-                    .then_some(func.name.clone())
-            })
-            .collect::<Vec<_>>();
+        let test_fail_functions =
+            functions.iter().filter(|func| func.test_function_kind().is_any_test_fail());
+        if test_fail_functions.clone().next().is_some() {
+            let fail = || {
+                TestResult::fail("`testFail*` has been removed. Consider changing to test_Revert[If|When]_Condition and expecting a revert".to_string())
+            };
+            let test_results = test_fail_functions.map(|func| (func.signature(), fail())).collect();
+            return SuiteResult::new(start.elapsed(), test_results, warnings);
+        }
 
-        if !test_fail_instances.is_empty() {
-            let instances = format!(
-                "Found {} instances: {}",
-                test_fail_instances.len(),
-                test_fail_instances.join(", ")
-            );
-            let fail =  TestResult::fail("`testFail*` has been removed. Consider changing to test_Revert[If|When]_Condition and expecting a revert".to_string());
-            return SuiteResult::new(start.elapsed(), [(instances, fail)].into(), warnings)
+        let early_exit = &self.tcfg.early_exit;
+
+        if self.progress.is_some() {
+            let interrupt = early_exit.clone();
+            self.tokio_handle.spawn(async move {
+                signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+                interrupt.record_ctrl_c();
+            });
         }
 
         let test_results = functions
             .par_iter()
-            .map(|&func| {
+            .filter_map(|&func| {
+                // Early exit if we're running with fail-fast and a test already failed.
+                if early_exit.should_stop() {
+                    return None;
+                }
+
                 let start = Instant::now();
 
                 let _guard = self.tokio_handle.enter();
@@ -434,7 +468,12 @@ impl<'a> ContractRunner<'a> {
                 );
                 res.duration = start.elapsed();
 
-                (sig, res)
+                // Record test failure for early exit (only triggers if fail-fast is enabled).
+                if res.status.is_failure() {
+                    early_exit.record_failure();
+                }
+
+                Some((sig, res))
             })
             .collect::<BTreeMap<_, _>>();
 
@@ -444,13 +483,13 @@ impl<'a> ContractRunner<'a> {
 }
 
 /// Executes a single test function, returning a [`TestResult`].
-struct FunctionRunner<'a> {
+struct FunctionRunner<'a, FEN: FoundryEvmNetwork> {
     /// The function-level configuration.
-    tcfg: Cow<'a, TestRunnerConfig>,
+    tcfg: Cow<'a, TestRunnerConfig<FEN>>,
     /// The EVM executor.
-    executor: Cow<'a, Executor>,
+    executor: Cow<'a, Executor<FEN>>,
     /// The parent runner.
-    cr: &'a ContractRunner<'a>,
+    cr: &'a ContractRunner<'a, FEN>,
     /// The address of the test contract.
     address: Address,
     /// The test setup result.
@@ -459,8 +498,8 @@ struct FunctionRunner<'a> {
     result: TestResult,
 }
 
-impl<'a> std::ops::Deref for FunctionRunner<'a> {
-    type Target = Cow<'a, TestRunnerConfig>;
+impl<'a, FEN: FoundryEvmNetwork> Deref for FunctionRunner<'a, FEN> {
+    type Target = Cow<'a, TestRunnerConfig<FEN>>;
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
@@ -468,8 +507,8 @@ impl<'a> std::ops::Deref for FunctionRunner<'a> {
     }
 }
 
-impl<'a> FunctionRunner<'a> {
-    fn new(cr: &'a ContractRunner<'a>, setup: &'a TestSetup) -> Self {
+impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
+    fn new(cr: &'a ContractRunner<'a, FEN>, setup: &'a TestSetup) -> Self {
         Self {
             tcfg: match &cr.tcfg {
                 Cow::Borrowed(tcfg) => Cow::Borrowed(tcfg),
@@ -483,7 +522,7 @@ impl<'a> FunctionRunner<'a> {
         }
     }
 
-    fn revert_decoder(&self) -> &'a RevertDecoder {
+    const fn revert_decoder(&self) -> &'a RevertDecoder {
         &self.cr.mcr.revert_decoder
     }
 
@@ -512,14 +551,9 @@ impl<'a> FunctionRunner<'a> {
         match kind {
             TestFunctionKind::UnitTest { .. } => self.run_unit_test(func),
             TestFunctionKind::FuzzTest { .. } => self.run_fuzz_test(func),
+            TestFunctionKind::TableTest => self.run_table_test(func),
             TestFunctionKind::InvariantTest => {
-                let test_bytecode = &self.cr.contract.bytecode;
-                self.run_invariant_test(
-                    func,
-                    call_after_invariant,
-                    identified_contracts.unwrap(),
-                    test_bytecode,
-                )
+                self.run_invariant_test(func, call_after_invariant, identified_contracts.unwrap())
             }
             _ => unreachable!(),
         }
@@ -566,12 +600,141 @@ impl<'a> FunctionRunner<'a> {
         self.result
     }
 
+    /// Runs a table test.
+    /// The parameters dataset (table) is created from defined parameter fixtures, therefore each
+    /// test table parameter should have the same number of fixtures defined.
+    /// E.g. for table test
+    /// - `table_test(uint256 amount, bool swap)` fixtures are defined as
+    /// - `uint256[] public fixtureAmount = [2, 5]`
+    /// - `bool[] public fixtureSwap = [true, false]` The `table_test` is then called with the pair
+    ///   of args `(2, true)` and `(5, false)`.
+    fn run_table_test(mut self, func: &Function) -> TestResult {
+        // Prepare unit test execution.
+        if self.prepare_test(func).is_err() {
+            return self.result;
+        }
+
+        // Extract and validate fixtures for the first table test parameter.
+        let Some(first_param) = func.inputs.first() else {
+            self.result.single_fail(Some("Table test should have at least one parameter".into()));
+            return self.result;
+        };
+
+        let Some(first_param_fixtures) =
+            &self.setup.fuzz_fixtures.param_fixtures(first_param.name())
+        else {
+            self.result.single_fail(Some("Table test should have fixtures defined".into()));
+            return self.result;
+        };
+
+        if first_param_fixtures.is_empty() {
+            self.result.single_fail(Some("Table test should have at least one fixture".into()));
+            return self.result;
+        }
+
+        let fixtures_len = first_param_fixtures.len();
+        let mut table_fixtures = vec![&first_param_fixtures[..]];
+
+        // Collect fixtures for remaining parameters.
+        for param in &func.inputs[1..] {
+            let param_name = param.name();
+            let Some(fixtures) = &self.setup.fuzz_fixtures.param_fixtures(param.name()) else {
+                self.result.single_fail(Some(format!("No fixture defined for param {param_name}")));
+                return self.result;
+            };
+
+            if fixtures.len() != fixtures_len {
+                self.result.single_fail(Some(format!(
+                    "{} fixtures defined for {param_name} (expected {})",
+                    fixtures.len(),
+                    fixtures_len
+                )));
+                return self.result;
+            }
+
+            table_fixtures.push(&fixtures[..]);
+        }
+
+        let progress = start_fuzz_progress(
+            self.cr.progress,
+            self.cr.name,
+            &func.name,
+            None,
+            fixtures_len as u32,
+        );
+
+        let mut result = FuzzTestResult::default();
+
+        for i in 0..fixtures_len {
+            if self.tcfg.early_exit.should_stop() {
+                return self.result;
+            }
+
+            // Increment progress bar.
+            if let Some(progress) = progress.as_ref() {
+                progress.inc(1);
+            }
+
+            let args = table_fixtures.iter().map(|row| row[i].clone()).collect_vec();
+            let (mut raw_call_result, reason) = match self.executor.call(
+                self.sender,
+                self.address,
+                func,
+                &args,
+                U256::ZERO,
+                Some(self.revert_decoder()),
+            ) {
+                Ok(res) => (res.raw, None),
+                Err(EvmError::Execution(err)) => (err.raw, Some(err.reason)),
+                Err(EvmError::Skip(reason)) => {
+                    self.result.single_skip(reason);
+                    return self.result;
+                }
+                Err(err) => {
+                    self.result.single_fail(Some(err.to_string()));
+                    return self.result;
+                }
+            };
+
+            result.gas_by_case.push((raw_call_result.gas_used, raw_call_result.stipend));
+            result.logs.extend(raw_call_result.logs.clone());
+            result.labels.extend(raw_call_result.labels.clone());
+            HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
+
+            let is_success =
+                self.executor.is_raw_call_mut_success(self.address, &mut raw_call_result, false);
+            // Record counterexample if test fails.
+            if !is_success {
+                result.counterexample =
+                    Some(CounterExample::Single(BaseCounterExample::from_fuzz_call(
+                        Bytes::from(func.abi_encode_input(&args).unwrap()),
+                        args,
+                        raw_call_result.traces.clone(),
+                    )));
+                result.reason = reason;
+                result.traces = raw_call_result.traces;
+                self.result.table_result(result);
+                return self.result;
+            }
+
+            // If it's the last iteration and all other runs succeeded, then use last call result
+            // for logs and traces.
+            if i == fixtures_len - 1 {
+                result.success = true;
+                result.traces = raw_call_result.traces;
+                self.result.table_result(result);
+                return self.result;
+            }
+        }
+
+        self.result
+    }
+
     fn run_invariant_test(
         mut self,
         func: &Function,
         call_after_invariant: bool,
         identified_contracts: &ContractsByAddress,
-        test_bytecode: &Bytes,
     ) -> TestResult {
         // First, run the test normally to see if it needs to be skipped.
         if let Err(EvmError::Skip(reason)) = self.executor.call(
@@ -589,30 +752,62 @@ impl<'a> FunctionRunner<'a> {
         let runner = self.invariant_runner();
         let invariant_config = &self.config.invariant;
 
+        let mut executor = self.clone_executor();
+        // Enable edge coverage if running with coverage guided fuzzing or with edge coverage
+        // metrics (useful for benchmarking the fuzzer).
+        executor
+            .inspector_mut()
+            .collect_edge_coverage(invariant_config.corpus.collect_evm_edge_coverage());
+        executor
+            .inspector_mut()
+            .collect_sancov_edges(invariant_config.corpus.collect_sancov_edges());
+        executor
+            .inspector_mut()
+            .collect_sancov_trace_cmp(invariant_config.corpus.collect_sancov_trace_cmp());
+        let mut config = invariant_config.clone();
+        let (failure_dir, failure_file) = test_paths(
+            &mut config.corpus,
+            invariant_config.failure_persist_dir.clone().unwrap(),
+            self.cr.name,
+            &func.name,
+        );
+
         let mut evm = InvariantExecutor::new(
-            self.clone_executor(),
+            executor,
             runner,
-            invariant_config.clone(),
+            config,
             identified_contracts,
             &self.cr.mcr.known_contracts,
         );
-        let invariant_contract = InvariantContract {
-            address: self.address,
-            invariant_function: func,
-            call_after_invariant,
-            abi: &self.cr.contract.abi,
-        };
-
-        let (failure_dir, failure_file) = invariant_failure_paths(
-            invariant_config,
+        let invariant_contract = InvariantContract::new(
+            self.address,
             self.cr.name,
-            &invariant_contract.invariant_function.name,
+            func,
+            call_after_invariant,
+            &self.cr.contract.abi,
         );
         let show_solidity = invariant_config.show_solidity;
 
+        // Compute current invariant settings for failure validation.
+        let current_settings = match evm.compute_settings(self.address) {
+            Ok(s) => s,
+            Err(e) => {
+                self.result.invariant_setup_fail(e);
+                return self.result;
+            }
+        };
+
+        let progress = start_fuzz_progress(
+            self.cr.progress,
+            self.cr.name,
+            &func.name,
+            invariant_config.timeout,
+            invariant_config.runs,
+        );
+
         // Try to replay recorded failure if any.
-        if let Some(mut call_sequence) =
-            persisted_call_sequence(failure_file.as_path(), test_bytecode)
+        if let Some(InvariantPersistedFailure { mut call_sequence, assertion_failure, .. }) =
+            persisted_call_sequence(failure_file.as_path(), &current_settings)
         {
             // Create calls from failed sequence and check if invariant still broken.
             let txes = call_sequence
@@ -620,6 +815,8 @@ impl<'a> FunctionRunner<'a> {
                 .map(|seq| {
                     seq.show_solidity = show_solidity;
                     BasicTxDetails {
+                        warp: seq.warp,
+                        roll: seq.roll,
                         sender: seq.sender.unwrap_or_default(),
                         call_details: CallDetails {
                             target: seq.addr.unwrap_or_default(),
@@ -628,52 +825,84 @@ impl<'a> FunctionRunner<'a> {
                     }
                 })
                 .collect::<Vec<BasicTxDetails>>();
-            if let Ok((success, replayed_entirely)) = check_sequence(
+            if let Ok((success, replayed_entirely, replay_reason)) = check_sequence(
                 self.clone_executor(),
                 &txes,
                 (0..min(txes.len(), invariant_config.depth as usize)).collect(),
                 invariant_contract.address,
                 invariant_contract.invariant_function.selector().to_vec().into(),
-                invariant_config.fail_on_revert,
-                invariant_contract.call_after_invariant,
-            ) {
-                if !success {
-                    let _= sh_warn!("\
-                            Replayed invariant failure from {:?} file. \
-                            Run `forge clean` or remove file to ignore failure and to continue invariant test campaign.",
-                        failure_file.as_path()
-                    );
-                    // If sequence still fails then replay error to collect traces and
-                    // exit without executing new runs.
-                    let _ = replay_run(
-                        &invariant_contract,
-                        self.clone_executor(),
-                        &self.cr.mcr.known_contracts,
-                        identified_contracts.clone(),
-                        &mut self.result.logs,
-                        &mut self.result.traces,
-                        &mut self.result.coverage,
-                        &mut self.result.deprecated_cheatcodes,
-                        &txes,
-                        show_solidity,
-                    );
-                    self.result.invariant_replay_fail(
-                        replayed_entirely,
-                        &invariant_contract.invariant_function.name,
-                        call_sequence,
-                    );
-                    return self.result;
+                CheckSequenceOptions {
+                    accumulate_warp_roll: invariant_config.has_delay(),
+                    fail_on_revert: invariant_config.fail_on_revert,
+                    expect_assertion_failure: assertion_failure,
+                    call_after_invariant: invariant_contract.call_after_invariant,
+                    rd: Some(self.revert_decoder()),
+                },
+            ) && !success
+            {
+                let warn = format!(
+                    "Replayed invariant failure from {:?} file. \nRun `forge clean` or remove file to ignore failure and to continue invariant test campaign.",
+                    failure_file.as_path()
+                );
+
+                if let Some(ref progress) = progress {
+                    progress.set_prefix(format!("{}\n{warn}\n", func.name));
+                } else {
+                    let _ = sh_warn!("{warn}");
                 }
+
+                // If sequence still fails then replay error to collect traces and exit without
+                // executing new runs.
+                match replay_error(
+                    evm.config(),
+                    self.clone_executor(),
+                    &txes,
+                    None,
+                    assertion_failure,
+                    None, // check mode
+                    &invariant_contract,
+                    &self.cr.mcr.known_contracts,
+                    identified_contracts.clone(),
+                    &mut self.result.logs,
+                    &mut self.result.traces,
+                    &mut self.result.line_coverage,
+                    &mut self.result.deprecated_cheatcodes,
+                    progress.as_ref(),
+                    &self.tcfg.early_exit,
+                ) {
+                    Ok(replayed_call_sequence) if !replayed_call_sequence.is_empty() => {
+                        call_sequence = replayed_call_sequence;
+                        // Persist error in invariant failure dir.
+                        record_invariant_failure(
+                            failure_dir.as_path(),
+                            failure_file.as_path(),
+                            &call_sequence,
+                            &current_settings,
+                            assertion_failure,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        error!(%err, "Failed to replay invariant error");
+                    }
+                }
+
+                self.result.invariant_replay_fail(
+                    replayed_entirely,
+                    &invariant_contract.invariant_function.name,
+                    replay_reason,
+                    call_sequence,
+                );
+                return self.result;
             }
         }
 
-        let progress =
-            start_fuzz_progress(self.cr.progress, self.cr.name, &func.name, invariant_config.runs);
         let invariant_result = match evm.invariant_fuzz(
             invariant_contract.clone(),
             &self.setup.fuzz_fixtures,
-            &self.setup.deployed_libs,
+            self.build_fuzz_state(true),
             progress.as_ref(),
+            &self.tcfg.early_exit,
         ) {
             Ok(x) => x,
             Err(e) => {
@@ -682,7 +911,7 @@ impl<'a> FunctionRunner<'a> {
             }
         };
         // Merge coverage collected during invariant run with test setup coverage.
-        self.result.merge_coverages(invariant_result.coverage);
+        self.result.merge_coverages(invariant_result.line_coverage);
 
         let mut counterexample = None;
         let success = invariant_result.error.is_none();
@@ -691,73 +920,111 @@ impl<'a> FunctionRunner<'a> {
         match invariant_result.error {
             // If invariants were broken, replay the error to collect logs and traces
             Some(error) => match error {
-                InvariantFuzzError::BrokenInvariant(case_data) |
-                InvariantFuzzError::Revert(case_data) => {
+                InvariantFuzzError::BrokenInvariant(case_data)
+                | InvariantFuzzError::Revert(case_data) => {
                     // Replay error to create counterexample and to collect logs, traces and
                     // coverage.
-                    match replay_error(
-                        &case_data,
-                        &invariant_contract,
-                        self.clone_executor(),
-                        &self.cr.mcr.known_contracts,
-                        identified_contracts.clone(),
-                        &mut self.result.logs,
-                        &mut self.result.traces,
-                        &mut self.result.coverage,
-                        &mut self.result.deprecated_cheatcodes,
-                        progress.as_ref(),
-                        show_solidity,
-                    ) {
-                        Ok(call_sequence) => {
-                            if !call_sequence.is_empty() {
-                                // Persist error in invariant failure dir.
-                                if let Err(err) = foundry_common::fs::create_dir_all(failure_dir) {
-                                    error!(%err, "Failed to create invariant failure dir");
-                                } else if let Err(err) = foundry_common::fs::write_json_file(
-                                    failure_file.as_path(),
-                                    &InvariantPersistedFailure {
-                                        call_sequence: call_sequence.clone(),
-                                        driver_bytecode: Some(test_bytecode.clone()),
-                                    },
-                                ) {
-                                    error!(%err, "Failed to record call sequence");
+                    match case_data.test_error {
+                        TestError::Abort(_) => {}
+                        TestError::Fail(_, ref calls) => {
+                            match replay_error(
+                                evm.config(),
+                                self.clone_executor(),
+                                calls,
+                                Some(case_data.inner_sequence),
+                                case_data.assertion_failure,
+                                None, // check mode
+                                &invariant_contract,
+                                &self.cr.mcr.known_contracts,
+                                identified_contracts.clone(),
+                                &mut self.result.logs,
+                                &mut self.result.traces,
+                                &mut self.result.line_coverage,
+                                &mut self.result.deprecated_cheatcodes,
+                                progress.as_ref(),
+                                &self.tcfg.early_exit,
+                            ) {
+                                Ok(call_sequence) if !call_sequence.is_empty() => {
+                                    // Persist error in invariant failure dir.
+                                    record_invariant_failure(
+                                        failure_dir.as_path(),
+                                        failure_file.as_path(),
+                                        &call_sequence,
+                                        &current_settings,
+                                        case_data.assertion_failure,
+                                    );
+
+                                    let original_seq_len =
+                                        if let TestError::Fail(_, calls) = &case_data.test_error {
+                                            calls.len()
+                                        } else {
+                                            call_sequence.len()
+                                        };
+
+                                    counterexample = Some(CounterExample::Sequence(
+                                        original_seq_len,
+                                        call_sequence,
+                                    ))
                                 }
-
-                                let original_seq_len =
-                                    if let TestError::Fail(_, calls) = &case_data.test_error {
-                                        calls.len()
-                                    } else {
-                                        call_sequence.len()
-                                    };
-
-                                counterexample =
-                                    Some(CounterExample::Sequence(original_seq_len, call_sequence))
+                                Ok(_) => {}
+                                Err(err) => {
+                                    error!(%err, "Failed to replay invariant error");
+                                }
                             }
-                        }
-                        Err(err) => {
-                            error!(%err, "Failed to replay invariant error");
                         }
                     };
                 }
                 InvariantFuzzError::MaxAssumeRejects(_) => {}
             },
 
-            // If invariants ran successfully, replay the last run to collect logs and
-            // traces.
+            // If invariants ran successfully, replay the last run to collect logs and traces.
             _ => {
-                if let Err(err) = replay_run(
-                    &invariant_contract,
-                    self.clone_executor(),
-                    &self.cr.mcr.known_contracts,
-                    identified_contracts.clone(),
-                    &mut self.result.logs,
-                    &mut self.result.traces,
-                    &mut self.result.coverage,
-                    &mut self.result.deprecated_cheatcodes,
-                    &invariant_result.last_run_inputs,
-                    show_solidity,
-                ) {
-                    error!(%err, "Failed to replay last invariant run");
+                if let Some(best_value) = invariant_result.optimization_best_value {
+                    // Optimization mode: replay and shrink to find shortest best sequence.
+                    match replay_error(
+                        evm.config(),
+                        self.clone_executor(),
+                        &invariant_result.optimization_best_sequence,
+                        None,
+                        false,
+                        Some(best_value),
+                        &invariant_contract,
+                        &self.cr.mcr.known_contracts,
+                        identified_contracts.clone(),
+                        &mut self.result.logs,
+                        &mut self.result.traces,
+                        &mut self.result.line_coverage,
+                        &mut self.result.deprecated_cheatcodes,
+                        progress.as_ref(),
+                        &self.tcfg.early_exit,
+                    ) {
+                        Ok(best_sequence) if !best_sequence.is_empty() => {
+                            counterexample = Some(CounterExample::Sequence(
+                                invariant_result.optimization_best_sequence.len(),
+                                best_sequence,
+                            ));
+                        }
+                        Err(err) => {
+                            error!(%err, "Failed to replay optimization best sequence");
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Standard check mode: replay last run for traces.
+                    if let Err(err) = replay_run(
+                        &invariant_contract,
+                        self.clone_executor(),
+                        &self.cr.mcr.known_contracts,
+                        identified_contracts.clone(),
+                        &mut self.result.logs,
+                        &mut self.result.traces,
+                        &mut self.result.line_coverage,
+                        &mut self.result.deprecated_cheatcodes,
+                        &invariant_result.last_run_inputs,
+                        show_solidity,
+                    ) {
+                        error!(%err, "Failed to replay last invariant run");
+                    }
                 }
             }
         }
@@ -770,6 +1037,8 @@ impl<'a> FunctionRunner<'a> {
             invariant_result.cases,
             invariant_result.reverts,
             invariant_result.metrics,
+            invariant_result.failed_corpus_replays,
+            invariant_result.optimization_best_value,
         );
         self.result
     }
@@ -790,22 +1059,67 @@ impl<'a> FunctionRunner<'a> {
         }
 
         let runner = self.fuzz_runner();
-        let fuzz_config = self.config.fuzz.clone();
+        let mut fuzz_config = self.config.fuzz.clone();
+        let (failure_dir, failure_file) = test_paths(
+            &mut fuzz_config.corpus,
+            fuzz_config.failure_persist_dir.clone().unwrap(),
+            self.cr.name,
+            &func.name,
+        );
 
-        let progress =
-            start_fuzz_progress(self.cr.progress, self.cr.name, &func.name, fuzz_config.runs);
+        let progress = start_fuzz_progress(
+            self.cr.progress,
+            self.cr.name,
+            &func.name,
+            fuzz_config.timeout,
+            if fuzz_config.run.is_some() { 1 } else { fuzz_config.runs },
+        );
 
+        let state = self.build_fuzz_state(false);
+        let mut executor = self.executor.into_owned();
+        // Enable edge coverage if running with coverage guided fuzzing or with edge coverage
+        // metrics (useful for benchmarking the fuzzer).
+        executor
+            .inspector_mut()
+            .collect_edge_coverage(fuzz_config.corpus.collect_evm_edge_coverage());
+        executor.inspector_mut().collect_sancov_edges(fuzz_config.corpus.collect_sancov_edges());
+        executor
+            .inspector_mut()
+            .collect_sancov_trace_cmp(fuzz_config.corpus.collect_sancov_trace_cmp());
+        // Load persisted counterexample, if any.
+        let persisted_failure =
+            foundry_common::fs::read_json_file::<BaseCounterExample>(failure_file.as_path()).ok();
         // Run fuzz test.
-        let fuzzed_executor =
-            FuzzedExecutor::new(self.executor.into_owned(), runner, self.tcfg.sender, fuzz_config);
-        let result = fuzzed_executor.fuzz(
+        let mut fuzzed_executor =
+            FuzzedExecutor::new(executor, runner, self.tcfg.sender, fuzz_config, persisted_failure);
+        let result = match fuzzed_executor.fuzz(
             func,
             &self.setup.fuzz_fixtures,
-            &self.setup.deployed_libs,
+            state,
             self.address,
             &self.cr.mcr.revert_decoder,
             progress.as_ref(),
-        );
+            &self.tcfg.early_exit,
+            self.cr.tokio_handle,
+        ) {
+            Ok(x) => x,
+            Err(e) => {
+                self.result.fuzz_setup_fail(e);
+                return self.result;
+            }
+        };
+
+        // Record counterexample.
+        if let Some(CounterExample::Single(counterexample)) = &result.counterexample {
+            if let Err(err) = foundry_common::fs::create_dir_all(failure_dir) {
+                error!(%err, "Failed to create fuzz failure dir");
+            } else if let Err(err) =
+                foundry_common::fs::write_json_file(failure_file.as_path(), counterexample)
+            {
+                error!(%err, "Failed to record call sequence");
+            }
+        }
+
         self.result.fuzz_result(result);
         self.result
     }
@@ -823,13 +1137,13 @@ impl<'a> FunctionRunner<'a> {
         let address = self.setup.address;
 
         // Apply before test configured functions (if any).
-        if self.cr.contract.abi.functions().filter(|func| func.name.is_before_test_setup()).count() ==
-            1
-        {
+        if self.cr.contract.abi.functions().any(|func| func.name.is_before_test_setup()) {
             for calldata in self.executor.call_sol_default(
                 address,
                 &ITest::beforeTestSetupCall { testSelector: func.selector() },
             ) {
+                let spec_id: SpecId = self.executor.spec_id().into();
+                debug!(?calldata, spec=%spec_id, "applying before_test_setup");
                 // Apply before test configured calldata.
                 match self.executor.to_mut().transact_raw(
                     self.tcfg.sender,
@@ -861,40 +1175,42 @@ impl<'a> FunctionRunner<'a> {
 
     fn fuzz_runner(&self) -> TestRunner {
         let config = &self.config.fuzz;
-        let failure_persist_path = config
-            .failure_persist_dir
-            .as_ref()
-            .unwrap()
-            .join(config.failure_persist_file.as_ref().unwrap())
-            .into_os_string()
-            .into_string()
-            .unwrap();
-        fuzzer_with_cases(
-            config.seed,
-            config.runs,
-            config.max_test_rejects,
-            Some(Box::new(FileFailurePersistence::Direct(failure_persist_path.leak()))),
-        )
+        fuzzer_with_cases(config.seed, config.runs, config.max_test_rejects)
     }
 
     fn invariant_runner(&self) -> TestRunner {
         let config = &self.config.invariant;
-        fuzzer_with_cases(self.config.fuzz.seed, config.runs, config.max_assume_rejects, None)
+        fuzzer_with_cases(self.config.fuzz.seed, config.runs, config.max_assume_rejects)
     }
 
-    fn clone_executor(&self) -> Executor {
+    fn clone_executor(&self) -> Executor<FEN> {
         self.executor.clone().into_owned()
+    }
+
+    fn build_fuzz_state(&self, invariant: bool) -> EvmFuzzState {
+        let config =
+            if invariant { self.config.invariant.dictionary } else { self.config.fuzz.dictionary };
+        if let Some(db) = self.executor.backend().active_fork_db() {
+            EvmFuzzState::new(
+                &self.setup.deployed_libs,
+                db,
+                config,
+                Some(&self.cr.mcr.fuzz_literals),
+            )
+        } else {
+            let db = self.executor.backend().mem_db();
+            EvmFuzzState::new(
+                &self.setup.deployed_libs,
+                db,
+                config,
+                Some(&self.cr.mcr.fuzz_literals),
+            )
+        }
     }
 }
 
-fn fuzzer_with_cases(
-    seed: Option<U256>,
-    cases: u32,
-    max_global_rejects: u32,
-    file_failure_persistence: Option<Box<dyn FailurePersistence>>,
-) -> TestRunner {
+fn fuzzer_with_cases(seed: Option<U256>, cases: u32, max_global_rejects: u32) -> TestRunner {
     let config = proptest::test_runner::Config {
-        failure_persistence: file_failure_persistence,
         cases,
         max_global_rejects,
         // Disable proptest shrink: for fuzz tests we provide single counterexample,
@@ -918,44 +1234,72 @@ fn fuzzer_with_cases(
 struct InvariantPersistedFailure {
     /// Recorded counterexample.
     call_sequence: Vec<BaseCounterExample>,
-    /// Bytecode of the test contract that generated the counterexample.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    driver_bytecode: Option<Bytes>,
+    /// Invariant settings when the counterexample was generated.
+    /// Used to determine if the counterexample is still valid.
+    settings: InvariantSettings,
+    /// Whether the persisted failure came from a handler assertion instead of the invariant body.
+    #[serde(default)]
+    assertion_failure: bool,
 }
 
 /// Helper function to load failed call sequence from file.
-/// Ignores failure if generated with different test contract than the current one.
-fn persisted_call_sequence(path: &Path, bytecode: &Bytes) -> Option<Vec<BaseCounterExample>> {
+/// Ignores failure if generated with different invariant settings than the current ones.
+fn persisted_call_sequence(
+    path: &Path,
+    current_settings: &InvariantSettings,
+) -> Option<InvariantPersistedFailure> {
     foundry_common::fs::read_json_file::<InvariantPersistedFailure>(path).ok().and_then(
         |persisted_failure| {
-            if let Some(persisted_bytecode) = &persisted_failure.driver_bytecode {
-                // Ignore persisted sequence if test bytecode doesn't match.
-                if !bytecode.eq(persisted_bytecode) {
-                    let _= sh_warn!("\
-                            Failure from {:?} file was ignored because test contract bytecode has changed.",
-                        path
-                    );
-                    return None;
-                }
-            };
-            Some(persisted_failure.call_sequence)
+            if let Some(diff) = persisted_failure.settings.diff(current_settings) {
+                let _ = sh_warn!(
+                    "Failure from {:?} file was ignored because invariant test settings have changed: {}",
+                    path,
+                    diff
+                );
+                return None;
+            }
+            Some(persisted_failure)
         },
     )
 }
 
-/// Helper functions to return canonicalized invariant failure paths.
-fn invariant_failure_paths(
-    config: &InvariantConfig,
+/// Helper function to set test corpus dir and to compose persisted failure paths.
+fn test_paths(
+    corpus_config: &mut FuzzCorpusConfig,
+    persist_dir: PathBuf,
     contract_name: &str,
-    invariant_name: &str,
+    test_name: &str,
 ) -> (PathBuf, PathBuf) {
-    let dir = config
-        .failure_persist_dir
-        .clone()
-        .unwrap()
-        .join("failures")
-        .join(contract_name.split(':').next_back().unwrap());
-    let dir = canonicalized(dir);
-    let file = canonicalized(dir.join(invariant_name));
-    (dir, file)
+    let contract = contract_name.split(':').next_back().unwrap();
+    // Update config with corpus dir for current test.
+    corpus_config.with_test(contract, test_name);
+
+    let failures_dir = canonicalized(persist_dir.join("failures").join(contract));
+    let failure_file = canonicalized(failures_dir.join(test_name));
+    (failures_dir, failure_file)
+}
+
+/// Helper function to persist invariant failure.
+fn record_invariant_failure(
+    failure_dir: &Path,
+    failure_file: &Path,
+    call_sequence: &[BaseCounterExample],
+    settings: &InvariantSettings,
+    assertion_failure: bool,
+) {
+    if let Err(err) = foundry_common::fs::create_dir_all(failure_dir) {
+        error!(%err, "Failed to create invariant failure dir");
+        return;
+    }
+
+    if let Err(err) = foundry_common::fs::write_json_file(
+        failure_file,
+        &InvariantPersistedFailure {
+            call_sequence: call_sequence.to_owned(),
+            settings: settings.clone(),
+            assertion_failure,
+        },
+    ) {
+        error!(%err, "Failed to record call sequence");
+    }
 }

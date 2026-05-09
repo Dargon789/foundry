@@ -14,19 +14,22 @@ pub struct DebugNode {
     pub kind: CallKind,
     /// Calldata of the call.
     pub calldata: Bytes,
+    /// The gas limit of the call.
+    pub gas_limit: u64,
     /// The debug steps.
     pub steps: Vec<CallTraceStep>,
 }
 
 impl DebugNode {
     /// Creates a new debug node.
-    pub fn new(
+    pub const fn new(
         address: Address,
         kind: CallKind,
         steps: Vec<CallTraceStep>,
         calldata: Bytes,
+        gas_limit: u64,
     ) -> Self {
-        Self { address, kind, steps, calldata }
+        Self { address, kind, steps, calldata, gas_limit }
     }
 }
 
@@ -73,12 +76,12 @@ pub fn flatten_call_trace(arena: CallTraceArena, out: &mut Vec<DebugNode>) {
 
         // Skip nodes with empty steps as there's nothing to display for them.
         if steps.is_empty() {
-            continue
+            continue;
         }
 
         let call = &arena_nodes[pending.node_idx].trace;
         let calldata = if call.kind.is_any_create() { Bytes::new() } else { call.data.clone() };
-        let node = DebugNode::new(call.address, call.kind, steps, calldata);
+        let node = DebugNode::new(call.address, call.kind, steps, calldata, call.gas_limit);
 
         out.push(node);
     }

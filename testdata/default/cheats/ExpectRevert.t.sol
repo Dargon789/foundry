@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.18;
 
-import "ds-test/test.sol";
-import "cheats/Vm.sol";
+import "utils/Test.sol";
 
 contract Reverter {
     error CustomError();
@@ -71,9 +70,7 @@ contract Dummy {
     }
 }
 
-contract ExpectRevertTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract ExpectRevertTest is Test {
     function shouldRevert() internal {
         revert();
     }
@@ -94,12 +91,6 @@ contract ExpectRevertTest is DSTest {
 
         vm.expectRevert(abi.encodeWithSignature("Error(string)", "revert: A"));
         reverter.revertWithMessage("revert: A");
-    }
-
-    function testShouldFailIfExpectRevertWrongString() public {
-        Reverter reverter = new Reverter();
-        vm.expectRevert("my not so cool error", 0);
-        reverter.revertWithMessage("my cool error");
     }
 
     function testExpectRevertConstructor() public {
@@ -269,9 +260,7 @@ contract DContract {
     }
 }
 
-contract ExpectRevertWithReverterTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract ExpectRevertWithReverterTest is Test {
     error CContractError(string reason);
 
     AContract aContract;
@@ -316,11 +305,94 @@ contract ExpectRevertWithReverterTest is DSTest {
         vm.expectRevert(address(cContract));
         aContract.createDContractThroughCContract();
     }
+
+    // <https://github.com/foundry-rs/foundry/issues/14613>
+    // Regression: when the next operation is a top-level CREATE whose constructor
+    // reverts directly, the reverter address argument must be enforced (it used to
+    // be silently ignored). The matched reverter is the would-be-deployed address.
+    function testExpectRevertsWithReverterTopLevelCreate() public {
+        address expected = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectRevert(expected);
+        new DContract();
+
+        expected = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectRevert(abi.encodePacked("Reverted by DContract"), expected);
+        new DContract();
+    }
+
+    // <https://github.com/foundry-rs/foundry/issues/14613>
+    // Regression: when the next operation is a top-level CREATE whose constructor
+    // synchronously creates another contract that reverts (i.e. innermost frame is
+    // a CREATE), the matched reverter is the outer would-be-deployed address (the
+    // contract whose deployment failed).
+    function testExpectRevertsWithReverterNestedCreate() public {
+        address expected = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectRevert(expected);
+        new NestedDContractCreator();
+    }
+
+    // <https://github.com/foundry-rs/foundry/issues/14613>
+    // Regression: `expectPartialRevert(bytes4, address)` overload must enforce
+    // the reverter address argument when matching a top-level CREATE revert.
+    function testExpectPartialRevertWithReverterTopLevelCreate() public {
+        address expected = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        // `Reverted by DContract` triggers Solidity's `Error(string)` selector.
+        vm.expectPartialRevert(bytes4(keccak256("Error(string)")), expected);
+        new DContract();
+    }
+
+    // <https://github.com/foundry-rs/foundry/issues/14613>
+    // Regression: `expectRevert(bytes4, address)` (exact 4-byte selector + reverter)
+    // overload must enforce the reverter address argument for a top-level CREATE.
+    function testExpectRevertWithBytes4SelectorAndReverterTopLevelCreate() public {
+        address expected = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectRevert(DCustomErrorContract.CustomError.selector, expected);
+        new DCustomErrorContract();
+    }
+
+    // <https://github.com/foundry-rs/foundry/issues/14613>
+    // Regression: `expectRevert(address, uint64)` count-bearing overload must
+    // exercise the `count > 1` branch in `create_end`. Use CREATE2 with the same
+    // salt so both deploys would resolve to the same would-be address (each
+    // constructor reverts so no contract is ever actually placed there).
+    function testExpectRevertsWithReverterCountTopLevelCreate2() public {
+        bytes32 salt = bytes32(uint256(0x42));
+        address expected = vm.computeCreate2Address(salt, keccak256(type(DContract).creationCode), address(this));
+        vm.expectRevert(expected, 2);
+        new DContract{salt: salt}();
+        new DContract{salt: salt}();
+    }
+
+    // <https://github.com/foundry-rs/foundry/issues/14613>
+    // Regression: CREATE2 deploys must also enforce the reverter address argument.
+    function testExpectRevertsWithReverterTopLevelCreate2() public {
+        bytes32 salt = bytes32(uint256(0xC0FFEE));
+        address expected = vm.computeCreate2Address(salt, keccak256(type(DContract).creationCode), address(this));
+        vm.expectRevert(expected);
+        new DContract{salt: salt}();
+    }
 }
 
-contract ExpectRevertCount is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
+// Used by `testExpectRevertsWithReverterNestedCreate`: a contract whose constructor
+// directly creates another contract that reverts.
+contract NestedDContractCreator {
+    constructor() {
+        new DContract();
+    }
+}
 
+// Used by `testExpectRevertWithBytes4SelectorAndReverterTopLevelCreate`: constructor
+// reverts with a parameter-less custom error so the full revert data is exactly the
+// 4-byte selector.
+contract DCustomErrorContract {
+    error CustomError();
+
+    constructor() {
+        revert CustomError();
+    }
+}
+
+contract ExpectRevertCount is Test {
     function testRevertCountAny() public {
         uint64 count = 3;
         Reverter reverter = new Reverter();
@@ -353,13 +425,6 @@ contract ExpectRevertCount is DSTest {
         Reverter reverter = new Reverter();
         vm.expectRevert("revert", count);
         reverter.doNotRevert();
-    }
-
-    function testNoRevertSpecificButDiffRevert() public {
-        uint64 count = 0;
-        Reverter reverter = new Reverter();
-        vm.expectRevert("revert", count);
-        reverter.revertWithMessage("revert2");
     }
 
     function testRevertCountWithConstructor() public {
@@ -408,9 +473,7 @@ contract ExpectRevertCount is DSTest {
     }
 }
 
-contract ExpectRevertCountWithReverter is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract ExpectRevertCountWithReverter is Test {
     function testRevertCountWithReverter() public {
         uint64 count = 2;
         Reverter reverter = new Reverter();
@@ -426,14 +489,6 @@ contract ExpectRevertCountWithReverter is DSTest {
         reverter.doNotRevert();
     }
 
-    function testNoRevertWithWrongReverter() public {
-        uint64 count = 0;
-        Reverter reverter = new Reverter();
-        Reverter reverter2 = new Reverter();
-        vm.expectRevert(address(reverter), count);
-        reverter2.revertWithMessage("revert"); // revert from wrong reverter
-    }
-
     function testReverterCountWithData() public {
         uint64 count = 2;
         Reverter reverter = new Reverter();
@@ -441,14 +496,35 @@ contract ExpectRevertCountWithReverter is DSTest {
         reverter.revertWithMessage("revert");
         reverter.revertWithMessage("revert");
     }
+}
 
-    function testNoReverterCountWithData() public {
-        uint64 count = 0;
-        Reverter reverter = new Reverter();
-        vm.expectRevert("revert", address(reverter), count);
-        reverter.doNotRevert();
+contract ExpectRevertPrecompileTest is Test {
+    /// Test that vm.expectRevert works when the next external call targets a
+    /// precompile address directly. Precompile calls don't create an interpreter
+    /// frame (no `initialize_interp`), so depth tracking must account for them.
+    function testExpectRevertDirectPrecompileCall() public {
+        // BLAKE2F precompile (0x09) expects exactly 213 bytes of input.
+        // Calling it with invalid input reverts.
+        vm.expectRevert();
+        address(0x09).call(hex"00");
+    }
+}
 
-        vm.expectRevert("revert", address(reverter), count);
-        reverter.revertWithMessage("revert2");
+contract ExpectRevertWithErrorTest is Test {
+    /// Ref: <https://github.com/foundry-rs/foundry/issues/12511>
+    function test_f() external {
+        bytes memory v = abi.encodeWithSignature("Error(string)", "");
+        vm.expectRevert(v);
+        this.f(v);
+
+        bytes memory v1 = abi.encodeWithSignature("Error(string)", unicode"🙀");
+        vm.expectRevert(v1);
+        this.f(v1);
+    }
+
+    function f(bytes memory v) external pure {
+        assembly {
+            revert(add(v, 32), mload(v))
+        }
     }
 }

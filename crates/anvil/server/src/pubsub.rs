@@ -1,4 +1,4 @@
-use crate::{error::RequestError, handler::handle_request, RpcHandler};
+use crate::{RpcHandler, error::RequestError, handler::handle_request};
 use anvil_rpc::{
     error::RpcError,
     request::Request,
@@ -11,7 +11,6 @@ use serde::de::DeserializeOwned;
 use std::{
     collections::VecDeque,
     fmt,
-    future::Future,
     hash::Hash,
     pin::Pin,
     sync::Arc,
@@ -68,7 +67,7 @@ impl<Handler: PubSubRpcHandler> PubSubContext<Handler> {
         let mut subscriptions = self.subscriptions.lock();
         if let Some(idx) = subscriptions.iter().position(|(i, _)| id == i) {
             trace!(target: "rpc", ?id,  "removed subscription");
-            return Some(subscriptions.swap_remove(idx).1)
+            return Some(subscriptions.swap_remove(idx).1);
         }
         None
     }
@@ -118,7 +117,7 @@ pub struct PubSubConnection<Handler: PubSubRpcHandler, Connection> {
     /// The established connection
     connection: Connection,
     /// currently in progress requests
-    processing: Vec<Pin<Box<dyn Future<Output = Response> + Send>>>,
+    processing: Vec<Pin<Box<dyn Future<Output = Option<Response>> + Send>>>,
     /// pending messages to send
     pending: VecDeque<String>,
 }
@@ -143,12 +142,10 @@ impl<Handler: PubSubRpcHandler, Connection> PubSubConnection<Handler, Connection
         let handler = self.compat_helper();
         self.processing.push(Box::pin(async move {
             match req {
-                Ok(req) => handle_request(req, handler)
-                    .await
-                    .unwrap_or_else(|| Response::error(RpcError::invalid_request())),
+                Ok(req) => handle_request(req, handler).await,
                 Err(err) => {
                     error!(target: "rpc", ?err, "invalid request");
-                    Response::error(RpcError::invalid_request())
+                    Some(Response::error(RpcError::invalid_request()))
                 }
             }
         }));
@@ -174,7 +171,7 @@ where
                         error!(target: "rpc", ?err, "Failed to send message");
                     }
                 } else {
-                    break
+                    break;
                 }
             }
 
@@ -183,7 +180,7 @@ where
             if let Poll::Ready(Err(err)) = pin.connection.poll_flush_unpin(cx) {
                 trace!(target: "rpc", ?err, "websocket err");
                 // close the connection
-                return Poll::Ready(())
+                return Poll::Ready(());
             }
 
             loop {
@@ -195,25 +192,25 @@ where
                         Err(err) => match err {
                             RequestError::Axum(err) => {
                                 trace!(target: "rpc", ?err, "client disconnected");
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                             RequestError::Io(err) => {
                                 trace!(target: "rpc", ?err, "client disconnected");
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                             RequestError::Serde(err) => {
                                 pin.process_request(Err(err));
                             }
                             RequestError::Disconnect => {
                                 trace!(target: "rpc", "client disconnected");
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                         },
                         _ => {}
                     },
                     Poll::Ready(None) => {
                         trace!(target: "rpc", "socket connection finished");
-                        return Poll::Ready(())
+                        return Poll::Ready(());
                     }
                     Poll::Pending => break,
                 }
@@ -222,13 +219,15 @@ where
             let mut progress = false;
             for n in (0..pin.processing.len()).rev() {
                 let mut req = pin.processing.swap_remove(n);
+                #[allow(clippy::collapsible_match)]
                 match req.poll_unpin(cx) {
-                    Poll::Ready(resp) => {
+                    Poll::Ready(Some(resp)) => {
                         if let Ok(text) = serde_json::to_string(&resp) {
                             pin.pending.push_back(text);
                             progress = true;
                         }
                     }
+                    Poll::Ready(None) => {}
                     Poll::Pending => pin.processing.push(req),
                 }
             }
@@ -239,6 +238,7 @@ where
                 'outer: for n in (0..subscriptions.len()).rev() {
                     let (id, mut sub) = subscriptions.swap_remove(n);
                     'inner: loop {
+                        #[allow(clippy::collapsible_match)]
                         match sub.poll_next_unpin(cx) {
                             Poll::Ready(Some(res)) => {
                                 if let Ok(text) = serde_json::to_string(&res) {
@@ -256,8 +256,75 @@ where
             }
 
             if !progress {
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anvil_rpc::{
+        request::{RequestParams, RpcCall, RpcNotification, Version},
+        response::RpcResponse,
+    };
+    use std::{pin::pin, task::Waker};
+
+    #[derive(Clone)]
+    struct TestHandler;
+
+    #[async_trait::async_trait]
+    impl PubSubRpcHandler for TestHandler {
+        type Request = serde_json::Value;
+        type SubscriptionId = u64;
+        type Subscription = futures::stream::Empty<serde_json::Value>;
+
+        async fn on_request(
+            &self,
+            _request: Self::Request,
+            _cx: PubSubContext<Self>,
+        ) -> ResponseResult {
+            ResponseResult::success(serde_json::Value::Null)
+        }
+    }
+
+    fn notification() -> RpcCall {
+        RpcCall::Notification(RpcNotification {
+            jsonrpc: Some(Version::V2),
+            method: "eth_subscribe".to_owned(),
+            params: RequestParams::None,
+        })
+    }
+
+    fn run_ready<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut future = pin!(future);
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("future unexpectedly pending"),
+        }
+    }
+
+    #[test]
+    fn process_request_keeps_empty_batch_invalid() {
+        let mut connection = PubSubConnection::new((), TestHandler);
+        connection.process_request(Ok(Request::Batch(vec![])));
+
+        let response = run_ready(connection.processing.pop().unwrap());
+        assert_eq!(
+            response,
+            Some(Response::Single(RpcResponse::from(RpcError::invalid_request())))
+        );
+    }
+
+    #[test]
+    fn process_request_skips_notification_only_batch_response() {
+        let mut connection = PubSubConnection::new((), TestHandler);
+        connection.process_request(Ok(Request::Batch(vec![notification()])));
+
+        let response = run_ready(connection.processing.pop().unwrap());
+        assert_eq!(response, None);
     }
 }

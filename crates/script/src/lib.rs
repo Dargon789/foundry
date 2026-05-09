@@ -2,8 +2,9 @@
 //!
 //! Smart contract scripting.
 
+#![recursion_limit = "256"]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[macro_use]
 extern crate foundry_common;
@@ -11,12 +12,12 @@ extern crate foundry_common;
 #[macro_use]
 extern crate tracing;
 
-use crate::runner::ScriptRunner;
+use crate::{broadcast::BundledState, runner::ScriptRunner};
 use alloy_json_abi::{Function, JsonAbi};
+use alloy_network::Network;
 use alloy_primitives::{
-    hex,
+    Address, Bytes, Log, U256, hex,
     map::{AddressHashMap, HashMap},
-    Address, Bytes, Log, TxKind, U256,
 };
 use alloy_signer::Signer;
 use broadcast::next_nonce;
@@ -26,35 +27,42 @@ use dialoguer::Confirm;
 use eyre::{ContextCompat, Result};
 use forge_script_sequence::{AdditionalContract, NestedValue};
 use forge_verify::{RetryArgs, VerifierArgs};
-use foundry_block_explorers::EtherscanApiVersion;
 use foundry_cli::{
-    opts::{BuildOpts, GlobalArgs},
+    opts::{BuildOpts, EvmArgs, GlobalArgs, TempoOpts},
     utils::LoadConfig,
 };
 use foundry_common::{
+    CONTRACT_MAX_SIZE, ContractsByArtifact, SELECTOR_LEN,
     abi::{encode_function_args, get_func},
-    evm::{Breakpoints, EvmArgs},
-    shell, ContractsByArtifact, CONTRACT_MAX_SIZE, SELECTOR_LEN,
+    shell,
 };
 use foundry_compilers::ArtifactId;
 use foundry_config::{
-    figment,
+    Config, figment,
     figment::{
-        value::{Dict, Map},
         Metadata, Profile, Provider,
+        value::{Dict, Map},
     },
-    Config,
 };
+#[cfg(feature = "optimism")]
+use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
     backend::Backend,
+    core::{
+        Breakpoints, FoundryTransaction,
+        evm::{EthEvmNetwork, FoundryEvmNetwork, TempoEvmNetwork, TxEnvFor},
+        tempo::PATH_USD_ADDRESS,
+    },
     executors::ExecutorBuilder,
     inspectors::{
-        cheatcodes::{BroadcastableTransactions, Wallets},
         CheatsConfig,
+        cheatcodes::{BroadcastableTransactions, Wallets},
     },
     opts::EvmOpts,
+    revm::interpreter::InstructionResult,
     traces::{TraceMode, Traces},
 };
+use foundry_evm_networks::NetworkConfigs;
 use foundry_wallets::MultiWalletOpts;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -97,7 +105,7 @@ pub struct ScriptArgs {
     pub target_contract: Option<String>,
 
     /// The signature of the function you want to call in the contract, or raw calldata.
-    #[arg(long, short, default_value = "run()")]
+    #[arg(long, short, default_value = "run")]
     pub sig: String,
 
     /// Max priority fee per gas for EIP1559 transactions.
@@ -119,11 +127,24 @@ pub struct ScriptArgs {
     #[arg(long)]
     pub broadcast: bool,
 
-    /// Batch size of transactions.
+    /// Batch all broadcast transactions into a single Tempo batch transaction.
     ///
-    /// This is ignored and set to 1 if batching is not available or `--slow` is enabled.
-    #[arg(long, default_value = "100")]
+    /// When enabled, all vm.broadcast() calls are collected and sent as a single
+    /// atomic type 0x76 transaction instead of individual transactions.
+    /// This provides atomicity (all-or-nothing execution) and gas savings.
+    #[arg(long)]
+    pub batch: bool,
+
+    /// Number of calls per Tempo batch transaction.
+    ///
+    /// When `--batch` is enabled, splits the collected calls into multiple batch
+    /// transactions of at most this many calls each.
+    #[arg(long, requires = "batch", default_value = "100")]
     pub batch_size: usize,
+
+    /// Tempo transaction options.
+    #[command(flatten)]
+    pub tempo: TempoOpts,
 
     /// Skips on-chain simulation.
     #[arg(long)]
@@ -133,10 +154,10 @@ pub struct ScriptArgs {
     #[arg(long, short, default_value = "130")]
     pub gas_estimate_multiplier: u64,
 
-    /// Send via `eth_sendTransaction` using the `--from` argument or `$ETH_FROM` as sender
+    /// Send via `eth_sendTransaction` using the `--sender` argument as sender.
     #[arg(
         long,
-        conflicts_with_all = &["private_key", "private_keys", "froms", "ledger", "trezor", "aws"],
+        conflicts_with_all = &["private_key", "private_keys", "ledger", "trezor", "aws", "browser"],
     )]
     pub unlocked: bool,
 
@@ -179,16 +200,20 @@ pub struct ScriptArgs {
     #[arg(long)]
     pub non_interactive: bool,
 
+    /// Disables the contract size limit during script execution.
+    #[arg(long)]
+    pub disable_code_size_limit: bool,
+
+    /// Disables the labels in the traces.
+    #[arg(long)]
+    pub disable_labels: bool,
+
     /// The Etherscan (or equivalent) API key
     #[arg(long, env = "ETHERSCAN_API_KEY", value_name = "KEY")]
     pub etherscan_api_key: Option<String>,
 
-    /// The Etherscan API version.
-    #[arg(long, env = "ETHERSCAN_API_VERSION", value_name = "VERSION")]
-    pub etherscan_api_version: Option<EtherscanApiVersion>,
-
     /// Verifies all the contracts found in the receipts of a script, if any.
-    #[arg(long)]
+    #[arg(long, requires = "broadcast")]
     pub verify: bool,
 
     /// Gas price for legacy transactions, or max fee per gas for EIP1559 transactions, either
@@ -224,32 +249,107 @@ pub struct ScriptArgs {
 }
 
 impl ScriptArgs {
-    pub async fn preprocess(self) -> Result<PreprocessedState> {
-        let script_wallets = Wallets::new(self.wallets.get_multi_wallet().await?, self.evm.sender);
-
+    /// Loads config, resolves evm_opts (including network inference from fork), and returns them.
+    async fn resolved_evm_opts(&self) -> Result<(Config, EvmOpts)> {
         let (config, mut evm_opts) = self.load_config_and_evm_opts()?;
+
+        if self.tempo.is_tempo() {
+            // If fee token or expiry is set directly select tempo
+            evm_opts.networks = NetworkConfigs::with_tempo();
+        } else {
+            // Auto-detect network from fork chain ID when not explicitly configured.
+            evm_opts.infer_network_from_fork().await;
+        }
+
+        Ok((config, evm_opts))
+    }
+
+    async fn preprocess<FEN: FoundryEvmNetwork>(
+        self,
+        config: Config,
+        mut evm_opts: EvmOpts,
+    ) -> Result<PreprocessedState<FEN>> {
+        let script_wallets = Wallets::new(self.wallets.get_multi_wallet().await?, self.evm.sender);
+        let browser_wallet = self.wallets.browser_signer::<FEN::Network>().await?;
 
         if let Some(sender) = self.maybe_load_private_key()? {
             evm_opts.sender = sender;
+        } else if self.evm.sender.is_none() {
+            // If no sender was explicitly set via --sender, auto-detect it from available signers:
+            // use the sole signer's address if there's exactly one, or fall back to the browser
+            // wallet address if present.
+            if let Ok(signers) = script_wallets.signers()
+                && signers.len() == 1
+            {
+                evm_opts.sender = signers[0];
+            } else if let Some(signer) = browser_wallet.as_ref().map(|b| b.address()) {
+                evm_opts.sender = signer
+            }
         }
 
-        let script_config = ScriptConfig::new(config, evm_opts).await?;
+        let mut tempo = self.tempo.clone();
+        tempo.resolve_expires();
 
-        Ok(PreprocessedState { args: self, script_config, script_wallets })
+        if evm_opts.networks.is_tempo() && tempo.fee_token.is_none() {
+            tempo.fee_token = Some(PATH_USD_ADDRESS);
+        }
+
+        let script_config = ScriptConfig::new(config, evm_opts, self.batch, tempo).await?;
+        Ok(PreprocessedState { args: self, script_config, script_wallets, browser_wallet })
     }
 
     /// Executes the script
+    #[allow(clippy::large_stack_frames)]
     pub async fn run_script(self) -> Result<()> {
         trace!(target: "script", "executing script command");
 
-        let state = self.preprocess().await?;
+        let (config, evm_opts) = self.resolved_evm_opts().await?;
+
+        let is_tempo = evm_opts.networks.is_tempo();
+
+        if self.batch && !is_tempo {
+            eyre::bail!("--batch mode is only supported on Tempo networks");
+        }
+
+        if is_tempo {
+            let batch = self.batch;
+            let bundled = match self.prepare_bundled::<TempoEvmNetwork>(config, evm_opts).await? {
+                Some(bundled) => bundled,
+                None => return Ok(()),
+            };
+            let bundled = bundled.wait_for_pending().await?;
+            let broadcasted =
+                if batch { bundled.broadcast_batch().await? } else { bundled.broadcast().await? };
+            if broadcasted.args.verify {
+                broadcasted.verify().await?;
+            }
+            return Ok(());
+        }
+
+        #[cfg(feature = "optimism")]
+        if evm_opts.networks.is_optimism() {
+            return self.run_generic_script::<OpEvmNetwork>(config, evm_opts).await;
+        }
+
+        self.run_generic_script::<EthEvmNetwork>(config, evm_opts).await
+    }
+
+    /// Prepares the bundled state (compile, simulate, bundle) and returns it
+    /// for broadcasting, or returns `None` if there's nothing to broadcast
+    /// (e.g., debug mode, no transactions, missing RPCs).
+    #[allow(clippy::large_stack_frames)]
+    async fn prepare_bundled<FEN: FoundryEvmNetwork>(
+        self,
+        config: Config,
+        evm_opts: EvmOpts,
+    ) -> Result<Option<BundledState<FEN>>> {
+        let state = self.preprocess::<FEN>(config, evm_opts).await?;
         let create2_deployer = state.script_config.evm_opts.create2_deployer;
         let compiled = state.compile()?;
 
         // Move from `CompiledState` to `BundledState` either by resuming or executing and
         // simulating script.
-        let bundled = if compiled.args.resume || (compiled.args.verify && !compiled.args.broadcast)
-        {
+        let bundled = if compiled.args.resume {
             compiled.resume().await?
         } else {
             // Drive state machine to point at which we have everything needed for simulation.
@@ -265,8 +365,8 @@ impl ScriptArgs {
 
             if pre_simulation.args.debug {
                 return match pre_simulation.args.dump.clone() {
-                    Some(path) => pre_simulation.dump_debugger(&path),
-                    None => pre_simulation.run_debugger(),
+                    Some(path) => pre_simulation.dump_debugger(&path).map(|_| None),
+                    None => pre_simulation.run_debugger().map(|_| None),
                 };
             }
 
@@ -288,7 +388,7 @@ impl ScriptArgs {
                     sh_warn!("No transactions to broadcast.")?;
                 }
 
-                return Ok(());
+                return Ok(None);
             }
 
             // Check if there are any missing RPCs and exit early to avoid hard error.
@@ -297,7 +397,7 @@ impl ScriptArgs {
                     sh_println!("\nIf you wish to simulate on-chain transactions pass a RPC URL.")?;
                 }
 
-                return Ok(());
+                return Ok(None);
             }
 
             pre_simulation.args.check_contract_sizes(
@@ -317,15 +417,30 @@ impl ScriptArgs {
                     bundled.sequence.show_transactions()?;
                 }
 
-                sh_println!("\nSIMULATION COMPLETE. To broadcast these transactions, add --broadcast and wallet configuration(s) to the previous command. See forge script --help for more.")?;
+                sh_println!(
+                    "\nSIMULATION COMPLETE. To broadcast these transactions, add --broadcast and wallet configuration(s) to the previous command. See forge script --help for more."
+                )?;
             }
-            return Ok(());
+            return Ok(None);
         }
 
         // Exit early if something is wrong with verification options.
         if bundled.args.verify {
             bundled.verify_preflight_check()?;
         }
+
+        Ok(Some(bundled))
+    }
+
+    async fn run_generic_script<FEN: FoundryEvmNetwork>(
+        self,
+        config: Config,
+        evm_opts: EvmOpts,
+    ) -> Result<()> {
+        let bundled = match self.prepare_bundled::<FEN>(config, evm_opts).await? {
+            Some(bundled) => bundled,
+            None => return Ok(()),
+        };
 
         // Wait for pending txes and broadcast others.
         let broadcasted = bundled.wait_for_pending().await?.broadcast().await?;
@@ -337,9 +452,13 @@ impl ScriptArgs {
         Ok(())
     }
 
-    /// In case the user has loaded *only* one private-key, we can assume that he's using it as the
-    /// `--sender`
+    /// In case the user has loaded *only* one private-key or a single remote signer (e.g.,
+    /// Turnkey), we can assume that they're using it as the `--sender`.
     fn maybe_load_private_key(&self) -> Result<Option<Address>> {
+        if let Some(turnkey_address) = self.wallets.turnkey_address() {
+            return Ok(Some(turnkey_address));
+        }
+
         let maybe_sender = self
             .wallets
             .private_keys()?
@@ -395,12 +514,17 @@ impl ScriptArgs {
     ///
     /// If `self.broadcast` is enabled, it asks confirmation of the user. Otherwise, it just warns
     /// the user.
-    fn check_contract_sizes(
+    fn check_contract_sizes<N: Network>(
         &self,
-        result: &ScriptResult,
+        result: &ScriptResult<N>,
         known_contracts: &ContractsByArtifact,
         create2_deployer: Address,
     ) -> Result<()> {
+        // If disable-code-size-limit flag is enabled then skip the size check
+        if self.disable_code_size_limit {
+            return Ok(());
+        }
+
         // (name, &init, &deployed)[]
         let mut bytecodes: Vec<(String, &[u8], &[u8])> = vec![];
 
@@ -423,7 +547,6 @@ impl ScriptArgs {
                 bytecodes.push((format!("Unknown{unknown_c}"), init_code, deployed_code));
                 unknown_c += 1;
             }
-            continue;
         }
 
         let mut prompt_user = false;
@@ -443,15 +566,13 @@ impl ScriptArgs {
             let mut offset = 0;
 
             // Find if it's a CREATE or CREATE2. Otherwise, skip transaction.
-            if let Some(TxKind::Call(to)) = to {
+            if let Some(to) = to {
                 if to == create2_deployer {
                     // Size of the salt prefix.
                     offset = 32;
                 } else {
                     continue;
                 }
-            } else if let Some(TxKind::Create) = to {
-                // Pass
             }
 
             // Find artifact with a deployment code same as the data.
@@ -470,9 +591,9 @@ impl ScriptArgs {
         }
 
         // Only prompt if we're broadcasting and we've not disabled interactivity.
-        if prompt_user &&
-            !self.non_interactive &&
-            !Confirm::new().with_prompt("Do you wish to continue?".to_string()).interact()?
+        if prompt_user
+            && !self.non_interactive
+            && !Confirm::new().with_prompt("Do you wish to continue?".to_string()).interact()?
         {
             eyre::bail!("User canceled the script.");
         }
@@ -480,9 +601,9 @@ impl ScriptArgs {
         Ok(())
     }
 
-    /// We only broadcast transactions if --broadcast or --resume was passed.
-    fn should_broadcast(&self) -> bool {
-        self.broadcast || self.resume
+    /// We only broadcast transactions if --broadcast, --resume, or --verify was passed.
+    const fn should_broadcast(&self) -> bool {
+        self.broadcast || self.resume || self.verify
     }
 }
 
@@ -493,26 +614,27 @@ impl Provider for ScriptArgs {
 
     fn data(&self) -> Result<Map<Profile, Dict>, figment::Error> {
         let mut dict = Dict::default();
-        if let Some(ref etherscan_api_key) =
+
+        if let Some(etherscan_api_key) =
             self.etherscan_api_key.as_ref().filter(|s| !s.trim().is_empty())
         {
             dict.insert(
                 "etherscan_api_key".to_string(),
-                figment::value::Value::from(etherscan_api_key.to_string()),
+                figment::value::Value::from(etherscan_api_key.clone()),
             );
         }
-        if let Some(api_version) = &self.etherscan_api_version {
-            dict.insert("etherscan_api_version".to_string(), api_version.to_string().into());
-        }
+
         if let Some(timeout) = self.timeout {
             dict.insert("transaction_timeout".to_string(), timeout.into());
         }
+
         Ok(Map::from([(Config::selected_profile(), dict)]))
     }
 }
 
-#[derive(Default, Serialize, Clone)]
-pub struct ScriptResult {
+#[derive(Serialize, Clone)]
+#[serde(bound = "")]
+pub struct ScriptResult<N: Network> {
     pub success: bool,
     #[serde(rename = "raw_logs")]
     pub logs: Vec<Log>,
@@ -520,24 +642,51 @@ pub struct ScriptResult {
     pub gas_used: u64,
     pub labeled_addresses: AddressHashMap<String>,
     #[serde(skip)]
-    pub transactions: Option<BroadcastableTransactions>,
+    pub transactions: Option<BroadcastableTransactions<N>>,
     pub returned: Bytes,
+    #[serde(skip)]
+    pub exit_reason: Option<InstructionResult>,
     pub address: Option<Address>,
     #[serde(skip)]
     pub breakpoints: Breakpoints,
 }
 
-impl ScriptResult {
-    pub fn get_created_contracts(&self) -> Vec<AdditionalContract> {
+impl<N: Network> Default for ScriptResult<N> {
+    fn default() -> Self {
+        Self {
+            success: Default::default(),
+            logs: Default::default(),
+            traces: Default::default(),
+            gas_used: Default::default(),
+            labeled_addresses: Default::default(),
+            transactions: Default::default(),
+            returned: Default::default(),
+            exit_reason: Default::default(),
+            address: Default::default(),
+            breakpoints: Default::default(),
+        }
+    }
+}
+
+impl<N: Network> ScriptResult<N> {
+    pub fn get_created_contracts(
+        &self,
+        known_contracts: &ContractsByArtifact,
+    ) -> Vec<AdditionalContract> {
         self.traces
             .iter()
             .flat_map(|(_, traces)| {
                 traces.nodes().iter().filter_map(|node| {
                     if node.trace.kind.is_any_create() {
+                        let init_code = node.trace.data.clone();
+                        let contract_name = known_contracts
+                            .find_by_creation_code(init_code.as_ref())
+                            .map(|artifact| artifact.0.name.clone());
                         return Some(AdditionalContract {
-                            opcode: node.trace.kind,
+                            call_kind: node.trace.kind,
                             address: node.trace.address,
-                            init_code: node.trace.data.clone(),
+                            contract_name,
+                            init_code,
                         });
                     }
                     None
@@ -548,24 +697,34 @@ impl ScriptResult {
 }
 
 #[derive(Serialize)]
-struct JsonResult<'a> {
+#[serde(bound = "")]
+struct JsonResult<'a, N: Network> {
     logs: Vec<String>,
     returns: &'a HashMap<String, NestedValue>,
     #[serde(flatten)]
-    result: &'a ScriptResult,
+    result: &'a ScriptResult<N>,
 }
 
 #[derive(Clone, Debug)]
-pub struct ScriptConfig {
+pub struct ScriptConfig<FEN: FoundryEvmNetwork> {
     pub config: Config,
     pub evm_opts: EvmOpts,
     pub sender_nonce: u64,
     /// Maps a rpc url to a backend
-    pub backends: HashMap<String, Backend>,
+    pub backends: HashMap<String, Backend<FEN>>,
+    /// Whether to batch all broadcast transactions into a single Tempo batch transaction.
+    pub batch: bool,
+    /// Tempo transaction options applied to broadcast transactions.
+    pub tempo: TempoOpts,
 }
 
-impl ScriptConfig {
-    pub async fn new(config: Config, evm_opts: EvmOpts) -> Result<Self> {
+impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
+    pub async fn new(
+        config: Config,
+        evm_opts: EvmOpts,
+        batch: bool,
+        tempo: TempoOpts,
+    ) -> Result<Self> {
         let sender_nonce = if let Some(fork_url) = evm_opts.fork_url.as_ref() {
             next_nonce(evm_opts.sender, fork_url, evm_opts.fork_block_number).await?
         } else {
@@ -573,7 +732,7 @@ impl ScriptConfig {
             1
         };
 
-        Ok(Self { config, evm_opts, sender_nonce, backends: HashMap::default() })
+        Ok(Self { config, evm_opts, sender_nonce, backends: HashMap::default(), batch, tempo })
     }
 
     pub async fn update_sender(&mut self, sender: Address) -> Result<()> {
@@ -587,7 +746,7 @@ impl ScriptConfig {
         Ok(())
     }
 
-    async fn get_runner(&mut self) -> Result<ScriptRunner> {
+    async fn get_runner(&mut self) -> Result<ScriptRunner<FEN>> {
         self._get_runner(None, false).await
     }
 
@@ -597,7 +756,7 @@ impl ScriptConfig {
         script_wallets: Wallets,
         debug: bool,
         target: ArtifactId,
-    ) -> Result<ScriptRunner> {
+    ) -> Result<ScriptRunner<FEN>> {
         self._get_runner(Some((known_contracts, script_wallets, target)), debug).await
     }
 
@@ -605,15 +764,16 @@ impl ScriptConfig {
         &mut self,
         cheats_data: Option<(ContractsByArtifact, Wallets, ArtifactId)>,
         debug: bool,
-    ) -> Result<ScriptRunner> {
+    ) -> Result<ScriptRunner<FEN>> {
         trace!("preparing script runner");
-        let env = self.evm_opts.evm_env().await?;
+        let (evm_env, mut tx_env, fork_block) = self.evm_opts.env::<_, _, TxEnvFor<FEN>>().await?;
 
         let db = if let Some(fork_url) = self.evm_opts.fork_url.as_ref() {
             match self.backends.get(fork_url) {
                 Some(db) => db.clone(),
                 None => {
-                    let fork = self.evm_opts.get_fork(&self.config, env.clone());
+                    let fork =
+                        self.evm_opts.get_fork(&self.config, evm_env.cfg_env.chain_id, fork_block);
                     let backend = Backend::spawn(fork)?;
                     self.backends.insert(fork_url.clone(), backend.clone());
                     backend
@@ -627,11 +787,12 @@ impl ScriptConfig {
         };
 
         // We need to enable tracing to decode contract names: local or external.
-        let mut builder = ExecutorBuilder::new()
+        let mut builder = ExecutorBuilder::default()
             .inspectors(|stack| {
                 stack
+                    .logs(self.config.live_logs)
                     .trace_mode(if debug { TraceMode::Debug } else { TraceMode::Call })
-                    .odyssey(self.evm_opts.odyssey)
+                    .networks(self.evm_opts.networks)
                     .create2_deployer(self.evm_opts.create2_deployer)
             })
             .spec_id(self.config.evm_spec_id())
@@ -647,6 +808,7 @@ impl ScriptConfig {
                             self.evm_opts.clone(),
                             Some(known_contracts),
                             Some(target),
+                            self.tempo.fee_token,
                         )
                         .into(),
                     )
@@ -655,13 +817,19 @@ impl ScriptConfig {
             });
         }
 
-        Ok(ScriptRunner::new(builder.build(env, db), self.evm_opts.clone()))
+        // Propagate fee token to the transaction environment so that internal EVM calls
+        // (e.g. script deployment, setUp) use the correct fee token for Tempo networks.
+        tx_env.set_fee_token(self.tempo.fee_token);
+
+        Ok(ScriptRunner::new(builder.build(evm_env, tx_env, db), self.evm_opts.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_network::Ethereum;
+    use alloy_primitives::address;
     use foundry_config::{NamedChain, UnresolvedEnvVarError};
     use std::fs;
     use tempfile::tempdir;
@@ -671,6 +839,50 @@ mod tests {
         let sig = "0x522bb704000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfFFb92266";
         let args = ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--sig", sig]);
         assert_eq!(args.sig, sig);
+    }
+
+    #[test]
+    fn can_parse_shared_tempo_opts() {
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--tempo.fee-token",
+            "1",
+            "--tempo.expires",
+            "10",
+        ]);
+
+        assert_eq!(
+            args.tempo.fee_token,
+            Some(address!("0x20C0000000000000000000000000000000000001"))
+        );
+        assert_eq!(args.tempo.expires, Some(10));
+    }
+
+    #[test]
+    fn can_parse_sponsor_tempo_opts() {
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--tempo.sponsor",
+            "0x1111111111111111111111111111111111111111",
+            "--tempo.sponsor-signer",
+            "env://TEMPO_SPONSOR_PK",
+        ]);
+
+        assert_eq!(
+            args.tempo.sponsor,
+            Some(address!("0x1111111111111111111111111111111111111111"))
+        );
+        assert_eq!(args.tempo.sponsor_signer.as_deref(), Some("env://TEMPO_SPONSOR_PK"));
+    }
+
+    #[test]
+    fn can_parse_full_tempo_opts() {
+        let args =
+            ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--tempo.nonce-key", "1"]);
+
+        assert_eq!(args.tempo.nonce_key, Some(U256::from(1)));
     }
 
     #[test]
@@ -692,7 +904,7 @@ mod tests {
             "0x4e59b44847b379578588920ca78fbf26c0b4956c",
             "--unlocked",
             "--private-key",
-            key.to_string().as_str(),
+            &key.to_string(),
         ]);
         assert!(args.is_err());
     }
@@ -707,6 +919,18 @@ mod tests {
         ]);
         let config = args.load_config().unwrap();
         assert_eq!(config.etherscan_api_key, Some("goerli".to_string()));
+    }
+
+    #[test]
+    fn can_disable_code_size_limit() {
+        let args =
+            ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--disable-code-size-limit"]);
+        assert!(args.disable_code_size_limit);
+
+        let result = ScriptResult::<Ethereum>::default();
+        let contracts = ContractsByArtifact::default();
+        let create = Address::ZERO;
+        assert!(args.check_contract_sizes(&result, &contracts, create).is_ok());
     }
 
     #[test]
@@ -753,10 +977,10 @@ mod tests {
 
         let config = r#"
                 [profile.default]
-                etherscan_api_key = "mumbai"
+                etherscan_api_key = "amoy"
 
                 [etherscan]
-                mumbai = { key = "https://etherscan-mumbai.com/" }
+                amoy = { key = "https://etherscan-amoy.com/" }
             "#;
 
         let toml_file = root.join(Config::FILE_NAME);
@@ -765,14 +989,14 @@ mod tests {
             "foundry-cli",
             "Contract.sol",
             "--etherscan-api-key",
-            "mumbai",
+            "amoy",
             "--root",
             root.as_os_str().to_str().unwrap(),
         ]);
 
         let config = args.load_config().unwrap();
-        let mumbai = config.get_etherscan_api_key(Some(NamedChain::PolygonMumbai.into()));
-        assert_eq!(mumbai, Some("https://etherscan-mumbai.com/".to_string()));
+        let amoy = config.get_etherscan_api_key(Some(NamedChain::PolygonAmoy.into()));
+        assert_eq!(amoy, Some("https://etherscan-amoy.com/".to_string()));
     }
 
     #[test]
@@ -784,7 +1008,7 @@ mod tests {
                 [profile.default]
 
                 [rpc_endpoints]
-                polygonMumbai = "https://polygon-mumbai.g.alchemy.com/v2/${_CAN_EXTRACT_RPC_ALIAS}"
+                polygonAmoy = "https://polygon-amoy.g.alchemy.com/v2/${_CAN_EXTRACT_RPC_ALIAS}"
             "#;
 
         let toml_file = root.join(Config::FILE_NAME);
@@ -793,7 +1017,7 @@ mod tests {
             "foundry-cli",
             "DeployV1",
             "--rpc-url",
-            "polygonMumbai",
+            "polygonAmoy",
             "--root",
             root.as_os_str().to_str().unwrap(),
         ]);
@@ -802,12 +1026,14 @@ mod tests {
 
         assert!(err.downcast::<UnresolvedEnvVarError>().is_ok());
 
-        std::env::set_var("_CAN_EXTRACT_RPC_ALIAS", "123456");
+        unsafe {
+            std::env::set_var("_CAN_EXTRACT_RPC_ALIAS", "123456");
+        }
         let (config, evm_opts) = args.load_config_and_evm_opts().unwrap();
-        assert_eq!(config.eth_rpc_url, Some("polygonMumbai".to_string()));
+        assert_eq!(config.eth_rpc_url, Some("polygonAmoy".to_string()));
         assert_eq!(
             evm_opts.fork_url,
-            Some("https://polygon-mumbai.g.alchemy.com/v2/123456".to_string())
+            Some("https://polygon-amoy.g.alchemy.com/v2/123456".to_string())
         );
     }
 
@@ -820,10 +1046,10 @@ mod tests {
             [profile.default]
 
             [rpc_endpoints]
-            mumbai = "https://polygon-mumbai.g.alchemy.com/v2/${_EXTRACT_RPC_ALIAS}"
+            amoy = "https://polygon-amoy.g.alchemy.com/v2/${_EXTRACT_RPC_ALIAS}"
 
             [etherscan]
-            mumbai = { key = "${_POLYSCAN_API_KEY}", chain = 80001, url = "https://api-testnet.polygonscan.com/" }
+            amoy = { key = "${_ETHERSCAN_API_KEY}", chain = 80002, url = "https://amoy.polygonscan.com/" }
         "#;
 
         let toml_file = root.join(Config::FILE_NAME);
@@ -832,9 +1058,9 @@ mod tests {
             "foundry-cli",
             "DeployV1",
             "--rpc-url",
-            "mumbai",
+            "amoy",
             "--etherscan-api-key",
-            "mumbai",
+            "amoy",
             "--root",
             root.as_os_str().to_str().unwrap(),
         ]);
@@ -842,18 +1068,22 @@ mod tests {
 
         assert!(err.downcast::<UnresolvedEnvVarError>().is_ok());
 
-        std::env::set_var("_EXTRACT_RPC_ALIAS", "123456");
-        std::env::set_var("_POLYSCAN_API_KEY", "polygonkey");
+        unsafe {
+            std::env::set_var("_EXTRACT_RPC_ALIAS", "123456");
+        }
+        unsafe {
+            std::env::set_var("_ETHERSCAN_API_KEY", "etherscan_api_key");
+        }
         let (config, evm_opts) = args.load_config_and_evm_opts().unwrap();
-        assert_eq!(config.eth_rpc_url, Some("mumbai".to_string()));
+        assert_eq!(config.eth_rpc_url, Some("amoy".to_string()));
         assert_eq!(
             evm_opts.fork_url,
-            Some("https://polygon-mumbai.g.alchemy.com/v2/123456".to_string())
+            Some("https://polygon-amoy.g.alchemy.com/v2/123456".to_string())
         );
-        let etherscan = config.get_etherscan_api_key(Some(80001u64.into()));
-        assert_eq!(etherscan, Some("polygonkey".to_string()));
+        let etherscan = config.get_etherscan_api_key(Some(80002u64.into()));
+        assert_eq!(etherscan, Some("etherscan_api_key".to_string()));
         let etherscan = config.get_etherscan_api_key(None);
-        assert_eq!(etherscan, Some("polygonkey".to_string()));
+        assert_eq!(etherscan, Some("etherscan_api_key".to_string()));
     }
 
     #[test]
@@ -865,10 +1095,10 @@ mod tests {
                 [profile.default]
 
                [rpc_endpoints]
-                mumbai = "https://polygon-mumbai.g.alchemy.com/v2/${_SOLE_EXTRACT_RPC_ALIAS}"
+                amoy = "https://polygon-amoy.g.alchemy.com/v2/${_SOLE_EXTRACT_RPC_ALIAS}"
 
                 [etherscan]
-                mumbai = { key = "${_SOLE_POLYSCAN_API_KEY}" }
+                amoy = { key = "${_SOLE_ETHERSCAN_API_KEY}" }
             "#;
 
         let toml_file = root.join(Config::FILE_NAME);
@@ -877,7 +1107,7 @@ mod tests {
             "foundry-cli",
             "DeployV1",
             "--rpc-url",
-            "mumbai",
+            "amoy",
             "--root",
             root.as_os_str().to_str().unwrap(),
         ]);
@@ -885,17 +1115,21 @@ mod tests {
 
         assert!(err.downcast::<UnresolvedEnvVarError>().is_ok());
 
-        std::env::set_var("_SOLE_EXTRACT_RPC_ALIAS", "123456");
-        std::env::set_var("_SOLE_POLYSCAN_API_KEY", "polygonkey");
+        unsafe {
+            std::env::set_var("_SOLE_EXTRACT_RPC_ALIAS", "123456");
+        }
+        unsafe {
+            std::env::set_var("_SOLE_ETHERSCAN_API_KEY", "etherscan_api_key");
+        }
         let (config, evm_opts) = args.load_config_and_evm_opts().unwrap();
         assert_eq!(
             evm_opts.fork_url,
-            Some("https://polygon-mumbai.g.alchemy.com/v2/123456".to_string())
+            Some("https://polygon-amoy.g.alchemy.com/v2/123456".to_string())
         );
-        let etherscan = config.get_etherscan_api_key(Some(80001u64.into()));
-        assert_eq!(etherscan, Some("polygonkey".to_string()));
+        let etherscan = config.get_etherscan_api_key(Some(80002u64.into()));
+        assert_eq!(etherscan, Some("etherscan_api_key".to_string()));
         let etherscan = config.get_etherscan_api_key(None);
-        assert_eq!(etherscan, Some("polygonkey".to_string()));
+        assert_eq!(etherscan, Some("etherscan_api_key".to_string()));
     }
 
     // <https://github.com/foundry-rs/foundry/issues/5923>
@@ -917,5 +1151,20 @@ mod tests {
             "SolveTutorial",
         ]);
         assert!(args.with_gas_price.unwrap().is_zero());
+    }
+
+    #[test]
+    fn test_priority_gas_price_cannot_exceed_gas_price() {
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "--broadcast",
+            "--with-gas-price",
+            "100",
+            "--priority-gas-price",
+            "200",
+            "Script",
+        ]);
+        // priority (200) > max_fee (100) — broadcast should reject this at runtime
+        assert!(args.priority_gas_price.unwrap() > args.with_gas_price.unwrap());
     }
 }

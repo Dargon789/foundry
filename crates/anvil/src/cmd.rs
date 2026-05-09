@@ -1,32 +1,37 @@
 use crate::{
-    config::{ForkChoice, DEFAULT_MNEMONIC},
-    eth::{backend::db::SerializableState, pool::transactions::TransactionOrder, EthApi},
-    AccountGenerator, EthereumHardfork, NodeConfig, CHAIN_ID,
+    AccountGenerator, CHAIN_ID, NodeConfig,
+    config::{DEFAULT_MNEMONIC, ForkChoice},
+    eth::{EthApi, backend::db::SerializableState, pool::transactions::TransactionOrder},
 };
 use alloy_genesis::Genesis;
-use alloy_op_hardforks::OpHardfork;
-use alloy_primitives::{utils::Unit, B256, U256};
+use alloy_network::Network;
+use alloy_primitives::{Address, B256, U256, map::HashMap, utils::Unit};
 use alloy_signer_local::coins_bip39::{English, Mnemonic};
 use anvil_server::ServerConfig;
 use clap::Parser;
 use core::fmt;
 use foundry_common::shell;
 use foundry_config::{Chain, Config, FigmentProviders};
+#[cfg(feature = "optimism")]
+use foundry_evm::hardfork::OpHardfork;
+use foundry_evm::hardfork::{EthereumHardfork, FoundryHardfork};
+use foundry_evm_networks::NetworkConfigs;
+use foundry_primitives::FoundryReceiptEnvelope;
 use futures::FutureExt;
-use rand_08::{rngs::StdRng, SeedableRng};
+use rand_08::{SeedableRng, rngs::StdRng};
 use std::{
-    future::Future,
     net::IpAddr,
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
 };
+use tempo_chainspec::hardfork::TempoHardfork;
 use tokio::time::{Instant, Interval};
 
 #[derive(Clone, Debug, Parser)]
@@ -100,7 +105,7 @@ pub struct NodeArgs {
     #[arg(long, visible_alias = "no-mine", conflicts_with = "block_time")]
     pub no_mining: bool,
 
-    #[arg(long, visible_alias = "mixed-mining", requires = "block_time")]
+    #[arg(long, requires = "block_time")]
     pub mixed_mining: bool,
 
     /// The hosts the server will listen on.
@@ -168,6 +173,13 @@ pub struct NodeArgs {
     )]
     pub load_state: Option<SerializableState>,
 
+    /// Fund specific accounts with custom balances on startup.
+    ///
+    /// Accepts multiple address:balance pairs where balance is in ETH.
+    /// Example: --fund-accounts 0x1234...5678:1000 0xabcd...ef01:5000
+    #[arg(long, value_name = "ADDRESS:AMOUNT", value_delimiter = ' ', num_args = 1..)]
+    pub fund_accounts: Vec<String>,
+
     #[arg(long, help = IPC_HELP, value_name = "PATH", visible_alias = "ipcpath")]
     pub ipc: Option<Option<String>>,
 
@@ -188,13 +200,21 @@ pub struct NodeArgs {
     #[arg(long)]
     pub transaction_block_keeper: Option<usize>,
 
+    /// Maximum number of transactions in a block.
+    #[arg(long)]
+    pub max_transactions: Option<usize>,
+
     #[command(flatten)]
     pub evm: AnvilEvmArgs,
 
     #[command(flatten)]
     pub server_config: ServerConfig,
 
-    /// Path to the cache directory where states are stored.    
+    /// Path to the cache directory where persisted states are stored (see
+    /// `--max-persisted-states`).
+    ///
+    /// Note: This does not affect the fork RPC cache location (`storage.json`), which is stored in
+    /// `~/.foundry/cache/rpc/<chain>/<block>/`.
     #[arg(long, value_name = "PATH")]
     pub cache_path: Option<PathBuf>,
 }
@@ -216,20 +236,29 @@ impl NodeArgs {
         let compute_units_per_second =
             if self.evm.no_rate_limit { Some(u64::MAX) } else { self.evm.compute_units_per_second };
 
-        let hardfork = match &self.hardfork {
-            Some(hf) => {
-                if self.evm.optimism {
-                    Some(OpHardfork::from_str(hf)?.into())
-                } else {
-                    Some(EthereumHardfork::from_str(hf)?.into())
+        // Validate that secondary fork URLs don't have conflicting block number suffixes
+        if self.evm.fork_url.len() > 1 {
+            for fork in &self.evm.fork_url[1..] {
+                if fork.block.is_some() {
+                    eyre::bail!(
+                        "Block number suffixes (@block) on secondary --fork-url values are not supported. \
+                         Use --fork-block-number to set the fork block for all endpoints."
+                    );
                 }
             }
+        }
+
+        let funded_accounts = self.parse_funded_accounts()?;
+
+        let hardfork = match &self.hardfork {
+            Some(hf) => Some(parse_hardfork(hf, &self.evm.networks)?),
             None => None,
         };
 
         Ok(NodeConfig::default()
             .with_gas_limit(self.evm.gas_limit)
             .disable_block_gas_limit(self.evm.disable_block_gas_limit)
+            .enable_tx_gas_limit(self.evm.enable_tx_gas_limit)
             .with_gas_price(self.evm.gas_price)
             .with_hardfork(hardfork)
             .with_blocktime(self.block_time)
@@ -246,7 +275,7 @@ impl NodeArgs {
                 _ => self
                     .evm
                     .fork_url
-                    .as_ref()
+                    .first()
                     .and_then(|f| f.block)
                     .map(|num| ForkChoice::Block(num as i128)),
             })
@@ -256,10 +285,10 @@ impl NodeArgs {
             .fork_request_retries(self.evm.fork_request_retries)
             .fork_retry_backoff(self.evm.fork_retry_backoff.map(Duration::from_millis))
             .fork_compute_units_per_second(compute_units_per_second)
-            .with_eth_rpc_url(self.evm.fork_url.map(|fork| fork.url))
+            .with_fork_urls(self.evm.fork_url.into_iter().map(|f| f.url).collect())
             .with_base_fee(self.evm.block_base_fee_per_gas)
             .disable_min_priority_fee(self.evm.disable_min_priority_fee)
-            .with_storage_caching(self.evm.no_storage_caching)
+            .with_no_storage_caching(self.evm.no_storage_caching)
             .with_server_config(self.server_config)
             .with_host(self.host)
             .set_silent(shell::is_quiet())
@@ -277,37 +306,68 @@ impl NodeArgs {
             .set_pruned_history(self.prune_history)
             .with_init_state(self.load_state.or_else(|| self.state.and_then(|s| s.state)))
             .with_transaction_block_keeper(self.transaction_block_keeper)
+            .with_max_transactions(self.max_transactions)
             .with_max_persisted_states(self.max_persisted_states)
-            .with_optimism(self.evm.optimism)
-            .with_odyssey(self.evm.odyssey)
+            .with_networks(self.evm.networks)
             .with_disable_default_create2_deployer(self.evm.disable_default_create2_deployer)
+            .with_disable_pool_balance_checks(self.evm.disable_pool_balance_checks)
             .with_slots_in_an_epoch(self.slots_in_an_epoch)
             .with_memory_limit(self.evm.memory_limit)
-            .with_cache_path(self.cache_path))
+            .with_cache_path(self.cache_path)
+            .with_funded_accounts(funded_accounts))
+    }
+
+    fn parse_funded_accounts(&self) -> eyre::Result<HashMap<Address, U256>> {
+        let mut accounts = HashMap::default();
+        for entry in &self.fund_accounts {
+            let parts: Vec<&str> = entry.split(':').collect();
+            if parts.len() != 2 {
+                eyre::bail!(
+                    "Invalid fund-accounts entry '{}'. Expected format: ADDRESS:AMOUNT",
+                    entry
+                );
+            }
+            let address = parts[0]
+                .parse::<Address>()
+                .map_err(|e| eyre::eyre!("Invalid address '{}': {}", parts[0], e))?;
+            let amount: u64 = parts[1]
+                .parse()
+                .map_err(|e| eyre::eyre!("Invalid amount '{}': {}", parts[1], e))?;
+            let balance = Unit::ETHER.wei().saturating_mul(U256::from(amount));
+            accounts.insert(address, balance);
+        }
+        Ok(accounts)
     }
 
     fn account_generator(&self) -> AccountGenerator {
-        let mut gen = AccountGenerator::new(self.accounts as usize)
+        let mut generator = AccountGenerator::new(self.accounts as usize)
             .phrase(DEFAULT_MNEMONIC)
             .chain_id(self.evm.chain_id.unwrap_or(CHAIN_ID.into()));
         if let Some(ref mnemonic) = self.mnemonic {
-            gen = gen.phrase(mnemonic);
+            generator = generator.phrase(mnemonic);
         } else if let Some(count) = self.mnemonic_random {
             let mut rng = rand_08::thread_rng();
             let mnemonic = match Mnemonic::<English>::new_with_count(&mut rng, count) {
                 Ok(mnemonic) => mnemonic.to_phrase(),
-                Err(_) => DEFAULT_MNEMONIC.to_string(),
+                Err(err) => {
+                    warn!(target: "node", ?count, %err, "failed to generate mnemonic, falling back to 12-word random mnemonic");
+                    // Fallback: generate a valid 12-word random mnemonic instead of using
+                    // DEFAULT_MNEMONIC
+                    Mnemonic::<English>::new_with_count(&mut rng, 12)
+                        .expect("valid default word count")
+                        .to_phrase()
+                }
             };
-            gen = gen.phrase(mnemonic);
+            generator = generator.phrase(mnemonic);
         } else if let Some(seed) = self.mnemonic_seed {
             let mut seed = StdRng::seed_from_u64(seed);
             let mnemonic = Mnemonic::<English>::new(&mut seed).to_phrase();
-            gen = gen.phrase(mnemonic);
+            generator = generator.phrase(mnemonic);
         }
         if let Some(ref derivation) = self.derivation_path {
-            gen = gen.derivation_path(derivation);
+            generator = generator.derivation_path(derivation);
         }
-        gen
+        generator
     }
 
     /// Returns the location where to dump the state to.
@@ -404,6 +464,10 @@ pub struct AnvilEvmArgs {
     /// Fetch state over a remote endpoint instead of starting from an empty state.
     ///
     /// If you want to fetch state from a specific block number, add a block number like `http://localhost:8545@1400000` or use the `--fork-block-number` argument.
+    ///
+    /// Multiple `--fork-url` flags can be provided to distribute requests across endpoints
+    /// using round-robin load balancing. On failure, the retry layer rotates to the next
+    /// endpoint.
     #[arg(
         long,
         short,
@@ -411,7 +475,7 @@ pub struct AnvilEvmArgs {
         value_name = "URL",
         help_heading = "Fork config"
     )]
-    pub fork_url: Option<ForkUrl>,
+    pub fork_url: Vec<ForkUrl>,
 
     /// Headers to use for the rpc client, e.g. "User-Agent: test-agent"
     ///
@@ -450,7 +514,7 @@ pub struct AnvilEvmArgs {
     )]
     pub fork_block_number: Option<i128>,
 
-    /// Fetch state from a specific transaction hash over a remote endpoint.
+    /// Fetch state from after a specific transaction hash has been applied over a remote endpoint.
     ///
     /// See --fork-url.
     #[arg(
@@ -533,6 +597,10 @@ pub struct AnvilEvmArgs {
     )]
     pub disable_block_gas_limit: bool,
 
+    /// Enable the transaction gas limit check as imposed by EIP-7825 (Osaka hardfork).
+    #[arg(long, visible_alias = "tx-gas-limit", help_heading = "Environment config")]
+    pub enable_tx_gas_limit: bool,
+
     /// EIP-170: Contract code size limit in bytes. Useful to increase this because of tests. To
     /// disable entirely, use `--disable-code-size-limit`. By default, it is 0x6000 (~25kb).
     #[arg(long, value_name = "CODE_SIZE", help_heading = "Environment config")]
@@ -585,50 +653,80 @@ pub struct AnvilEvmArgs {
     #[arg(long, visible_alias = "auto-unlock")]
     pub auto_impersonate: bool,
 
-    /// Run an Optimism chain
-    #[arg(long, visible_alias = "optimism")]
-    pub optimism: bool,
-
     /// Disable the default create2 deployer
     #[arg(long, visible_alias = "no-create2")]
     pub disable_default_create2_deployer: bool,
+
+    /// Disable pool balance checks
+    #[arg(long)]
+    pub disable_pool_balance_checks: bool,
 
     /// The memory limit per EVM execution in bytes.
     #[arg(long)]
     pub memory_limit: Option<u64>,
 
-    /// Enable Odyssey features
-    #[arg(long, alias = "alphanet")]
-    pub odyssey: bool,
+    #[command(flatten)]
+    pub networks: NetworkConfigs,
 }
 
 /// Resolves an alias passed as fork-url to the matching url defined in the rpc_endpoints section
 /// of the project configuration file.
 /// Does nothing if the fork-url is not a configured alias.
+///
+/// When an alias maps to an `RpcEndpoint` with multiple `endpoints`, all URLs are expanded
+/// into additional `--fork-url` entries for multi-endpoint load balancing.
 impl AnvilEvmArgs {
     pub fn resolve_rpc_alias(&mut self) {
-        if let Some(fork_url) = &self.fork_url {
-            if let Ok(config) = Config::load_with_providers(FigmentProviders::Anvil) {
-                if let Some(Ok(url)) = config.get_rpc_url_with_alias(&fork_url.url) {
-                    self.fork_url = Some(ForkUrl { url: url.to_string(), block: fork_url.block });
+        if let Ok(config) = Config::load_with_providers(FigmentProviders::Anvil) {
+            let mut resolved_urls = Vec::new();
+            for fork_url in &self.fork_url {
+                let mut endpoints = config.rpc_endpoints.clone().resolved();
+                if let Some(endpoint) = endpoints.remove(&fork_url.url) {
+                    // Alias matched — expand all URLs from the endpoint config
+                    match endpoint.all_urls() {
+                        Ok(urls) => {
+                            for (i, url) in urls.into_iter().enumerate() {
+                                resolved_urls.push(ForkUrl {
+                                    url,
+                                    // Only the first URL inherits the block suffix
+                                    block: if i == 0 { fork_url.block } else { None },
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(target: "node", alias=%fork_url.url, %e, "could not resolve all endpoints, using primary endpoint only");
+                            if let Ok(url) = endpoint.url() {
+                                resolved_urls.push(ForkUrl { url, block: fork_url.block });
+                            } else {
+                                resolved_urls.push(fork_url.clone());
+                            }
+                        }
+                    }
+                } else if let Some(Ok(url)) = config.get_rpc_url_with_alias(&fork_url.url) {
+                    // Try mesc or other resolution
+                    resolved_urls.push(ForkUrl { url: url.to_string(), block: fork_url.block });
+                } else {
+                    // Not an alias — keep as-is
+                    resolved_urls.push(fork_url.clone());
                 }
             }
+            self.fork_url = resolved_urls;
         }
     }
 }
 
 /// Helper type to periodically dump the state of the chain to disk
-struct PeriodicStateDumper {
+struct PeriodicStateDumper<N: Network> {
     in_progress_dump: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>>,
-    api: EthApi,
+    api: EthApi<N>,
     dump_state: Option<PathBuf>,
     preserve_historical_states: bool,
     interval: Interval,
 }
 
-impl PeriodicStateDumper {
+impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> PeriodicStateDumper<N> {
     fn new(
-        api: EthApi,
+        api: EthApi<N>,
         dump_state: Option<PathBuf>,
         interval: Duration,
         preserve_historical_states: bool,
@@ -652,7 +750,7 @@ impl PeriodicStateDumper {
     }
 
     /// Infallible state dump
-    async fn dump_state(api: EthApi, dump_state: PathBuf, preserve_historical_states: bool) {
+    async fn dump_state(api: EthApi<N>, dump_state: PathBuf, preserve_historical_states: bool) {
         trace!(path=?dump_state, "Dumping state on shutdown");
         match api.serialized_state(preserve_historical_states).await {
             Ok(state) => {
@@ -670,13 +768,13 @@ impl PeriodicStateDumper {
 }
 
 // An endless future that periodically dumps the state to disk if configured.
-impl Future for PeriodicStateDumper {
+impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Future for PeriodicStateDumper<N> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.dump_state.is_none() {
-            return Poll::Pending
+            return Poll::Pending;
         }
 
         loop {
@@ -687,7 +785,7 @@ impl Future for PeriodicStateDumper {
                     }
                     Poll::Pending => {
                         this.in_progress_dump = Some(flush);
-                        return Poll::Pending
+                        return Poll::Pending;
                     }
                 }
             }
@@ -698,7 +796,7 @@ impl Future for PeriodicStateDumper {
                 this.in_progress_dump =
                     Some(Box::pin(Self::dump_state(api, path, this.preserve_historical_states)));
             } else {
-                break
+                break;
             }
         }
 
@@ -728,7 +826,7 @@ impl StateFile {
         }
         let mut state = Self { path, state: None };
         if !state.path.exists() {
-            return Ok(state)
+            return Ok(state);
         }
 
         state.state = Some(SerializableState::load(&state.path).map_err(|err| err.to_string())?);
@@ -763,17 +861,30 @@ impl FromStr for ForkUrl {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some((url, block)) = s.rsplit_once('@') {
             if block == "latest" {
-                return Ok(Self { url: url.to_string(), block: None })
+                return Ok(Self { url: url.to_string(), block: None });
             }
             // this will prevent false positives for auths `user:password@example.com`
             if !block.is_empty() && !block.contains(':') && !block.contains('.') {
                 let block: u64 = block
                     .parse()
                     .map_err(|_| format!("Failed to parse block number: `{block}`"))?;
-                return Ok(Self { url: url.to_string(), block: Some(block) })
+                return Ok(Self { url: url.to_string(), block: Some(block) });
             }
         }
         Ok(Self { url: s.to_string(), block: None })
+    }
+}
+
+/// Parses a hardfork string against the active network configuration.
+fn parse_hardfork(hf: &str, networks: &NetworkConfigs) -> eyre::Result<FoundryHardfork> {
+    #[cfg(feature = "optimism")]
+    if networks.is_optimism() {
+        return Ok(OpHardfork::from_str(hf)?.into());
+    }
+    if networks.is_tempo() {
+        Ok(TempoHardfork::from_str(hf)?.into())
+    } else {
+        Ok(EthereumHardfork::from_str(hf)?.into())
     }
 }
 
@@ -887,6 +998,16 @@ mod tests {
     }
 
     #[test]
+    fn can_parse_enable_tx_gas_limit() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--enable-tx-gas-limit"]);
+        assert!(args.evm.enable_tx_gas_limit);
+
+        // Also test the alias
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--tx-gas-limit"]);
+        assert!(args.evm.enable_tx_gas_limit);
+    }
+
+    #[test]
     fn can_parse_disable_code_size_limit() {
         let args: NodeArgs = NodeArgs::parse_from(["anvil", "--disable-code-size-limit"]);
         assert!(args.evm.disable_code_size_limit);
@@ -920,15 +1041,76 @@ mod tests {
             ["::1", "1.1.1.1", "2.2.2.2"].map(|ip| ip.parse::<IpAddr>().unwrap()).to_vec()
         );
 
-        env::set_var("ANVIL_IP_ADDR", "1.1.1.1");
+        unsafe { env::set_var("ANVIL_IP_ADDR", "1.1.1.1") };
         let args = NodeArgs::parse_from(["anvil"]);
         assert_eq!(args.host, vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
 
-        env::set_var("ANVIL_IP_ADDR", "::1,1.1.1.1,2.2.2.2");
+        unsafe { env::set_var("ANVIL_IP_ADDR", "::1,1.1.1.1,2.2.2.2") };
         let args = NodeArgs::parse_from(["anvil"]);
         assert_eq!(
             args.host,
             ["::1", "1.1.1.1", "2.2.2.2"].map(|ip| ip.parse::<IpAddr>().unwrap()).to_vec()
         );
+    }
+
+    #[test]
+    fn can_parse_multiple_fork_urls() {
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http://localhost:8545",
+            "--fork-url",
+            "http://localhost:8546",
+            "--fork-url",
+            "http://localhost:8547",
+        ]);
+        assert_eq!(args.evm.fork_url.len(), 3);
+        assert_eq!(args.evm.fork_url[0].url, "http://localhost:8545");
+        assert_eq!(args.evm.fork_url[1].url, "http://localhost:8546");
+        assert_eq!(args.evm.fork_url[2].url, "http://localhost:8547");
+
+        // Block suffix on first URL should work
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http://localhost:8545@1000000",
+            "--fork-url",
+            "http://localhost:8546",
+        ]);
+        assert_eq!(args.evm.fork_url[0].block, Some(1000000));
+        assert_eq!(args.evm.fork_url[1].block, None);
+    }
+
+    #[test]
+    fn rejects_block_suffix_on_secondary_fork_urls() {
+        let args: NodeArgs = NodeArgs::parse_from([
+            "anvil",
+            "--fork-url",
+            "http://localhost:8545@1000000",
+            "--fork-url",
+            "http://localhost:8546@2000000",
+        ]);
+        let result = args.into_node_config();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Block number suffixes"),
+            "should reject block suffix on secondary fork URL"
+        );
+    }
+
+    #[test]
+    fn fork_dependent_args_require_fork_url() {
+        // All these args have `requires = "fork_url"` — they should fail without --fork-url
+        let cases = [
+            vec!["anvil", "--fork-header", "X-Api-Key: test"],
+            vec!["anvil", "--timeout", "5000"],
+            vec!["anvil", "--retries", "3"],
+            vec!["anvil", "--fork-block-number", "100"],
+            vec!["anvil", "--fork-retry-backoff", "500"],
+        ];
+        for args in &cases {
+            let result = NodeArgs::try_parse_from(args);
+            assert!(result.is_err(), "expected error when using {:?} without --fork-url", args[1]);
+        }
     }
 }

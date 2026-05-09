@@ -1,21 +1,23 @@
 use super::ScriptResult;
+use crate::build::LinkedBuildData;
 use alloy_dyn_abi::JsonAbiExt;
-use alloy_primitives::{hex, Address, TxKind, B256};
+use alloy_network::{Network, TransactionBuilder};
+use alloy_primitives::{Address, B256, hex};
 use eyre::Result;
 use forge_script_sequence::TransactionWithMetadata;
-use foundry_common::{fmt::format_token_raw, ContractData, TransactionMaybeSigned, SELECTOR_LEN};
+use foundry_common::{ContractData, SELECTOR_LEN, TransactionMaybeSigned, fmt::format_token_raw};
 use foundry_evm::traces::CallTraceDecoder;
 use itertools::Itertools;
 use revm_inspectors::tracing::types::CallKind;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
-pub struct ScriptTransactionBuilder {
-    transaction: TransactionWithMetadata,
+pub struct ScriptTransactionBuilder<N: Network> {
+    transaction: TransactionWithMetadata<N>,
 }
 
-impl ScriptTransactionBuilder {
-    pub fn new(transaction: TransactionMaybeSigned, rpc: String) -> Self {
+impl<N: Network> ScriptTransactionBuilder<N> {
+    pub fn new(transaction: TransactionMaybeSigned<N>, rpc: String) -> Self {
         let mut transaction = TransactionWithMetadata::from_tx_request(transaction);
         transaction.rpc = rpc;
         // If tx.gas is already set that means it was specified in script
@@ -31,7 +33,7 @@ impl ScriptTransactionBuilder {
         decoder: &CallTraceDecoder,
         create2_deployer: Address,
     ) -> Result<()> {
-        if let Some(TxKind::Call(to)) = self.transaction.transaction.to() {
+        if let Some(to) = self.transaction.transaction.to() {
             if to == create2_deployer {
                 if let Some(input) = self.transaction.transaction.input() {
                     let (salt, init_code) = input.split_at(32);
@@ -43,7 +45,7 @@ impl ScriptTransactionBuilder {
                     )?;
                 }
             } else {
-                self.transaction.opcode = CallKind::Call;
+                self.transaction.call_kind = CallKind::Call;
                 self.transaction.contract_address = Some(to);
 
                 let Some(data) = self.transaction.transaction.input() else { return Ok(()) };
@@ -95,9 +97,9 @@ impl ScriptTransactionBuilder {
         contracts: &BTreeMap<Address, &ContractData>,
     ) -> Result<()> {
         if is_create2 {
-            self.transaction.opcode = CallKind::Create2;
+            self.transaction.call_kind = CallKind::Create2;
         } else {
-            self.transaction.opcode = CallKind::Create;
+            self.transaction.call_kind = CallKind::Create;
         }
 
         let info = contracts.get(&address);
@@ -111,7 +113,7 @@ impl ScriptTransactionBuilder {
         // `create2` transactions are prefixed by a 32 byte salt.
         let creation_code = if is_create2 {
             if data.len() < 32 {
-                return Ok(())
+                return Ok(());
             }
             &data[32..]
         } else {
@@ -144,10 +146,12 @@ impl ScriptTransactionBuilder {
     /// Populates additional data from the transaction execution result.
     pub fn with_execution_result(
         mut self,
-        result: &ScriptResult,
+        result: &ScriptResult<N>,
         gas_estimate_multiplier: u64,
+        linked_build_data: &LinkedBuildData,
     ) -> Self {
-        let mut created_contracts = result.get_created_contracts();
+        let mut created_contracts =
+            result.get_created_contracts(&linked_build_data.known_contracts);
 
         // Add the additional contracts created in this transaction, so we can verify them later.
         created_contracts.retain(|contract| {
@@ -157,23 +161,23 @@ impl ScriptTransactionBuilder {
 
         self.transaction.additional_contracts = created_contracts;
 
-        if !self.transaction.is_fixed_gas_limit {
-            if let Some(unsigned) = self.transaction.transaction.as_unsigned_mut() {
-                // We inflate the gas used by the user specified percentage
-                unsigned.gas = Some(result.gas_used * gas_estimate_multiplier / 100);
-            }
+        if !self.transaction.is_fixed_gas_limit
+            && let Some(unsigned) = self.transaction.transaction.as_unsigned_mut()
+        {
+            // We inflate the gas used by the user specified percentage
+            unsigned.set_gas_limit(result.gas_used * gas_estimate_multiplier / 100);
         }
 
         self
     }
 
-    pub fn build(self) -> TransactionWithMetadata {
+    pub fn build(self) -> TransactionWithMetadata<N> {
         self.transaction
     }
 }
 
-impl From<TransactionWithMetadata> for ScriptTransactionBuilder {
-    fn from(transaction: TransactionWithMetadata) -> Self {
+impl<N: Network> From<TransactionWithMetadata<N>> for ScriptTransactionBuilder<N> {
+    fn from(transaction: TransactionWithMetadata<N>) -> Self {
         Self { transaction }
     }
 }

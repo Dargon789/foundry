@@ -1,21 +1,26 @@
 use super::{install, watch::WatchArgs};
 use clap::Parser;
 use eyre::Result;
-use foundry_cli::{opts::BuildOpts, utils::LoadConfig};
+use forge_lint::{linter::Linter, sol::SolidityLinter};
+use foundry_cli::{
+    opts::{BuildOpts, configure_pcx_from_solc, get_solar_sources_from_compile_output},
+    utils::{Git, LoadConfig, cache_local_signatures},
+};
 use foundry_common::{compile::ProjectCompiler, shell};
 use foundry_compilers::{
-    compilers::{multi::MultiCompilerLanguage, Language},
+    CompilationError, FileFilter, Project, ProjectCompileOutput,
+    compilers::{Language, multi::MultiCompilerLanguage},
+    solc::SolcLanguage,
     utils::source_files_iter,
-    Project, ProjectCompileOutput,
 };
 use foundry_config::{
+    Config, SkipBuildFilters,
     figment::{
-        self,
+        self, Metadata, Profile, Provider,
         error::Kind::InvalidType,
         value::{Dict, Map, Value},
-        Metadata, Profile, Provider,
     },
-    Config,
+    filter::expand_globs,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -56,6 +61,14 @@ pub struct BuildArgs {
     #[serde(skip)]
     pub ignore_eip_3860: bool,
 
+    /// Skip the post-build lint step for this invocation.
+    ///
+    /// Equivalent to setting `lint_on_build = false` under `[lint]` in foundry.toml,
+    /// but only for the current command.
+    #[arg(long, visible_alias = "skip-lint")]
+    #[serde(skip)]
+    pub no_lint: bool,
+
     #[command(flatten)]
     #[serde(flatten)]
     pub build: BuildOpts,
@@ -66,13 +79,17 @@ pub struct BuildArgs {
 }
 
 impl BuildArgs {
-    pub fn run(self) -> Result<ProjectCompileOutput> {
+    pub async fn run(self) -> Result<ProjectCompileOutput> {
         let mut config = self.load_config()?;
 
-        if install::install_missing_dependencies(&mut config) && config.auto_detect_remappings {
+        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+        {
             // need to re-configure here to also catch additional remappings
             config = self.load_config()?;
         }
+
+        self.check_soldeer_lock_consistency(&config).await;
+        self.check_foundry_lock_consistency(&config);
 
         let project = config.project()?;
 
@@ -98,13 +115,125 @@ impl BuildArgs {
             .ignore_eip_3860(self.ignore_eip_3860)
             .bail(!format_json);
 
-        let output = compiler.compile(&project)?;
+        let mut output = compiler.compile(&project)?;
+
+        // Cache project selectors.
+        cache_local_signatures(&output)?;
 
         if format_json && !self.names && !self.sizes {
             sh_println!("{}", serde_json::to_string_pretty(&output.output())?)?;
         }
 
+        // Only run the `SolidityLinter` if lint on build and no compilation errors.
+        if !self.no_lint
+            && config.lint.lint_on_build
+            && !output.output().errors.iter().any(|e| e.is_error())
+            && let Err(err) = self.lint(&project, &config, self.paths.as_deref(), &mut output)
+        {
+            emit_lint_failure_notice();
+            return Err(err.wrap_err(
+                "post-build lint step failed; rerun with --no-lint or set \
+                 `lint_on_build = false` under `[lint]` in foundry.toml to bypass",
+            ));
+        }
+
         Ok(output)
+    }
+
+    fn lint(
+        &self,
+        project: &Project,
+        config: &Config,
+        files: Option<&[PathBuf]>,
+        output: &mut ProjectCompileOutput,
+    ) -> Result<()> {
+        let format_json = shell::is_json();
+        if project.compiler.solc.is_some() && !shell::is_quiet() {
+            let linter = SolidityLinter::new(config.project_paths())
+                .with_json_emitter(format_json)
+                .with_description(!format_json)
+                .with_severity(if config.lint.severity.is_empty() {
+                    None
+                } else {
+                    Some(config.lint.severity.clone())
+                })
+                .without_lints(if config.lint.exclude_lints.is_empty() {
+                    None
+                } else {
+                    Some(
+                        config
+                            .lint
+                            .exclude_lints
+                            .iter()
+                            .filter_map(|s| forge_lint::sol::SolLint::try_from(s.as_str()).ok())
+                            .collect(),
+                    )
+                })
+                .with_lint_specific(&config.lint.lint_specific);
+
+            // Expand ignore globs and canonicalize from the get go
+            let ignored = expand_globs(&config.root, config.lint.ignore.iter())?
+                .iter()
+                .flat_map(foundry_common::fs::canonicalize_path)
+                .collect::<Vec<_>>();
+
+            let skip = SkipBuildFilters::new(config.skip.clone(), config.root.clone());
+            let curr_dir = std::env::current_dir()?;
+            let input_files = config
+                .project_paths::<SolcLanguage>()
+                .input_files_iter()
+                .filter(|p| {
+                    // Lint only specified build files, if any.
+                    if let Some(files) = files {
+                        return files.iter().any(|file| &curr_dir.join(file) == p);
+                    }
+                    skip.is_match(p)
+                        && !(ignored.contains(p) || ignored.contains(&curr_dir.join(p)))
+                })
+                .collect::<Vec<_>>();
+
+            let solar_sources =
+                get_solar_sources_from_compile_output(config, output, Some(&input_files), None)?;
+            if solar_sources.input.sources.is_empty() {
+                if !input_files.is_empty() {
+                    sh_warn!("unable to lint. Solar only supports Solidity versions >=0.8.0")?;
+                }
+                return Ok(());
+            }
+
+            // NOTE(rusowsky): Once solar can drop unsupported versions, rather than creating a new
+            // compiler, we should reuse the parser from the project output.
+            //
+            // Buffer emitter so parse-phase errors surface verbatim in `convert_solar_errors`.
+            let mut compiler = solar::sema::Compiler::new(
+                solar::interface::Session::builder()
+                    .with_buffer_emitter(Default::default())
+                    .build(),
+            );
+
+            // Load the solar-compatible sources to the pcx before linting
+            compiler.enter_mut(|compiler| {
+                let mut pcx = compiler.parse();
+                configure_pcx_from_solc(&mut pcx, &config.project_paths(), &solar_sources, true);
+                pcx.set_resolve_imports(true);
+                pcx.parse();
+            });
+
+            // Flush buffered parse-phase warnings; on error, `convert_solar_errors` surfaces
+            // them in the returned error instead, so skip to avoid duplicates.
+            if compiler.sess().dcx.has_errors().is_ok()
+                && let Some(diags) = compiler.sess().emitted_diagnostics()
+            {
+                let s = diags.to_string();
+                if !s.is_empty() {
+                    let _ = sh_eprint!("{s}");
+                }
+            }
+
+            linter.lint(&input_files, config.deny, &mut compiler)?;
+        }
+
+        Ok(())
     }
 
     /// Returns the `Project` for the current workspace
@@ -117,7 +246,7 @@ impl BuildArgs {
     }
 
     /// Returns whether `BuildArgs` was configured with `--watch`
-    pub fn is_watch(&self) -> bool {
+    pub const fn is_watch(&self) -> bool {
         self.watch.watch.is_some()
     }
 
@@ -131,6 +260,112 @@ impl BuildArgs {
             Ok([config.src, config.test, config.script, foundry_toml])
         })
     }
+
+    /// Check soldeer.lock file consistency using soldeer_core APIs
+    async fn check_soldeer_lock_consistency(&self, config: &Config) {
+        let soldeer_lock_path = config.root.join("soldeer.lock");
+        if !soldeer_lock_path.exists() {
+            return;
+        }
+
+        // Note: read_lockfile returns Ok with empty entries for malformed files
+        let Ok(lockfile) = soldeer_core::lock::read_lockfile(&soldeer_lock_path) else {
+            return;
+        };
+
+        let deps_dir = config.root.join("dependencies");
+        for entry in &lockfile.entries {
+            let dep_name = entry.name();
+
+            // Use soldeer_core's integrity check
+            match soldeer_core::install::check_dependency_integrity(entry, &deps_dir).await {
+                Ok(status) => {
+                    use soldeer_core::install::DependencyStatus;
+                    // Check if status indicates a problem
+                    if matches!(
+                        status,
+                        DependencyStatus::Missing | DependencyStatus::FailedIntegrity
+                    ) {
+                        sh_warn!("Dependency '{}' integrity check failed: {:?}", dep_name, status)
+                            .ok();
+                    }
+                }
+                Err(e) => {
+                    sh_warn!("Dependency '{}' integrity check error: {}", dep_name, e).ok();
+                }
+            }
+        }
+    }
+
+    /// Check foundry.lock file consistency with git submodules
+    fn check_foundry_lock_consistency(&self, config: &Config) {
+        use crate::lockfile::{DepIdentifier, FOUNDRY_LOCK, Lockfile};
+
+        let foundry_lock_path = config.root.join(FOUNDRY_LOCK);
+        if !foundry_lock_path.exists() {
+            return;
+        }
+
+        let git = Git::new(&config.root);
+
+        let mut lockfile = Lockfile::new(&config.root).with_git(&git);
+        if let Err(e) = lockfile.read() {
+            if !e.to_string().contains("Lockfile not found") {
+                sh_warn!("Failed to parse foundry.lock: {}", e).ok();
+            }
+            return;
+        }
+
+        for (dep_path, dep_identifier) in lockfile.iter() {
+            let full_path = config.root.join(dep_path);
+
+            if !full_path.exists() {
+                sh_warn!("Dependency '{}' not found at expected path", dep_path.display()).ok();
+                continue;
+            }
+
+            let actual_rev = match git.get_rev("HEAD", &full_path) {
+                Ok(rev) => rev,
+                Err(_) => {
+                    sh_warn!("Failed to get git revision for dependency '{}'", dep_path.display())
+                        .ok();
+                    continue;
+                }
+            };
+
+            // Compare with the expected revision from lockfile
+            let expected_rev = match dep_identifier {
+                DepIdentifier::Branch { rev, .. }
+                | DepIdentifier::Tag { rev, .. }
+                | DepIdentifier::Rev { rev, .. } => rev.clone(),
+            };
+
+            if actual_rev != expected_rev {
+                sh_warn!(
+                    "Dependency '{}' revision mismatch: expected '{}', found '{}'",
+                    dep_path.display(),
+                    expected_rev,
+                    actual_rev
+                )
+                .ok();
+            }
+        }
+    }
+}
+
+/// Notice shown on lint-on-build failure; printed separately so it survives single-line
+/// cause-chain rendering.
+const LINT_FAILURE_NOTICE: &str = "\
+note: post-build lint failed, but compilation succeeded.
+bypass with `--no-lint` or set `lint_on_build = false` under `[lint]` in foundry.toml
+docs: https://getfoundry.sh/forge/linting#disable-linting-on-build
+";
+
+fn emit_lint_failure_notice() {
+    if shell::is_json() {
+        return;
+    }
+    let _ = sh_eprintln!("\n{LINT_FAILURE_NOTICE}");
 }
 
 // Make this args a `figment::Provider` so that it can be merged into the `Config`

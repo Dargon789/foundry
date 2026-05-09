@@ -18,19 +18,21 @@ foundry-config.workspace = true
 foundry-cli.workspace = true
 foundry-common.workspace = true
 foundry-evm.workspace = true
-foundry-evm-core.workspace = true
+foundry-evm-networks.workspace = true
 serde_json.workspace = true
+alloy-consensus.workspace = true
 alloy-json-abi.workspace = true
 alloy-primitives.workspace = true
-alloy-rpc-types.workspace = true
+alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
 alloy-dyn-abi.workspace = true
 serde.workspace = true
 eyre.workspace = true
-alloy-provider.workspace = true
+alloy-provider = { workspace = true, features = ["trace-api"] }
 tracing.workspace = true
-foundry-compilers = { workspace = true, features = ["full"] }
+foundry-compilers.workspace = true
 foundry-block-explorers = { workspace = true, features = ["foundry-compilers"] }
 revm.workspace = true
+alloy-evm = { workspace = true, features = ["rpc"] }
 
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
 reqwest = { workspace = true, features = ["json"] }
@@ -40,8 +42,18 @@ semver.workspace = true
 regex = { workspace = true, default-features = false }
 yansi.workspace = true
 itertools.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
 foundry-test-utils.workspace = true
 tempfile.workspace = true
+
+[features]
+default = ["optimism"]
+optimism = [
+    "foundry-common/optimism",
+    "foundry-evm/optimism",
+    "foundry-evm-networks/optimism",
+    "foundry-cli/optimism",
+]

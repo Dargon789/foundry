@@ -46,6 +46,30 @@ pub enum Warning {
         /// is being removed completely without replacement
         new: String,
     },
+    /// An unknown key was encountered in a profile in a TOML file
+    UnknownKey {
+        /// The unknown key name
+        key: String,
+        /// The profile where the key was found, if applicable
+        profile: String,
+        /// The config file where the key was found
+        source: String,
+    },
+    /// An unknown key was encountered in a section in a TOML file
+    UnknownSectionKey {
+        /// The unknown key name
+        key: String,
+        /// The section where the key was found
+        section: String,
+        /// The config file where the key was found
+        source: String,
+    },
+    /// The selected profile (via `FOUNDRY_PROFILE` or otherwise) does not exist in the config.
+    /// Falls back to the default profile.
+    UnknownProfile {
+        /// The selected profile that does not exist
+        profile: String,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -82,7 +106,28 @@ impl fmt::Display for Warning {
                 write!(f, "Key `{old}` is being deprecated and will be removed in future versions.")
             }
             Self::DeprecatedKey { old, new } => {
-                write!(f, "Key `{old}` is being deprecated in favor of `{new}`. It will be removed in future versions.")
+                write!(
+                    f,
+                    "Key `{old}` is being deprecated in favor of `{new}`. It will be removed in future versions."
+                )
+            }
+            Self::UnknownKey { key, profile, source } => {
+                write!(
+                    f,
+                    "Found unknown `{key}` config for profile `{profile}` defined in {source}."
+                )
+            }
+            Self::UnknownSectionKey { key, section, source } => {
+                write!(
+                    f,
+                    "Found unknown `{key}` config key in section `{section}` defined in {source}."
+                )
+            }
+            Self::UnknownProfile { profile } => {
+                write!(
+                    f,
+                    "Selected profile `{profile}` does not exist; falling back to the default profile."
+                )
             }
         }
     }

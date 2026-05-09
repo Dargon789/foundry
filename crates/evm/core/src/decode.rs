@@ -1,9 +1,9 @@
 //! Various utilities to decode test results.
 
-use crate::abi::{console, Vm};
+use crate::abi::{Vm, console};
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::{Error, JsonAbi};
-use alloy_primitives::{hex, map::HashMap, Log, Selector};
+use alloy_primitives::{Log, Selector, hex, map::HashMap};
 use alloy_sol_types::{
     ContractError::Revert, RevertReason, RevertReason::ContractError, SolEventInterface,
     SolInterface, SolValue,
@@ -12,6 +12,12 @@ use foundry_common::SELECTOR_LEN;
 use itertools::Itertools;
 use revm::interpreter::InstructionResult;
 use std::{fmt, sync::OnceLock};
+
+/// Stable user-facing fallback for empty revert payloads.
+pub const EMPTY_REVERT_DATA: &str = "<empty revert data>";
+
+/// Prefix used by Foundry assertion helpers in user-visible failure messages.
+pub const ASSERTION_FAILED_PREFIX: &str = "assertion failed";
 
 /// A skip reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +68,7 @@ pub fn decode_console_log(log: &Log) -> Option<String> {
 #[derive(Clone, Debug, Default)]
 pub struct RevertDecoder {
     /// The custom errors to use for decoding.
-    pub errors: HashMap<Selector, Vec<Error>>,
+    errors: HashMap<Selector, Vec<Error>>,
 }
 
 impl Default for &RevertDecoder {
@@ -94,25 +100,15 @@ impl RevertDecoder {
         self
     }
 
-    /// Sets the ABI to use for error decoding, if it is present.
-    ///
-    /// Note that this is decently expensive as it will hash all errors for faster indexing.
-    pub fn with_abi_opt(mut self, abi: Option<&JsonAbi>) -> Self {
-        if let Some(abi) = abi {
-            self.extend_from_abi(abi);
-        }
-        self
-    }
-
     /// Extends the decoder with the given ABI's custom errors.
-    pub fn extend_from_abis<'a>(&mut self, abi: impl IntoIterator<Item = &'a JsonAbi>) {
+    fn extend_from_abis<'a>(&mut self, abi: impl IntoIterator<Item = &'a JsonAbi>) {
         for abi in abi {
             self.extend_from_abi(abi);
         }
     }
 
     /// Extends the decoder with the given ABI's custom errors.
-    pub fn extend_from_abi(&mut self, abi: &JsonAbi) {
+    fn extend_from_abi(&mut self, abi: &JsonAbi) {
         for error in abi.errors() {
             self.push_error(error.clone());
         }
@@ -129,11 +125,7 @@ impl RevertDecoder {
     /// than user output.
     pub fn decode(&self, err: &[u8], status: Option<InstructionResult>) -> String {
         self.maybe_decode(err, status).unwrap_or_else(|| {
-            if err.is_empty() {
-                "<empty revert data>".to_string()
-            } else {
-                trimmed_hex(err)
-            }
+            if err.is_empty() { EMPTY_REVERT_DATA.to_string() } else { trimmed_hex(err) }
         })
     }
 
@@ -141,10 +133,6 @@ impl RevertDecoder {
     ///
     /// See [`decode`](Self::decode) for more information.
     pub fn maybe_decode(&self, err: &[u8], status: Option<InstructionResult>) -> Option<String> {
-        if let Some(reason) = SkipReason::decode(err) {
-            return Some(reason.to_string());
-        }
-
         // Solidity's `Error(string)` (handled separately in order to strip revert: prefix)
         if let Some(ContractError(Revert(revert))) = RevertReason::decode(err) {
             return Some(revert.reason);
@@ -174,7 +162,7 @@ impl RevertDecoder {
             }
 
             if string_decoded.is_some() {
-                return string_decoded
+                return string_decoded;
             }
 
             // Generic custom error.
@@ -188,17 +176,17 @@ impl RevertDecoder {
                     }
                 }
                 s
-            })
+            });
         }
 
         if string_decoded.is_some() {
-            return string_decoded
+            return string_decoded;
         }
 
-        if let Some(status) = status {
-            if !status.is_ok() {
-                return Some(format!("EvmError: {status:?}"));
-            }
+        if let Some(status) = status
+            && !status.is_ok()
+        {
+            return Some(format!("EvmError: {status:?}"));
         }
         if err.is_empty() {
             None
@@ -211,10 +199,10 @@ impl RevertDecoder {
 /// Helper function that decodes provided error as an ABI encoded or an ASCII string (if not empty).
 fn decode_as_non_empty_string(err: &[u8]) -> Option<String> {
     // ABI-encoded `string`.
-    if let Ok(s) = String::abi_decode(err) {
-        if !s.is_empty() {
-            return Some(s);
-        }
+    if let Ok(s) = String::abi_decode(err)
+        && !s.is_empty()
+    {
+        return Some(s);
     }
 
     // ASCII string.
@@ -235,8 +223,8 @@ fn trimmed_hex(s: &[u8]) -> String {
     } else {
         format!(
             "{}…{} ({} bytes)",
-            &hex::encode(&s[..n / 2]),
-            &hex::encode(&s[s.len() - n / 2..]),
+            hex::encode(&s[..n / 2]),
+            hex::encode(&s[s.len() - n / 2..]),
             s.len(),
         )
     }
@@ -272,7 +260,10 @@ mod tests {
             "0xe17594de"
             "756688fe00000000000000000000000000000000000000000000000000000000"
         );
-        assert_eq!(decoder.decode(data, None), "custom error 0xe17594de: 756688fe00000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            decoder.decode(data, None),
+            "custom error 0xe17594de: 756688fe00000000000000000000000000000000000000000000000000000000"
+        );
 
         /*
         abi.encodeWithSelector(ValidationFailed.selector, abi.encodeWithSelector(InvalidNonce.selector))
@@ -284,5 +275,14 @@ mod tests {
             "756688fe00000000000000000000000000000000000000000000000000000000"
         );
         assert_eq!(decoder.decode(data, None), "ValidationFailed(0x756688fe)");
+    }
+
+    #[test]
+    fn maybe_decode_magic_skip_is_not_skip_marker() {
+        let decoder = RevertDecoder::new();
+        let reason = decoder.maybe_decode(crate::constants::MAGIC_SKIP, None).unwrap();
+
+        assert_eq!(reason, "FOUNDRY::SKIP");
+        assert!(SkipReason::decode_self(&reason).is_none());
     }
 }

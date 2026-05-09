@@ -1,15 +1,14 @@
 //! Support for multiple Etherscan keys.
 
 use crate::{
-    resolve::{interpolate, UnresolvedEnvVarError, RE_PLACEHOLDER},
     Chain, Config, NamedChain,
+    resolve::{RE_PLACEHOLDER, UnresolvedEnvVarError, interpolate},
 };
 use figment::{
+    Error, Metadata, Profile, Provider,
     providers::Env,
     value::{Dict, Map},
-    Error, Metadata, Profile, Provider,
 };
-use foundry_block_explorers::EtherscanApiVersion;
 use heck::ToKebabCase;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -18,9 +17,6 @@ use std::{
     ops::{Deref, DerefMut},
     time::Duration,
 };
-
-/// The user agent to use when querying the etherscan API.
-pub const ETHERSCAN_USER_AGENT: &str = concat!("foundry/", env!("CARGO_PKG_VERSION"));
 
 /// A [Provider] that provides Etherscan API key from the environment if it's not empty.
 ///
@@ -37,10 +33,10 @@ impl Provider for EtherscanEnvProvider {
     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
         let mut dict = Dict::default();
         let env_provider = Env::raw().only(&["ETHERSCAN_API_KEY"]);
-        if let Some((key, value)) = env_provider.iter().next() {
-            if !value.trim().is_empty() {
-                dict.insert(key.as_str().to_string(), value.into());
-            }
+        if let Some((key, value)) = env_provider.iter().next()
+            && !value.trim().is_empty()
+        {
+            dict.insert(key.as_str().to_string(), value.into());
         }
 
         Ok(Map::from([(Config::selected_profile(), dict)]))
@@ -53,7 +49,11 @@ pub enum EtherscanConfigError {
     #[error(transparent)]
     Unresolved(#[from] UnresolvedEnvVarError),
 
-    #[error("No known Etherscan API URL for config{0} with chain `{1}`. Please specify a `url`")]
+    #[error(
+        "No known Etherscan API URL for chain `{1}`. To fix this, please:\n\
+        1. Specify a `url` {0}\n\
+        2. Verify the chain `{1}` is correct"
+    )]
     UnknownChain(String, Chain),
 
     #[error("At least one of `url` or `chain` must be present{0}")]
@@ -84,13 +84,13 @@ impl EtherscanConfigs {
     }
 
     /// Returns all (alias -> url) pairs
-    pub fn resolved(self, default_api_version: EtherscanApiVersion) -> ResolvedEtherscanConfigs {
+    pub fn resolved(self) -> ResolvedEtherscanConfigs {
         ResolvedEtherscanConfigs {
             configs: self
                 .configs
                 .into_iter()
                 .map(|(name, e)| {
-                    let resolved = e.resolve(Some(&name), default_api_version);
+                    let resolved = e.resolve(Some(&name));
                     (name, resolved)
                 })
                 .collect(),
@@ -135,11 +135,11 @@ impl ResolvedEtherscanConfigs {
         self,
         chain: Chain,
     ) -> Option<Result<ResolvedEtherscanConfig, EtherscanConfigError>> {
-        for (_, config) in self.configs.into_iter() {
+        for (_, config) in self.configs {
             match config {
                 Ok(c) if c.chain == Some(chain) => return Some(Ok(c)),
                 Err(e) => return Some(Err(e)),
-                _ => continue,
+                _ => {}
             }
         }
         None
@@ -174,9 +174,6 @@ pub struct EtherscanConfig {
     /// Etherscan API URL
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Etherscan API Version. Defaults to v2
-    #[serde(default, alias = "api-version", skip_serializing_if = "Option::is_none")]
-    pub api_version: Option<EtherscanApiVersion>,
     /// The etherscan API KEY that's required to make requests
     pub key: EtherscanApiKey,
 }
@@ -191,11 +188,8 @@ impl EtherscanConfig {
     pub fn resolve(
         self,
         alias: Option<&str>,
-        default_api_version: EtherscanApiVersion,
     ) -> Result<ResolvedEtherscanConfig, EtherscanConfigError> {
-        let Self { chain, mut url, key, api_version } = self;
-
-        let api_version = api_version.unwrap_or(default_api_version);
+        let Self { chain, mut url, key } = self;
 
         if let Some(url) = &mut url {
             *url = interpolate(url)?;
@@ -226,23 +220,17 @@ impl EtherscanConfig {
         match (chain, url) {
             (Some(chain), Some(api_url)) => Ok(ResolvedEtherscanConfig {
                 api_url,
-                api_version,
                 browser_url: chain.etherscan_urls().map(|(_, url)| url.to_string()),
                 key,
                 chain: Some(chain),
             }),
-            (Some(chain), None) => ResolvedEtherscanConfig::create(key, chain, api_version)
-                .ok_or_else(|| {
-                    let msg = alias.map(|a| format!(" `{a}`")).unwrap_or_default();
-                    EtherscanConfigError::UnknownChain(msg, chain)
-                }),
-            (None, Some(api_url)) => Ok(ResolvedEtherscanConfig {
-                api_url,
-                browser_url: None,
-                key,
-                chain: None,
-                api_version,
+            (Some(chain), None) => ResolvedEtherscanConfig::create(key, chain).ok_or_else(|| {
+                let msg = alias.map(|a| format!("for `{a}`")).unwrap_or_default();
+                EtherscanConfigError::UnknownChain(msg, chain)
             }),
+            (None, Some(api_url)) => {
+                Ok(ResolvedEtherscanConfig { api_url, browser_url: None, key, chain: None })
+            }
             (None, None) => {
                 let msg = alias
                     .map(|a| format!(" for Etherscan config with unknown alias `{a}`"))
@@ -264,9 +252,6 @@ pub struct ResolvedEtherscanConfig {
     pub browser_url: Option<String>,
     /// The resolved API key.
     pub key: String,
-    /// Etherscan API Version.
-    #[serde(default)]
-    pub api_version: EtherscanApiVersion,
     /// The chain name or EIP-155 chain ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<Chain>,
@@ -274,16 +259,11 @@ pub struct ResolvedEtherscanConfig {
 
 impl ResolvedEtherscanConfig {
     /// Creates a new instance using the api key and chain
-    pub fn create(
-        api_key: impl Into<String>,
-        chain: impl Into<Chain>,
-        api_version: EtherscanApiVersion,
-    ) -> Option<Self> {
+    pub fn create(api_key: impl Into<String>, chain: impl Into<Chain>) -> Option<Self> {
         let chain = chain.into();
         let (api_url, browser_url) = chain.etherscan_urls()?;
         Some(Self {
             api_url: api_url.to_string(),
-            api_version,
             browser_url: Some(browser_url.to_string()),
             key: api_key.into(),
             chain: Some(chain),
@@ -315,7 +295,21 @@ impl ResolvedEtherscanConfig {
         self,
     ) -> Result<foundry_block_explorers::Client, foundry_block_explorers::errors::EtherscanError>
     {
-        let Self { api_url, browser_url, key: api_key, chain, api_version } = self;
+        self.into_client_with_no_proxy(false)
+    }
+
+    /// Same as [`Self::into_client`] but optionally disables automatic proxy detection.
+    ///
+    /// When `no_proxy` is `true`, calls [`foundry_block_explorers::ClientBuilder::no_proxy`],
+    /// which prevents system proxy lookups that can crash in sandboxed environments (e.g.,
+    /// Cursor IDE, macOS App Sandbox).
+    /// See: <https://github.com/foundry-rs/foundry/issues/12733>
+    pub fn into_client_with_no_proxy(
+        self,
+        no_proxy: bool,
+    ) -> Result<foundry_block_explorers::Client, foundry_block_explorers::errors::EtherscanError>
+    {
+        let Self { api_url, browser_url, key: api_key, chain } = self;
 
         let chain = chain.unwrap_or_default();
         let cache = Config::foundry_etherscan_chain_cache_dir(chain);
@@ -327,20 +321,26 @@ impl ResolvedEtherscanConfig {
             }
         }
 
-        let api_url = into_url(&api_url)?;
-        let client = reqwest::Client::builder()
-            .user_agent(ETHERSCAN_USER_AGENT)
-            .tls_built_in_root_certs(api_url.scheme() == "https")
-            .build()?;
+        // Disable automatic proxy detection. In sandboxed environments (e.g., Cursor IDE,
+        // macOS App Sandbox), reqwest's system proxy lookup via SCDynamicStore can crash
+        // when the API returns NULL. See: https://github.com/foundry-rs/foundry/issues/12733
         let mut client_builder = foundry_block_explorers::Client::builder()
-            .with_client(client)
-            .with_api_version(api_version)
             .with_api_key(api_key)
             .with_cache(cache, Duration::from_secs(24 * 60 * 60));
-        if let Some(browser_url) = browser_url {
+        if no_proxy {
+            client_builder = client_builder.no_proxy();
+        }
+        if let Some(ref browser_url) = browser_url {
             client_builder = client_builder.with_url(browser_url)?;
         }
-        client_builder.chain(chain)?.build()
+
+        // Use the provided URL (either custom from foundry.toml or chain's default from resolve())
+        client_builder = client_builder.with_api_url(&api_url)?;
+        // Fallback: Use api_url as browser URL if browser_url is not set
+        if browser_url.is_none() {
+            client_builder = client_builder.with_url(&api_url)?;
+        }
+        client_builder.build()
     }
 }
 
@@ -361,22 +361,6 @@ pub enum EtherscanApiKey {
 }
 
 impl EtherscanApiKey {
-    /// Returns the key variant
-    pub fn as_key(&self) -> Option<&str> {
-        match self {
-            Self::Key(url) => Some(url),
-            Self::Env(_) => None,
-        }
-    }
-
-    /// Returns the env variant
-    pub fn as_env(&self) -> Option<&str> {
-        match self {
-            Self::Env(val) => Some(val),
-            Self::Key(_) => None,
-        }
-    }
-
     /// Returns the key this type holds
     ///
     /// # Error
@@ -420,13 +404,6 @@ impl fmt::Display for EtherscanApiKey {
     }
 }
 
-/// This is a hack to work around `IntoUrl`'s sealed private functions, which can't be called
-/// normally.
-#[inline]
-fn into_url(url: impl reqwest::IntoUrl) -> std::result::Result<reqwest::Url, reqwest::Error> {
-    url.into_url()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,36 +418,17 @@ mod tests {
                 chain: Some(Mainnet.into()),
                 url: None,
                 key: EtherscanApiKey::Key("ABCDEFG".to_string()),
-                api_version: None,
             },
         );
 
-        let mut resolved = configs.resolved(EtherscanApiVersion::V2);
+        let mut resolved = configs.resolved();
         let config = resolved.remove("mainnet").unwrap().unwrap();
-        // None version = None
-        assert_eq!(config.api_version, EtherscanApiVersion::V2);
-        let client = config.into_client().unwrap();
-        assert_eq!(*client.etherscan_api_version(), EtherscanApiVersion::V2);
-    }
 
-    #[test]
-    fn can_create_v1_client_via_chain() {
-        let mut configs = EtherscanConfigs::default();
-        configs.insert(
-            "mainnet".to_string(),
-            EtherscanConfig {
-                chain: Some(Mainnet.into()),
-                url: None,
-                api_version: Some(EtherscanApiVersion::V1),
-                key: EtherscanApiKey::Key("ABCDEG".to_string()),
-            },
+        let client = config.into_client().unwrap();
+        assert_eq!(
+            client.etherscan_api_url().as_str(),
+            "https://api.etherscan.io/v2/api?chainid=1"
         );
-
-        let mut resolved = configs.resolved(EtherscanApiVersion::V2);
-        let config = resolved.remove("mainnet").unwrap().unwrap();
-        assert_eq!(config.api_version, EtherscanApiVersion::V1);
-        let client = config.into_client().unwrap();
-        assert_eq!(*client.etherscan_api_version(), EtherscanApiVersion::V1);
     }
 
     #[test]
@@ -482,11 +440,10 @@ mod tests {
                 chain: Some(Mainnet.into()),
                 url: Some("https://api.etherscan.io/api".to_string()),
                 key: EtherscanApiKey::Key("ABCDEFG".to_string()),
-                api_version: None,
             },
         );
 
-        let mut resolved = configs.resolved(EtherscanApiVersion::V2);
+        let mut resolved = configs.resolved();
         let config = resolved.remove("mainnet").unwrap().unwrap();
         let _ = config.into_client().unwrap();
     }
@@ -500,24 +457,28 @@ mod tests {
             EtherscanConfig {
                 chain: Some(Mainnet.into()),
                 url: Some("https://api.etherscan.io/api".to_string()),
-                api_version: None,
                 key: EtherscanApiKey::Env(format!("${{{env}}}")),
             },
         );
 
-        let mut resolved = configs.clone().resolved(EtherscanApiVersion::V2);
+        let mut resolved = configs.clone().resolved();
         let config = resolved.remove("mainnet").unwrap();
         assert!(config.is_err());
 
-        std::env::set_var(env, "ABCDEFG");
+        unsafe {
+            std::env::set_var(env, "ABCDEFG");
+        }
 
-        let mut resolved = configs.resolved(EtherscanApiVersion::V2);
+        let mut resolved = configs.resolved();
         let config = resolved.remove("mainnet").unwrap().unwrap();
         assert_eq!(config.key, "ABCDEFG");
         let client = config.into_client().unwrap();
-        assert_eq!(*client.etherscan_api_version(), EtherscanApiVersion::V2);
+        // Custom URL should be used even when chain has a default URL
+        assert_eq!(client.etherscan_api_url().as_str(), "https://api.etherscan.io/api");
 
-        std::env::remove_var(env);
+        unsafe {
+            std::env::remove_var(env);
+        }
     }
 
     #[test]
@@ -529,11 +490,10 @@ mod tests {
                 chain: None,
                 url: Some("https://api.etherscan.io/api".to_string()),
                 key: EtherscanApiKey::Key("ABCDEFG".to_string()),
-                api_version: None,
             },
         );
 
-        let mut resolved = configs.clone().resolved(EtherscanApiVersion::V2);
+        let mut resolved = configs.clone().resolved();
         let config = resolved.remove("blast_sepolia").unwrap().unwrap();
         assert_eq!(config.chain, Some(Chain::blast_sepolia()));
     }
@@ -544,13 +504,57 @@ mod tests {
             chain: None,
             url: Some("https://api.etherscan.io/api".to_string()),
             key: EtherscanApiKey::Key("ABCDEFG".to_string()),
-            api_version: None,
         };
-        let resolved =
-            config.clone().resolve(Some("base_sepolia"), EtherscanApiVersion::V2).unwrap();
+        let resolved = config.clone().resolve(Some("base_sepolia")).unwrap();
         assert_eq!(resolved.chain, Some(Chain::base_sepolia()));
 
-        let resolved = config.resolve(Some("base-sepolia"), EtherscanApiVersion::V2).unwrap();
+        let resolved = config.resolve(Some("base-sepolia")).unwrap();
         assert_eq!(resolved.chain, Some(Chain::base_sepolia()));
+    }
+
+    #[test]
+    fn can_create_client_with_custom_url_for_chain_without_default_url() {
+        // Chains without default Etherscan URLs (e.g., Dev, AnvilHardhat networks)
+        // should work if a custom URL is provided in foundry.toml.
+        let mut configs = EtherscanConfigs::default();
+        configs.insert(
+            "dev".to_string(),
+            EtherscanConfig {
+                chain: Some(Chain::dev()),
+                url: Some("https://custom.api.url/verify/etherscan".to_string()),
+                key: EtherscanApiKey::Key("test_key".to_string()),
+            },
+        );
+
+        let mut resolved = configs.resolved();
+        let config = resolved.remove("dev").unwrap().unwrap();
+        let result = config.into_client();
+        assert!(
+            result.is_ok(),
+            "Should succeed with custom URL even for chains without default Etherscan URLs"
+        );
+    }
+
+    #[test]
+    fn fails_without_custom_url_for_chain_without_default_url() {
+        // Chains without default Etherscan URLs (e.g., Dev, AnvilHardhat networks)
+        // should fail if no custom URL is provided in foundry.toml.
+        let mut configs = EtherscanConfigs::default();
+        configs.insert(
+            "dev".to_string(),
+            EtherscanConfig {
+                chain: Some(Chain::dev()),
+                url: None,
+                key: EtherscanApiKey::Key("test_key".to_string()),
+            },
+        );
+
+        let mut resolved = configs.resolved();
+        let config = resolved.remove("dev").unwrap();
+
+        assert!(
+            config.is_err(),
+            "Should fail: chains without default Etherscan URLs require custom URL"
+        );
     }
 }

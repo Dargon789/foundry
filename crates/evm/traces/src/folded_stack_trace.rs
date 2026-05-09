@@ -1,24 +1,30 @@
 use alloy_primitives::hex::ToHexExt;
 use revm_inspectors::tracing::{
-    types::{CallTraceNode, CallTraceStep, DecodedTraceStep, TraceMemberOrder},
     CallTraceArena,
+    types::{CallTraceNode, CallTraceStep, DecodedTraceStep, TraceMemberOrder},
 };
 
 /// Builds a folded stack trace from a call trace arena.
-pub fn build(arena: &CallTraceArena) -> Vec<String> {
-    let mut fst = EvmFoldedStackTraceBuilder::default();
+pub fn build(arena: &CallTraceArena, isolate: bool) -> Vec<String> {
+    let mut fst = EvmFoldedStackTraceBuilder::new(isolate);
     fst.process_call_node(arena.nodes(), 0);
     fst.build()
 }
 
 /// Wrapper for building a folded stack trace using EVM call trace node.
-#[derive(Default)]
 pub struct EvmFoldedStackTraceBuilder {
+    /// Trace produced in isolate mode, meaning refund needs to be reversed at the depth=1
+    /// frame for consistent gas values.
+    isolate: bool,
     /// Raw folded stack trace builder.
     fst: FoldedStackTraceBuilder,
 }
 
 impl EvmFoldedStackTraceBuilder {
+    pub fn new(isolate: bool) -> Self {
+        Self { isolate, fst: FoldedStackTraceBuilder::default() }
+    }
+
     /// Returns the folded stack trace.
     pub fn build(self) -> Vec<String> {
         self.fst.build()
@@ -30,24 +36,40 @@ impl EvmFoldedStackTraceBuilder {
         let node = &nodes[idx];
 
         let func_name = if node.trace.kind.is_any_create() {
-            let contract_name = node.trace.decoded.label.as_deref().unwrap_or("Contract");
+            let contract_name = node
+                .trace
+                .decoded
+                .as_ref()
+                .and_then(|dc| dc.label.as_deref())
+                .unwrap_or("Contract");
             format!("new {contract_name}")
         } else {
             let selector = node
                 .selector()
                 .map(|selector| selector.encode_hex_with_prefix())
                 .unwrap_or_else(|| "fallback".to_string());
-            let signature =
-                node.trace.decoded.call_data.as_ref().map(|dc| &dc.signature).unwrap_or(&selector);
+            let signature = node
+                .trace
+                .decoded
+                .as_ref()
+                .and_then(|dc| dc.call_data.as_ref())
+                .map(|dc| &dc.signature)
+                .unwrap_or(&selector);
 
-            if let Some(label) = &node.trace.decoded.label {
+            if let Some(label) = node.trace.decoded.as_ref().and_then(|dc| dc.label.as_ref()) {
                 format!("{label}.{signature}")
             } else {
                 signature.clone()
             }
         };
 
-        self.fst.enter(func_name, node.trace.gas_used as i64);
+        let mut gas_used = node.trace.gas_used;
+        let max_refund_adjust_depth = if self.isolate { 1 } else { 0 };
+        if node.trace.depth <= max_refund_adjust_depth {
+            gas_used += node.trace.gas_refund_counter;
+        }
+
+        self.fst.enter(func_name, gas_used);
 
         // Track internal function step exits to do in this call context.
         let mut step_exits = vec![];
@@ -87,10 +109,10 @@ impl EvmFoldedStackTraceBuilder {
     ) {
         let step = &steps[step_idx];
         if let Some(decoded_step) = &step.decoded {
-            match decoded_step {
+            match decoded_step.as_ref() {
                 DecodedTraceStep::InternalCall(decoded_internal_call, step_end_idx) => {
-                    let gas_used = steps[*step_end_idx].gas_used.saturating_sub(step.gas_used);
-                    self.fst.enter(decoded_internal_call.func_name.clone(), gas_used as i64);
+                    let gas_used = step.gas_remaining - steps[*step_end_idx].gas_remaining;
+                    self.fst.enter(decoded_internal_call.func_name.clone(), gas_used);
                     step_exits.push(*step_end_idx);
                 }
                 DecodedTraceStep::Line(_) => {}
@@ -148,13 +170,13 @@ pub struct FoldedStackTraceBuilder {
 struct TraceEntry {
     /// Names of all functions in the call stack of this trace.
     names: Vec<String>,
-    /// Gas consumed by this function, allowed to be negative due to refunds.
-    gas: i64,
+    /// Gas consumed by this function, not including refunds.
+    gas: u64,
 }
 
 impl FoldedStackTraceBuilder {
     /// Enter execution of a function call that consumes `gas`.
-    pub fn enter(&mut self, label: String, gas: i64) {
+    pub fn enter(&mut self, label: String, gas: u64) {
         let mut names = self.traces.last().map(|entry| entry.names.clone()).unwrap_or_default();
 
         while self.exits > 0 {
@@ -167,7 +189,7 @@ impl FoldedStackTraceBuilder {
     }
 
     /// Exit execution of a function call.
-    pub fn exit(&mut self) {
+    pub const fn exit(&mut self) {
         self.exits += 1;
     }
 
@@ -179,7 +201,7 @@ impl FoldedStackTraceBuilder {
 
     /// Internal method to build the folded stack trace without subtracting gas consumed by
     /// the children function calls.
-    fn build_without_subtraction(&mut self) -> Vec<String> {
+    pub fn build_without_subtraction(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
         for TraceEntry { names, gas } in &self.traces {
             lines.push(format!("{} {}", names.join(";"), gas));

@@ -1,9 +1,9 @@
 //! Debugger implementation.
 
-use crate::{tui::TUI, DebugNode, DebuggerBuilder, ExitReason};
+use crate::{DebugNode, DebuggerBuilder, ExitReason, tui::TUI};
 use alloy_primitives::map::AddressHashMap;
 use eyre::Result;
-use foundry_common::evm::Breakpoints;
+use foundry_evm_core::Breakpoints;
 use foundry_evm_traces::debug::ContractSources;
 use std::path::Path;
 
@@ -27,7 +27,7 @@ impl Debugger {
     }
 
     /// Creates a new debugger.
-    pub fn new(
+    pub const fn new(
         debug_arena: Vec<DebugNode>,
         identified_contracts: AddressHashMap<String>,
         contracts_sources: ContractSources,

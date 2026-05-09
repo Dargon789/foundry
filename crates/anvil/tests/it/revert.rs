@@ -1,11 +1,11 @@
 use crate::abi::VendingMachine;
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{bytes, U256};
+use alloy_primitives::{U256, bytes};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
 use alloy_serde::WithOtherFields;
 use alloy_sol_types::sol;
-use anvil::{spawn, NodeConfig};
+use anvil::{NodeConfig, spawn};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deploy_reverting() {
@@ -26,6 +26,38 @@ async fn test_deploy_reverting() {
     let tx = provider.send_transaction(tx).await.unwrap();
     let receipt = tx.get_receipt().await.unwrap();
     assert!(!receipt.inner.inner.status());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invalid_opcode_rpc_error_code() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+    let sender = handle.dev_accounts().next().unwrap();
+
+    // Deploy a contract whose runtime bytecode is the invalid opcode 0xfe.
+    let code = bytes!("60fe60005360016000f3");
+    let tx = TransactionRequest::default().from(sender).with_deploy_code(code);
+    let receipt = provider
+        .send_transaction(WithOtherFields::new(tx))
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let contract = receipt.contract_address.unwrap();
+
+    for (method, params) in [
+        ("eth_call", serde_json::json!([{ "from": sender, "to": contract }, "latest"])),
+        ("eth_estimateGas", serde_json::json!([{ "from": sender, "to": contract }])),
+    ] {
+        let error = rpc_error(&handle.http_endpoint(), method, params).await;
+        assert_eq!(error["code"], serde_json::json!(-32003), "{error}");
+        assert!(error.get("data").is_none(), "{error}");
+
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("EVM error InvalidFEOpcode"), "{error}");
+        assert!(!message.contains("execution reverted"), "{error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -123,4 +155,22 @@ async fn test_solc_revert_custom_errors() {
     let err = contract.revertAddress().call().await.unwrap_err();
     let s = err.to_string();
     assert!(s.contains("execution reverted"), "{s:?}");
+}
+
+async fn rpc_error(endpoint: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    body.get("error").cloned().unwrap_or_else(|| panic!("expected JSON-RPC error, got {body}"))
 }

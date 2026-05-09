@@ -20,10 +20,10 @@ foundry-compilers = { workspace = true, features = ["svm-solc"] }
 alloy-chains = { workspace = true, features = ["serde"] }
 alloy-primitives = { workspace = true, features = ["serde"] }
 
-revm.workspace = true
+foundry-evm-hardforks.workspace = true
+foundry-evm-networks.workspace = true
 
-solar-parse.workspace = true
-solar-interface.workspace = true
+solar.workspace = true
 
 dirs.workspace = true
 dunce.workspace = true
@@ -34,28 +34,33 @@ globset = "0.4"
 heck.workspace = true
 itertools.workspace = true
 mesc.workspace = true
-number_prefix = "0.4"
+unit-prefix = "0.5.2"
+rayon.workspace = true
 regex.workspace = true
-reqwest.workspace = true
 semver = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
 serde.workspace = true
 soldeer-core.workspace = true
 thiserror.workspace = true
 toml = { workspace = true, features = ["preserve_order"] }
-toml_edit = "0.22"
+toml_edit.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
 yansi.workspace = true
 clap = { version = "4", features = ["derive"] }
 
+# schema
+schemars = { version = "1.0", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 path-slash = "0.2"
 
 [dev-dependencies]
+snapbox.workspace = true
 similar-asserts.workspace = true
 figment = { workspace = true, features = ["test"] }
 tempfile.workspace = true
 
 [features]
 isolate-by-default = []
+schema = ["dep:schemars"]

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.18;
 
-import "ds-test/test.sol";
-import "cheats/Vm.sol";
+import "utils/Test.sol";
 
-contract MockCallsTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract MockCallsTest is Test {
     function testMockCallsLastShouldPersist() public {
         address mockUser = vm.addr(vm.randomUint());
         address mockErc20 = vm.addr(vm.randomUint());
@@ -31,13 +28,17 @@ contract MockCallsTest is DSTest {
         mocks[0] = abi.encode(2 ether);
         mocks[1] = abi.encode(1 ether);
         mocks[2] = abi.encode(6.423 ether);
+        vm.deal(address(this), 3 ether);
         vm.mockCalls(mockErc20, 1 ether, data, mocks);
         (, bytes memory ret1) = mockErc20.call{value: 1 ether}(data);
         assertEq(abi.decode(ret1, (uint256)), 2 ether);
+        assertEq(mockErc20.balance, 1 ether);
         (, bytes memory ret2) = mockErc20.call{value: 1 ether}(data);
         assertEq(abi.decode(ret2, (uint256)), 1 ether);
+        assertEq(mockErc20.balance, 2 ether);
         (, bytes memory ret3) = mockErc20.call{value: 1 ether}(data);
         assertEq(abi.decode(ret3, (uint256)), 6.423 ether);
+        assertEq(mockErc20.balance, 3 ether);
     }
 
     function testMockCalls() public {

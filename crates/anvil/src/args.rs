@@ -1,11 +1,13 @@
 use crate::opts::{Anvil, AnvilSubcommand};
 use clap::{CommandFactory, Parser};
 use eyre::Result;
-use foundry_cli::{handler, utils};
+use foundry_cli::utils;
 
 /// Run the `anvil` command line interface.
 pub fn run() -> Result<()> {
     setup()?;
+
+    foundry_cli::opts::GlobalArgs::check_markdown_help::<Anvil>();
 
     let mut args = Anvil::parse();
     args.global.init()?;
@@ -16,10 +18,7 @@ pub fn run() -> Result<()> {
 
 /// Setup the exception handler and other utilities.
 pub fn setup() -> Result<()> {
-    utils::install_crypto_provider();
-    handler::install();
-    utils::load_dotenv();
-    utils::enable_paint();
+    utils::common_setup();
 
     Ok(())
 }
@@ -36,18 +35,12 @@ pub fn run_command(args: Anvil) -> Result<()> {
                     &mut std::io::stdout(),
                 );
             }
-            AnvilSubcommand::GenerateFigSpec => clap_complete::generate(
-                clap_complete_fig::Fig,
-                &mut Anvil::command(),
-                "anvil",
-                &mut std::io::stdout(),
-            ),
         }
-        return Ok(())
+        return Ok(());
     }
 
     let _ = fdlimit::raise_fd_limit();
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(args.node.run())
+    args.global.tokio_runtime().block_on(args.node.run())
 }
 
 #[cfg(test)]
@@ -79,7 +72,9 @@ mod tests {
         let args: Anvil = Anvil::parse_from(["anvil", "completions", "bash"]);
         assert!(matches!(
             args.cmd,
-            Some(AnvilSubcommand::Completions { shell: clap_complete::Shell::Bash })
+            Some(AnvilSubcommand::Completions {
+                shell: foundry_cli::clap::Shell::ClapCompleteShell(clap_complete::Shell::Bash)
+            })
         ));
     }
 }

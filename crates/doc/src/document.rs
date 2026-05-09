@@ -89,7 +89,7 @@ pub enum DocumentContent {
 }
 
 impl DocumentContent {
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         match self {
             Self::Empty => 0,
             Self::Single(_) => 1,
@@ -101,13 +101,7 @@ impl DocumentContent {
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut ParseItem> {
         match self {
             Self::Empty => None,
-            Self::Single(item) => {
-                if index == 0 {
-                    Some(item)
-                } else {
-                    None
-                }
-            }
+            Self::Single(item) => (index == 0).then_some(item),
             Self::Constants(items) => items.get_mut(index),
             Self::OverloadedFunctions(items) => items.get_mut(index),
         }
@@ -149,10 +143,10 @@ impl<'a> Iterator for ParseItemIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.next.take() {
-            return Some(next)
+            return Some(next);
         }
         if let Some(other) = self.other.as_mut() {
-            return other.next()
+            return other.next();
         }
 
         None
@@ -170,10 +164,10 @@ impl<'a> Iterator for ParseItemIterMut<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.next.take() {
-            return Some(next)
+            return Some(next);
         }
         if let Some(other) = self.other.as_mut() {
-            return other.next()
+            return other.next();
         }
 
         None
@@ -183,7 +177,7 @@ impl<'a> Iterator for ParseItemIterMut<'a> {
 /// Read the preprocessor output variant from document context.
 /// Returns [None] if there is no output.
 macro_rules! read_context {
-    ($doc: expr, $id: expr, $variant: ident) => {
+    ($doc:expr, $id:expr, $variant:ident) => {
         $doc.get_from_context($id).and_then(|out| match out {
             // Only a single variant is matched. Otherwise the code is invalid.
             PreprocessorOutput::$variant(inner) => Some(inner),

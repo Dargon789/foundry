@@ -1,13 +1,15 @@
+use crate::{DepIdentifier, FOUNDRY_LOCK, Lockfile};
 use clap::{Parser, ValueHint};
 use eyre::{Context, Result};
 use foundry_cli::{
     opts::Dependency,
-    utils::{CommandUtils, Git, LoadConfig},
+    utils::{Git, LoadConfig},
 };
 use foundry_common::fs;
-use foundry_config::{impl_figment_convert_basic, Config};
+use foundry_config::{Config, impl_figment_convert_basic};
 use regex::Regex;
 use semver::Version;
+use soldeer_commands::{Command, Verbosity, commands::install::Install};
 use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -58,9 +60,9 @@ pub struct InstallArgs {
 impl_figment_convert_basic!(InstallArgs);
 
 impl InstallArgs {
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         let mut config = self.load_config()?;
-        self.opts.install(&mut config, self.dependencies)
+        self.opts.install(&mut config, self.dependencies).await
     }
 }
 
@@ -91,12 +93,13 @@ impl DependencyInstallOpts {
     /// See also [`Self::install`].
     ///
     /// Returns true if any dependency was installed.
-    pub fn install_missing_dependencies(self, config: &mut Config) -> bool {
+    pub async fn install_missing_dependencies(self, config: &mut Config) -> bool {
         let lib = config.install_lib_dir();
         if self.git(config).has_missing_dependencies(Some(lib)).unwrap_or(false) {
             // The extra newline is needed, otherwise the compiler output will overwrite the message
             let _ = sh_println!("Missing dependencies found. Installing now...\n");
-            if self.install(config, Vec::new()).is_err() {
+
+            if self.install(config, Vec::new()).await.is_err() {
                 let _ =
                     sh_warn!("Your project has missing dependencies that could not be installed.");
             }
@@ -107,7 +110,7 @@ impl DependencyInstallOpts {
     }
 
     /// Installs all dependencies
-    pub fn install(self, config: &mut Config, dependencies: Vec<Dependency>) -> Result<()> {
+    pub async fn install(self, config: &mut Config, dependencies: Vec<Dependency>) -> Result<()> {
         let Self { no_git, commit, .. } = self;
 
         let git = self.git(config);
@@ -115,7 +118,22 @@ impl DependencyInstallOpts {
         let install_lib_dir = config.install_lib_dir();
         let libs = git.root.join(install_lib_dir);
 
-        if dependencies.is_empty() && !self.no_git {
+        let mut lockfile = Lockfile::new(&config.root);
+        if !no_git {
+            lockfile = lockfile.with_git(&git);
+
+            // Check if submodules are uninitialized, if so, we need to fetch all submodules
+            // This is to ensure that foundry.lock syncs successfully and doesn't error out, when
+            // looking for commits/tags in submodules
+            if git.submodules_uninitialized()? {
+                trace!(lib = %libs.display(), "submodules uninitialized");
+                git.submodule_update(false, false, false, true, Some(&libs))?;
+            }
+        }
+
+        let out_of_sync_deps = lockfile.sync(config.install_lib_dir())?;
+
+        if dependencies.is_empty() && !no_git {
             // Use the root of the git repository to look for submodules.
             let root = Git::root_of(git.root)?;
             match git.has_submodules(Some(&root)) {
@@ -124,10 +142,10 @@ impl DependencyInstallOpts {
 
                     // recursively fetch all submodules (without fetching latest)
                     git.submodule_update(false, false, false, true, Some(&libs))?;
+                    lockfile.write()?;
                 }
-
                 Err(err) => {
-                    warn!(?err, "Failed to check for submodules");
+                    sh_err!("Failed to check for submodules: {err}")?;
                 }
                 _ => {
                     // no submodules, nothing to do
@@ -144,15 +162,16 @@ impl DependencyInstallOpts {
                 .strip_prefix(git.root)
                 .wrap_err("Library directory is not relative to the repository root")?;
             sh_println!(
-                "Installing {} in {} (url: {:?}, tag: {:?})",
+                "Installing {} in {} (url: {}, tag: {})",
                 dep.name,
                 path.display(),
-                dep.url,
-                dep.tag
+                dep.url.as_deref().unwrap_or("None"),
+                dep.tag.as_deref().unwrap_or("None")
             )?;
 
             // this tracks the actual installed tag
             let installed_tag;
+            let mut dep_id = None;
             if no_git {
                 installed_tag = installer.install_as_folder(&dep, &path)?;
             } else {
@@ -161,15 +180,30 @@ impl DependencyInstallOpts {
                 }
                 installed_tag = installer.install_as_submodule(&dep, &path)?;
 
+                let mut new_insertion = false;
                 // Pin branch to submodule if branch is used
-                if let Some(branch) = &installed_tag {
+                if let Some(tag_or_branch) = &installed_tag {
                     // First, check if this tag has a branch
-                    if git.has_branch(branch, &path)? {
+                    dep_id = Some(DepIdentifier::resolve_type(&git, &path, tag_or_branch)?);
+                    if git.has_branch(tag_or_branch, &path)?
+                        && dep_id.as_ref().is_some_and(|id| id.is_branch())
+                    {
                         // always work with relative paths when directly modifying submodules
-                        git.cmd()
-                            .args(["submodule", "set-branch", "-b", branch])
-                            .arg(rel_path)
-                            .exec()?;
+                        git.set_submodule_branch(rel_path, tag_or_branch)?;
+
+                        let rev = git.get_rev(tag_or_branch, &path)?;
+
+                        dep_id = Some(DepIdentifier::Branch {
+                            name: tag_or_branch.clone(),
+                            rev,
+                            r#override: false,
+                        });
+                    }
+
+                    trace!(?dep_id, ?tag_or_branch, "resolved dep id");
+                    if let Some(dep_id) = &dep_id {
+                        new_insertion = true;
+                        lockfile.insert(rel_path.to_path_buf(), dep_id.clone());
                     }
 
                     if commit {
@@ -180,14 +214,31 @@ impl DependencyInstallOpts {
                     }
                 }
 
+                if new_insertion
+                    || out_of_sync_deps.as_ref().is_some_and(|o| !o.is_empty())
+                    || !lockfile.exists()
+                {
+                    lockfile.write()?;
+                }
+
                 // commit the installation
                 if commit {
                     let mut msg = String::with_capacity(128);
                     msg.push_str("forge install: ");
                     msg.push_str(dep.name());
+
                     if let Some(tag) = &installed_tag {
                         msg.push_str("\n\n");
-                        msg.push_str(tag);
+
+                        if let Some(dep_id) = &dep_id {
+                            msg.push_str(&dep_id.to_string());
+                        } else {
+                            msg.push_str(tag);
+                        }
+                    }
+
+                    if !lockfile.is_empty() {
+                        git.root(&config.root).add(Some(FOUNDRY_LOCK))?;
                     }
                     git.commit(&msg)?;
                 }
@@ -196,9 +247,19 @@ impl DependencyInstallOpts {
             let mut msg = format!("    {} {}", "Installed".green(), dep.name);
             if let Some(tag) = dep.tag.or(installed_tag) {
                 msg.push(' ');
-                msg.push_str(tag.as_str());
+
+                if let Some(dep_id) = dep_id {
+                    msg.push_str(&dep_id.to_string());
+                } else {
+                    msg.push_str(tag.as_str());
+                }
             }
             sh_println!("{msg}")?;
+
+            // Check if the dependency has soldeer.lock and install soldeer dependencies
+            if let Err(e) = install_soldeer_deps_if_needed(&path).await {
+                sh_warn!("Failed to install soldeer dependencies for {}: {e}", dep.name)?;
+            }
         }
 
         // update `libs` in config if not included yet
@@ -206,12 +267,43 @@ impl DependencyInstallOpts {
             config.libs.push(install_lib_dir.to_path_buf());
             config.update_libs()?;
         }
+
         Ok(())
     }
 }
 
-pub fn install_missing_dependencies(config: &mut Config) -> bool {
-    DependencyInstallOpts::default().install_missing_dependencies(config)
+pub async fn install_missing_dependencies(config: &mut Config) -> bool {
+    DependencyInstallOpts::default().install_missing_dependencies(config).await
+}
+
+/// Checks if a dependency has soldeer.lock and installs soldeer dependencies if needed.
+async fn install_soldeer_deps_if_needed(dep_path: &Path) -> Result<()> {
+    let soldeer_lock = dep_path.join("soldeer.lock");
+
+    if soldeer_lock.exists() {
+        sh_println!("    Found soldeer.lock, installing soldeer dependencies...")?;
+
+        // Change to the dependency directory and run soldeer install
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(dep_path)?;
+
+        let result = soldeer_commands::run(
+            Command::Install(Install::default()),
+            Verbosity::new(
+                foundry_common::shell::verbosity(),
+                if foundry_common::shell::is_quiet() { 1 } else { 0 },
+            ),
+        )
+        .await;
+
+        // Change back to original directory
+        std::env::set_current_dir(original_dir)?;
+
+        result.map_err(|e| eyre::eyre!("Failed to run soldeer install: {e}"))?;
+        sh_println!("    Soldeer dependencies installed successfully")?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,8 +324,10 @@ impl Installer<'_> {
             dep.tag = self.last_tag(path);
         }
 
-        // checkout the tag if necessary
-        self.git_checkout(&dep, path, false)?;
+        // checkout the tag if necessary, using recursive checkout to properly clean up
+        // nested submodules that may exist on the default branch but not on the target tag.
+        // See: https://github.com/foundry-rs/foundry/issues/13688
+        self.git_checkout(&dep, path, true)?;
 
         trace!("updating dependency submodules recursively");
         self.git.root(path).submodule_update(
@@ -244,10 +338,49 @@ impl Installer<'_> {
             std::iter::empty::<PathBuf>(),
         )?;
 
+        // remove nested .git directories from submodules before removing the top-level .git
+        Self::remove_nested_git_dirs(path)?;
+
         // remove git artifacts
         fs::remove_dir_all(path.join(".git"))?;
 
         Ok(dep.tag)
+    }
+
+    /// Recursively removes `.git` files/directories from nested submodules within `root`.
+    ///
+    /// Submodules typically have a `.git` file (not a directory) pointing to the parent's
+    /// `.git/modules/` directory. This cleans those up so the result is a plain folder tree.
+    fn remove_nested_git_dirs(root: &Path) -> Result<()> {
+        Self::remove_nested_git_dirs_inner(root, root)
+    }
+
+    fn remove_nested_git_dirs_inner(root: &Path, dir: &Path) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+
+            // never follow symlinks
+            if ft.is_symlink() {
+                continue;
+            }
+
+            let path = entry.path();
+            if path.file_name() == Some(".git".as_ref()) && path.parent() != Some(root) {
+                if ft.is_dir() {
+                    fs::remove_dir_all(&path)?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+            } else if ft.is_dir() {
+                Self::remove_nested_git_dirs_inner(root, &path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Installs the dependency as new submodule.
@@ -306,7 +439,7 @@ impl Installer<'_> {
             for &prefix in common_prefixes {
                 if let Some(rem) = tag.strip_prefix(prefix) {
                     maybe_semver = rem;
-                    break
+                    break;
                 }
             }
             match Version::parse(maybe_semver) {
@@ -362,21 +495,17 @@ impl Installer<'_> {
             if e.to_string().contains("did not match any file(s) known to git") {
                 e = eyre::eyre!("Tag: \"{tag}\" not found for repo \"{url}\"!")
             }
-            return Err(e)
+            return Err(e);
         }
 
-        if is_branch {
-            Ok(tag)
-        } else {
-            Ok(String::new())
-        }
+        if is_branch { Ok(tag) } else { Ok(String::new()) }
     }
 
     /// disambiguate tag if it is a version tag
     fn match_tag(self, tag: &str, path: &Path) -> Result<String> {
         // only try to match if it looks like a version tag
         if !DEPENDENCY_VERSION_TAG_REGEX.is_match(tag) {
-            return Ok(tag.into())
+            return Ok(tag.into());
         }
 
         // generate candidate list by filtering `git tag` output, valid ones are those "starting
@@ -394,13 +523,13 @@ impl Installer<'_> {
 
         // no match found, fall back to the user-provided tag
         if candidates.is_empty() {
-            return Ok(tag.into())
+            return Ok(tag.into());
         }
 
         // have exact match
         for candidate in &candidates {
             if candidate == tag {
-                return Ok(tag.into())
+                return Ok(tag.into());
             }
         }
 
@@ -410,7 +539,7 @@ impl Installer<'_> {
             let input = prompt!(
                 "Found a similar version tag: {matched_tag}, do you want to use this instead? [Y/n] "
             )?;
-            return if match_yn(input) { Ok(matched_tag.clone()) } else { Ok(tag.into()) }
+            return if match_yn(input) { Ok(matched_tag.clone()) } else { Ok(tag.into()) };
         }
 
         // multiple candidates, ask the user to choose one or skip
@@ -433,16 +562,16 @@ impl Installer<'_> {
                 Ok(i) if (1..=n_candidates).contains(&i) => {
                     let c = &candidates[i];
                     sh_println!("[{i}] {c} selected")?;
-                    return Ok(c.clone())
+                    return Ok(c.clone());
                 }
-                _ => continue,
+                _ => {}
             }
         }
     }
 
     fn match_branch(self, tag: &str, path: &Path) -> Result<Option<String>> {
         // fetch remote branches and check for tag
-        let output = self.git.root(path).cmd().args(["branch", "-r"]).get_stdout_lossy()?;
+        let output = self.git.root(path).remote_branches()?;
 
         let mut candidates = output
             .lines()
@@ -456,13 +585,13 @@ impl Installer<'_> {
 
         // no match found, fall back to the user-provided tag
         if candidates.is_empty() {
-            return Ok(None)
+            return Ok(None);
         }
 
         // have exact match
         for candidate in &candidates {
             if candidate == tag {
-                return Ok(Some(tag.to_string()))
+                return Ok(Some(tag.to_string()));
             }
         }
 
@@ -472,7 +601,7 @@ impl Installer<'_> {
             let input = prompt!(
                 "Found a similar branch: {matched_tag}, do you want to use this instead? [Y/n] "
             )?;
-            return if match_yn(input) { Ok(Some(matched_tag.clone())) } else { Ok(None) }
+            return if match_yn(input) { Ok(Some(matched_tag.clone())) } else { Ok(None) };
         }
 
         // multiple candidates, ask the user to choose one or skip
@@ -492,7 +621,7 @@ impl Installer<'_> {
         // default selection, return None
         if input.is_empty() {
             sh_println!("Canceled branch matching")?;
-            return Ok(None)
+            return Ok(None);
         }
 
         // match user input, 0 indicates skipping and use original tag

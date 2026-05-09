@@ -68,7 +68,7 @@ impl FromStr for Dependency {
             for (alias, real_org) in COMMON_ORG_ALIASES {
                 if dependency.starts_with(alias) {
                     dependency = dependency.replacen(alias, real_org, 1);
-                    break
+                    break;
                 }
             }
 
@@ -87,6 +87,8 @@ impl FromStr for Dependency {
                     token.as_str(),
                     project.trim_end_matches(".git")
                 ))
+            } else if dependency.starts_with("git@") {
+                Some(format!("git@{brand}.{tld}:{}", project.trim_end_matches(".git")))
             } else {
                 Some(format!("https://{brand}.{tld}/{}", project.trim_end_matches(".git")))
             }
@@ -117,11 +119,11 @@ impl FromStr for Dependency {
 
             if tag_or_branch.is_none() {
                 let maybe_tag_or_branch = split.next().unwrap();
-                if let Some(actual_url) = split.next() {
-                    if !maybe_tag_or_branch.contains('/') {
-                        tag_or_branch = Some(maybe_tag_or_branch.to_string());
-                        url = actual_url;
-                    }
+                if let Some(actual_url) = split.next()
+                    && !maybe_tag_or_branch.contains('/')
+                {
+                    tag_or_branch = Some(maybe_tag_or_branch.to_string());
+                    url = actual_url;
                 }
             }
 
@@ -160,7 +162,7 @@ mod tests {
 
     #[test]
     fn parses_dependencies() {
-        [
+        for (input, expected_path, expected_tag, expected_alias) in [
             ("gakonst/lootloose", "https://github.com/gakonst/lootloose", None, None),
             ("github.com/gakonst/lootloose", "https://github.com/gakonst/lootloose", None, None),
             (
@@ -176,17 +178,12 @@ mod tests {
                 None,
             ),
             (
-                "git@github.com:gakonst/lootloose@v1",
-                "https://github.com/gakonst/lootloose",
+                "git@github.com:gakonst/lootloose@tag=v1",
+                "git@github.com:gakonst/lootloose",
                 Some("v1"),
                 None,
             ),
-            (
-                "git@github.com:gakonst/lootloose",
-                "https://github.com/gakonst/lootloose",
-                None,
-                None,
-            ),
+            ("git@github.com:gakonst/lootloose", "git@github.com:gakonst/lootloose", None, None),
             (
                 "https://gitlab.com/gakonst/lootloose",
                 "https://gitlab.com/gakonst/lootloose",
@@ -237,20 +234,18 @@ mod tests {
                 Some("loot"),
             ),
             (
-                "loot=git@github.com:gakonst/lootloose@v1",
-                "https://github.com/gakonst/lootloose",
+                "loot=git@github.com:gakonst/lootloose@tag=v1",
+                "git@github.com:gakonst/lootloose",
                 Some("v1"),
                 Some("loot"),
             ),
-        ]
-        .iter()
-        .for_each(|(input, expected_path, expected_tag, expected_alias)| {
+        ] {
             let dep = Dependency::from_str(input).unwrap();
             assert_eq!(dep.url, Some(expected_path.to_string()));
             assert_eq!(dep.tag, expected_tag.map(ToString::to_string));
             assert_eq!(dep.name, "lootloose");
             assert_eq!(dep.alias, expected_alias.map(ToString::to_string));
-        });
+        }
     }
 
     #[test]
@@ -270,28 +265,26 @@ mod tests {
 
     #[test]
     fn parses_contract_info() {
-        [
+        for (input, expected_path, expected_name) in [
             (
                 "src/contracts/Contracts.sol:Contract",
                 Some("src/contracts/Contracts.sol"),
                 "Contract",
             ),
             ("Contract", None, "Contract"),
-        ]
-        .iter()
-        .for_each(|(input, expected_path, expected_name)| {
+        ] {
             let contract = ContractInfo::from_str(input).unwrap();
             assert_eq!(contract.path, expected_path.map(ToString::to_string));
             assert_eq!(contract.name, expected_name.to_string());
-        });
+        }
     }
 
     #[test]
     fn contract_info_should_reject_without_name() {
-        ["src/contracts/", "src/contracts/Contracts.sol"].iter().for_each(|input| {
+        for input in ["src/contracts/", "src/contracts/Contracts.sol"] {
             let contract = ContractInfo::from_str(input);
-            assert!(contract.is_err())
-        });
+            assert!(contract.is_err());
+        }
     }
 
     #[test]

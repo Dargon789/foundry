@@ -1,89 +1,29 @@
 use crate::eth::{
+    EthApi,
     error::{BlockchainError, Result},
     macros::node_info,
-    EthApi,
 };
-use alloy_consensus::Transaction as TransactionTrait;
+use alloy_consensus::{BlockHeader, Transaction as TransactionTrait};
 use alloy_network::{
     AnyHeader, AnyRpcBlock, AnyRpcHeader, AnyRpcTransaction, AnyTxEnvelope, BlockResponse,
-    TransactionResponse,
+    ReceiptResponse, TransactionResponse,
 };
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types::{
+    Block, BlockId, BlockNumberOrTag as BlockNumber, BlockTransactions,
     trace::{
         otterscan::{
             BlockDetails, ContractCreator, InternalOperation, OtsBlock, OtsBlockTransactions,
             OtsReceipt, OtsSlimBlock, OtsTransactionReceipt, TraceEntry, TransactionsWithReceipts,
         },
-        parity::{
-            Action, CallAction, CallType, CreateAction, CreateOutput, LocalizedTransactionTrace,
-            RewardAction, TraceOutput,
-        },
+        parity::{Action, CreateAction, CreateOutput, TraceOutput},
     },
-    Block, BlockId, BlockNumberOrTag as BlockNumber, BlockTransactions,
 };
+use foundry_primitives::FoundryNetwork;
+use futures::future::join_all;
 use itertools::Itertools;
 
-use futures::future::join_all;
-
-pub fn mentions_address(trace: LocalizedTransactionTrace, address: Address) -> Option<B256> {
-    match (trace.trace.action, trace.trace.result) {
-        (Action::Call(CallAction { from, to, .. }), _) if from == address || to == address => {
-            trace.transaction_hash
-        }
-        (_, Some(TraceOutput::Create(CreateOutput { address: created_address, .. })))
-            if created_address == address =>
-        {
-            trace.transaction_hash
-        }
-        (Action::Create(CreateAction { from, .. }), _) if from == address => trace.transaction_hash,
-        (Action::Reward(RewardAction { author, .. }), _) if author == address => {
-            trace.transaction_hash
-        }
-        _ => None,
-    }
-}
-
-/// Converts the list of traces for a transaction into the expected Otterscan format.
-///
-/// Follows format specified in the [`ots_traceTransaction`](https://docs.otterscan.io/api-docs/ots-api#ots_tracetransaction) spec.
-pub fn batch_build_ots_traces(traces: Vec<LocalizedTransactionTrace>) -> Vec<TraceEntry> {
-    traces
-        .into_iter()
-        .filter_map(|trace| {
-            let output = trace
-                .trace
-                .result
-                .map(|r| match r {
-                    TraceOutput::Call(output) => output.output,
-                    TraceOutput::Create(output) => output.code,
-                })
-                .unwrap_or_default();
-            match trace.trace.action {
-                Action::Call(call) => Some(TraceEntry {
-                    r#type: match call.call_type {
-                        CallType::Call => "CALL",
-                        CallType::CallCode => "CALLCODE",
-                        CallType::DelegateCall => "DELEGATECALL",
-                        CallType::StaticCall => "STATICCALL",
-                        CallType::AuthCall => "AUTHCALL",
-                        CallType::None => "NONE",
-                    }
-                    .to_string(),
-                    depth: trace.trace.trace_address.len() as u32,
-                    from: call.from,
-                    to: call.to,
-                    value: Some(call.value),
-                    input: call.input,
-                    output,
-                }),
-                Action::Create(_) | Action::Selfdestruct(_) | Action::Reward(_) => None,
-            }
-        })
-        .collect()
-}
-
-impl EthApi {
+impl EthApi<FoundryNetwork> {
     /// Otterscan currently requires this endpoint, even though it's not part of the `ots_*`.
     /// Ref: <https://github.com/otterscan/otterscan/blob/071d8c55202badf01804f6f8d53ef9311d4a9e47/src/useProvider.ts#L71>
     ///
@@ -93,7 +33,7 @@ impl EthApi {
         &self,
         number: BlockNumber,
     ) -> Result<Option<AnyRpcBlock>> {
-        node_info!("ots_getApiLevel");
+        node_info!("erigon_getHeaderByNumber");
 
         self.backend.block_by_number(number).await
     }
@@ -126,20 +66,29 @@ impl EthApi {
     }
 
     /// Trace a transaction and generate a trace call tree.
+    /// Converts the list of traces for a transaction into the expected Otterscan format.
+    ///
+    /// Follows format specified in the [`ots_traceTransaction`](https://docs.otterscan.io/api-docs/ots-api#ots_tracetransaction) spec.
     pub async fn ots_trace_transaction(&self, hash: B256) -> Result<Vec<TraceEntry>> {
         node_info!("ots_traceTransaction");
-
-        Ok(batch_build_ots_traces(self.backend.trace_transaction(hash).await?))
+        let traces = self
+            .backend
+            .trace_transaction(hash)
+            .await?
+            .into_iter()
+            .filter_map(|trace| TraceEntry::from_transaction_trace(&trace.trace))
+            .collect();
+        Ok(traces)
     }
 
     /// Given a transaction hash, returns its raw revert reason.
     pub async fn ots_get_transaction_error(&self, hash: B256) -> Result<Bytes> {
         node_info!("ots_getTransactionError");
 
-        if let Some(receipt) = self.backend.mined_transaction_receipt(hash) {
-            if !receipt.inner.inner.as_receipt_with_bloom().receipt.status.coerce_status() {
-                return Ok(receipt.out.map(|b| b.0.into()).unwrap_or(Bytes::default()));
-            }
+        if let Some(receipt) = self.backend.mined_transaction_receipt(hash)
+            && !receipt.inner.as_ref().status()
+        {
+            return Ok(receipt.out.unwrap_or_default());
         }
 
         Ok(Bytes::default())
@@ -206,9 +155,12 @@ impl EthApi {
 
         let best = self.backend.best_number();
         // we go from given block (defaulting to best) down to first block
-        // considering only post-fork
+        // considering only post-fork (or post-genesis in non-fork mode)
         let from = if block_number == 0 { best } else { block_number - 1 };
-        let to = self.get_fork().map(|f| f.block_number() + 1).unwrap_or(1);
+        let to = self
+            .get_fork()
+            .map(|f| f.block_number() + 1)
+            .unwrap_or_else(|| self.backend.genesis_number() + 1);
 
         let first_page = from >= best;
         let mut last_page = false;
@@ -220,7 +172,8 @@ impl EthApi {
                 let hashes = traces
                     .into_iter()
                     .rev()
-                    .filter_map(|trace| mentions_address(trace, address))
+                    .filter(|trace| trace.contains_address(address))
+                    .filter_map(|trace| trace.transaction_hash)
                     .unique();
 
                 if res.len() >= page_size {
@@ -248,8 +201,11 @@ impl EthApi {
         node_info!("ots_searchTransactionsAfter");
 
         let best = self.backend.best_number();
-        // we go from the first post-fork block, up to the tip
-        let first_block = self.get_fork().map(|f| f.block_number() + 1).unwrap_or(1);
+        // we go from the first post-fork (or post-genesis) block, up to the tip
+        let first_block = self
+            .get_fork()
+            .map(|f| f.block_number() + 1)
+            .unwrap_or_else(|| self.backend.genesis_number() + 1);
         let from = if block_number == 0 { first_block } else { block_number + 1 };
         let to = best;
 
@@ -267,7 +223,8 @@ impl EthApi {
                 let hashes = traces
                     .into_iter()
                     .rev()
-                    .filter_map(|trace| mentions_address(trace, address))
+                    .filter(|trace| trace.contains_address(address))
+                    .filter_map(|trace| trace.transaction_hash)
                     .unique();
 
                 if res.len() >= page_size {
@@ -297,7 +254,10 @@ impl EthApi {
     ) -> Result<Option<B256>> {
         node_info!("ots_getTransactionBySenderAndNonce");
 
-        let from = self.get_fork().map(|f| f.block_number() + 1).unwrap_or_default();
+        let from = self
+            .get_fork()
+            .map(|f| f.block_number() + 1)
+            .unwrap_or_else(|| self.backend.genesis_number() + 1);
         let to = self.backend.best_number();
 
         for n in (from..=to).rev() {
@@ -382,9 +342,9 @@ impl EthApi {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let total_fees = receipts
-            .iter()
-            .fold(0, |acc, receipt| acc + (receipt.gas_used as u128) * receipt.effective_gas_price);
+        let total_fees = receipts.iter().fold(0, |acc, receipt| {
+            acc + (receipt.gas_used() as u128) * receipt.effective_gas_price()
+        });
 
         let Block { header, uncles, transactions, withdrawals } = block.into_inner();
 
@@ -418,18 +378,19 @@ impl EthApi {
                 txs.iter().skip(page * page_size).take(page_size).cloned().collect(),
             ),
             BlockTransactions::Hashes(txs) => BlockTransactions::Hashes(
-                txs.iter().skip(page * page_size).take(page_size).cloned().collect(),
+                txs.iter().skip(page * page_size).take(page_size).copied().collect(),
             ),
             BlockTransactions::Uncle => unreachable!(),
         };
 
         let receipt_futs = block.transactions.hashes().map(|hash| self.transaction_receipt(hash));
 
-        let receipts = join_all(receipt_futs.map(|r| async {
+        // Reuse timestamp from the block we already have
+        let timestamp = block.header.timestamp();
+
+        let receipts = join_all(receipt_futs.map(|r| async move {
             if let Ok(Some(r)) = r.await {
-                let block = self.block_by_number(r.block_number.unwrap().into()).await?;
-                let timestamp = block.ok_or(BlockchainError::BlockNotFound)?.header.timestamp;
-                let receipt = r.map_inner(OtsReceipt::from);
+                let receipt = r.as_ref().inner.clone().map_inner(OtsReceipt::from);
                 Ok(OtsTransactionReceipt { receipt, timestamp: Some(timestamp) })
             } else {
                 Err(BlockchainError::BlockNotFound)
@@ -468,9 +429,15 @@ impl EthApi {
 
         let receipts = join_all(receipt_futs.map(|r| async {
             if let Ok(Some(r)) = r.await {
-                let block = self.block_by_number(r.block_number.unwrap().into()).await?;
-                let timestamp = block.ok_or(BlockchainError::BlockNotFound)?.header.timestamp;
-                let receipt = r.map_inner(OtsReceipt::from);
+                // Try to get timestamp from receipt's other fields first (set by mined receipts),
+                // fallback to block lookup for fork receipts that may not have it
+                let timestamp = if let Some(ts) = r.block_timestamp() {
+                    ts
+                } else {
+                    let block = self.block_by_number(r.block_number().unwrap().into()).await?;
+                    block.ok_or(BlockchainError::BlockNotFound)?.header.timestamp()
+                };
+                let receipt = r.as_ref().inner.clone().map_inner(OtsReceipt::from);
                 Ok(OtsTransactionReceipt { receipt, timestamp: Some(timestamp) })
             } else {
                 Err(BlockchainError::BlockNotFound)

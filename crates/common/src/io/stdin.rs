@@ -20,7 +20,6 @@ where
 }
 
 /// Shortcut for `(unwrap(a), unwrap(b))`.
-#[inline]
 pub fn unwrap2<A, B>(a: Option<A>, b: Option<B>) -> Result<(A, B)>
 where
     A: FromStr,
@@ -50,7 +49,6 @@ where
 }
 
 /// Short-hand for `unwrap(value, true)`.
-#[inline]
 pub fn unwrap_line<T>(value: Option<T>) -> Result<T>
 where
     T: FromStr,
@@ -62,7 +60,6 @@ where
 /// Reads bytes from [`stdin`][io::stdin] into a String.
 ///
 /// If `read_line` is true, stop at the first newline (the `0xA` byte).
-#[inline]
 pub fn parse<T>(read_line: bool) -> Result<T>
 where
     T: FromStr,
@@ -72,7 +69,6 @@ where
 }
 
 /// Short-hand for `parse(true)`.
-#[inline]
 pub fn parse_line<T>() -> Result<T>
 where
     T: FromStr,
@@ -84,7 +80,6 @@ where
 /// Reads bytes from [`stdin`][io::stdin] into a String.
 ///
 /// If `read_line` is true, stop at the first newline (the `0xA` byte).
-#[inline]
 pub fn read(read_line: bool) -> Result<String> {
     let bytes = read_bytes(read_line)?;
 
@@ -106,8 +101,11 @@ pub fn read_bytes(read_line: bool) -> Result<Vec<u8>> {
         let mut buf = String::new();
         stdin.read_line(&mut buf)?;
         // remove the trailing newline
-        if let Some(b'\n') = buf.as_bytes().last() {
+        if matches!(buf.as_bytes().last(), Some(b'\n')) {
             buf.pop();
+            if matches!(buf.as_bytes().last(), Some(b'\r')) {
+                buf.pop();
+            }
         }
         Ok(buf.into_bytes())
     } else {

@@ -1,12 +1,16 @@
-use alloy_json_abi::{ContractObject, JsonAbi};
+use alloy_json_abi::{ContractObject, JsonAbi, ToSolConfig};
 use alloy_primitives::Address;
 use clap::Parser;
 use eyre::{Context, Result};
-use foundry_block_explorers::Client;
-use foundry_cli::{opts::EtherscanOpts, utils::LoadConfig};
+use forge_fmt::FormatterConfig;
+use foundry_cli::{
+    opts::EtherscanOpts,
+    utils::{LoadConfig, fetch_abi_from_etherscan},
+};
 use foundry_common::{
+    ContractsByArtifact,
     compile::{PathOrContractInfo, ProjectCompiler},
-    find_target_path, fs, shell, ContractsByArtifact,
+    find_target_path, fs, shell,
 };
 use foundry_config::load_config;
 use itertools::Itertools;
@@ -46,17 +50,23 @@ pub struct InterfaceArgs {
     )]
     output: Option<PathBuf>,
 
+    /// If set, generate all types in a single interface, inlining any inherited or library types.
+    ///
+    /// This can fail if there are structs with the same name in different interfaces.
+    #[arg(long)]
+    flatten: bool,
+
     #[command(flatten)]
     etherscan: EtherscanOpts,
 }
 
 impl InterfaceArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { contract, name, pragma, output: output_location, etherscan } = self;
+        let Self { contract, name, pragma, output: output_location, flatten, etherscan } = self;
 
         // Determine if the target contract is an ABI file, a local contract or an Ethereum address.
-        let abis = if Path::new(&contract).is_file() &&
-            fs::read_to_string(&contract)
+        let abis = if Path::new(&contract).is_file()
+            && fs::read_to_string(&contract)
                 .ok()
                 .and_then(|content| serde_json::from_str::<Value>(&content).ok())
                 .is_some()
@@ -64,13 +74,16 @@ impl InterfaceArgs {
             load_abi_from_file(&contract, name)?
         } else {
             match Address::from_str(&contract) {
-                Ok(address) => fetch_abi_from_etherscan(address, &etherscan).await?,
+                Ok(address) => fetch_abi_from_etherscan(address, &etherscan.load_config()?).await?,
                 Err(_) => load_abi_from_artifact(&contract)?,
             }
         };
 
+        // Build config for to_sol conversion.
+        let config = flatten.then(|| ToSolConfig::new().one_contract(true));
+
         // Retrieve interfaces from the array of ABIs.
-        let interfaces = get_interfaces(abis)?;
+        let interfaces = get_interfaces(abis, config)?;
 
         // Print result or write to file.
         let res = if shell::is_json() {
@@ -136,32 +149,27 @@ fn load_abi_from_artifact(path_or_contract: &str) -> Result<Vec<(JsonAbi, String
     Ok(vec![(abi.clone(), contract.name().unwrap_or(name).to_string())])
 }
 
-/// Fetches the ABI of a contract from Etherscan.
-pub async fn fetch_abi_from_etherscan(
-    address: Address,
-    etherscan: &EtherscanOpts,
-) -> Result<Vec<(JsonAbi, String)>> {
-    let config = etherscan.load_config()?;
-    let chain = config.chain.unwrap_or_default();
-    let api_version = config.get_etherscan_api_version(Some(chain));
-    let api_key = config.get_etherscan_api_key(Some(chain)).unwrap_or_default();
-    let client = Client::new_with_api_version(chain, api_key, api_version)?;
-    let source = client.contract_source_code(address).await?;
-    source.items.into_iter().map(|item| Ok((item.abi()?, item.contract_name))).collect()
-}
-
 /// Converts a vector of tuples containing the ABI and contract name into a vector of
 /// `InterfaceSource` objects.
-fn get_interfaces(abis: Vec<(JsonAbi, String)>) -> Result<Vec<InterfaceSource>> {
+fn get_interfaces(
+    abis: Vec<(JsonAbi, String)>,
+    config: Option<ToSolConfig>,
+) -> Result<Vec<InterfaceSource>> {
     abis.into_iter()
         .map(|(contract_abi, name)| {
-            let source = match foundry_cli::utils::abi_to_solidity(&contract_abi, &name) {
+            let source = match forge_fmt::format(
+                &contract_abi.to_sol(&name, config.clone()),
+                FormatterConfig::default(),
+            )
+            .into_result()
+            {
                 Ok(generated_source) => generated_source,
                 Err(e) => {
                     sh_warn!("Failed to format interface for {name}: {e}")?;
-                    contract_abi.to_sol(&name, None)
+                    contract_abi.to_sol(&name, config.clone())
                 }
             };
+
             Ok(InterfaceSource { json_abi: serde_json::to_string_pretty(&contract_abi)?, source })
         })
         .collect()

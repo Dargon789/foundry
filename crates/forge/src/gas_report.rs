@@ -5,12 +5,10 @@ use crate::{
     traces::{CallTraceArena, CallTraceDecoder, CallTraceNode, DecodedCallData},
 };
 use alloy_primitives::map::HashSet;
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, Cell, Color, Table};
-use foundry_common::{
-    calc,
-    reports::{report_kind, ReportKind},
-    TestFunctionExt,
+use comfy_table::{
+    Cell, CellAlignment, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::ASCII_MARKDOWN,
 };
+use foundry_common::{TestFunctionExt, calc, shell};
 use foundry_evm::traces::CallKind;
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +20,6 @@ use std::{collections::BTreeMap, fmt::Display};
 pub struct GasReport {
     /// Whether to report any contracts.
     report_any: bool,
-    /// What kind of report to generate.
-    report_kind: ReportKind,
     /// Contracts to generate the report for.
     report_for: HashSet<String>,
     /// Contracts to ignore when generating the report.
@@ -44,14 +40,7 @@ impl GasReport {
         let report_for = report_for.into_iter().collect::<HashSet<_>>();
         let ignore = ignore.into_iter().collect::<HashSet<_>>();
         let report_any = report_for.is_empty() || report_for.contains("*");
-        Self {
-            report_any,
-            report_kind: report_kind(),
-            report_for,
-            ignore,
-            include_tests,
-            ..Default::default()
-        }
+        Self { report_any, report_for, ignore, include_tests, ..Default::default() }
     }
 
     /// Whether the given contract should be reported.
@@ -98,7 +87,7 @@ impl GasReport {
         if !self.should_report(contract_name) {
             return;
         }
-        let contract_info = self.contracts.entry(name.to_string()).or_default();
+        let contract_info = self.contracts.entry(name.clone()).or_default();
         let is_create_call = trace.kind.is_any_create();
 
         // Record contract deployment size.
@@ -156,20 +145,17 @@ impl GasReport {
 
 impl Display for GasReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match self.report_kind {
-            ReportKind::Text => {
-                for (name, contract) in &self.contracts {
-                    if contract.functions.is_empty() {
-                        trace!(name, "gas report contract without functions");
-                        continue;
-                    }
-
-                    let table = self.format_table_output(contract, name);
-                    writeln!(f, "\n{table}")?;
+        if shell::is_json() {
+            writeln!(f, "{}", self.format_json_output())?;
+        } else {
+            for (name, contract) in &self.contracts {
+                if contract.functions.is_empty() {
+                    trace!(name, "gas report contract without functions");
+                    continue;
                 }
-            }
-            ReportKind::JSON => {
-                writeln!(f, "{}", &self.format_json_output())?;
+
+                let table = self.format_table_output(contract, name);
+                writeln!(f, "\n{table}")?;
             }
         }
 
@@ -191,8 +177,8 @@ impl GasReport {
 
                     let functions = contract
                         .functions
-                        .iter()
-                        .flat_map(|(_, sigs)| {
+                        .values()
+                        .flat_map(|sigs| {
                             sigs.iter().map(|(sig, gas_info)| {
                                 let display_name = sig.replace(':', "");
                                 (display_name, gas_info)
@@ -216,7 +202,11 @@ impl GasReport {
 
     fn format_table_output(&self, contract: &ContractInfo, name: &str) -> Table {
         let mut table = Table::new();
-        table.apply_modifier(UTF8_ROUND_CORNERS);
+        if shell::is_markdown() {
+            table.load_preset(ASCII_MARKDOWN);
+        } else {
+            table.apply_modifier(UTF8_ROUND_CORNERS);
+        }
 
         table.set_header(vec![Cell::new(format!("{name} Contract")).fg(Color::Magenta)]);
 
@@ -225,8 +215,8 @@ impl GasReport {
             Cell::new("Deployment Size").fg(Color::Cyan),
         ]);
         table.add_row(vec![
-            Cell::new(contract.gas.to_string()),
-            Cell::new(contract.size.to_string()),
+            Cell::new(contract.gas.to_string()).set_alignment(CellAlignment::Right),
+            Cell::new(contract.size.to_string()).set_alignment(CellAlignment::Right),
         ]);
 
         // Add a blank row to separate deployment info from function info.
@@ -241,22 +231,30 @@ impl GasReport {
             Cell::new("# Calls").fg(Color::Cyan),
         ]);
 
-        contract.functions.iter().for_each(|(fname, sigs)| {
-            sigs.iter().for_each(|(sig, gas_info)| {
+        for (fname, sigs) in &contract.functions {
+            for (sig, gas_info) in sigs {
                 // Show function signature if overloaded else display function name.
                 let display_name =
-                    if sigs.len() == 1 { fname.to_string() } else { sig.replace(':', "") };
+                    if sigs.len() == 1 { fname.clone() } else { sig.replace(':', "") };
 
                 table.add_row(vec![
                     Cell::new(display_name),
-                    Cell::new(gas_info.min.to_string()).fg(Color::Green),
-                    Cell::new(gas_info.mean.to_string()).fg(Color::Yellow),
-                    Cell::new(gas_info.median.to_string()).fg(Color::Yellow),
-                    Cell::new(gas_info.max.to_string()).fg(Color::Red),
-                    Cell::new(gas_info.calls.to_string()),
+                    Cell::new(gas_info.min.to_string())
+                        .fg(Color::Green)
+                        .set_alignment(CellAlignment::Right),
+                    Cell::new(gas_info.mean.to_string())
+                        .fg(Color::Yellow)
+                        .set_alignment(CellAlignment::Right),
+                    Cell::new(gas_info.median.to_string())
+                        .fg(Color::Yellow)
+                        .set_alignment(CellAlignment::Right),
+                    Cell::new(gas_info.max.to_string())
+                        .fg(Color::Red)
+                        .set_alignment(CellAlignment::Right),
+                    Cell::new(gas_info.calls.to_string()).set_alignment(CellAlignment::Right),
                 ]);
-            })
-        });
+            }
+        }
 
         table
     }

@@ -5,120 +5,161 @@
 
 # Cargo profile for builds.
 PROFILE ?= dev
+
 # The docker image name
 DOCKER_IMAGE_NAME ?= ghcr.io/foundry-rs/foundry:latest
+
 BIN_DIR = dist/bin
 CARGO_TARGET_DIR ?= target
 
 # List of features to use when building. Can be overridden via the environment.
 # No jemalloc on Windows
 ifeq ($(OS),Windows_NT)
-    FEATURES ?= aws-kms gcp-kms cli asm-keccak
+    FEATURES ?= aws-kms gcp-kms turnkey cli asm-keccak
 else
-    FEATURES ?= jemalloc aws-kms gcp-kms cli asm-keccak
+    FEATURES ?= jemalloc aws-kms gcp-kms turnkey cli asm-keccak
 endif
 
 ##@ Help
 
 .PHONY: help
 help: ## Display this help.
-	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
 
 .PHONY: build
 build: ## Build the project.
-	cargo build --features "$(FEATURES)" --profile "$(PROFILE)"
+	cargo build --locked --features "$(FEATURES)" --profile "$(PROFILE)"
 
-# The following commands use `cross` to build a cross-compile.
-#
-# These commands require that:
-#
-# - `cross` is installed (`cargo install cross`).
-# - Docker is running.
-# - The current user is in the `docker` group.
-#
-# The resulting binaries will be created in the `target/` directory.
-build-%:
-	cross build --target $* --features "$(FEATURES)" --profile "$(PROFILE)"
-
-.PHONY: docker-build-push
-docker-build-push: docker-build-prepare ## Build and push a cross-arch Docker image tagged with DOCKER_IMAGE_NAME.
-	FEATURES="jemalloc aws-kms gcp-kms cli asm-keccak" $(MAKE) build-x86_64-unknown-linux-gnu
-	mkdir -p $(BIN_DIR)/amd64
-	for bin in anvil cast chisel forge; do \
-		cp $(CARGO_TARGET_DIR)/x86_64-unknown-linux-gnu/$(PROFILE)/$$bin $(BIN_DIR)/amd64/; \
-	done
-
-	FEATURES="aws-kms gcp-kms cli asm-keccak" $(MAKE) build-aarch64-unknown-linux-gnu
-	mkdir -p $(BIN_DIR)/arm64
-	for bin in anvil cast chisel forge; do \
-		cp $(CARGO_TARGET_DIR)/aarch64-unknown-linux-gnu/$(PROFILE)/$$bin $(BIN_DIR)/arm64/; \
-	done
-
-	docker buildx build --file ./Dockerfile.cross . \
-		--platform linux/amd64,linux/arm64 \
-		$(foreach tag,$(shell echo $(DOCKER_IMAGE_NAME) | tr ',' ' '),--tag $(tag)) \
-		--provenance=false \
-		--push
-
-.PHONY: docker-build-prepare
-docker-build-prepare: ## Prepare the Docker build environment.
-	docker run --privileged --rm tonistiigi/binfmt:qemu-v7.0.0-28 --install amd64,arm64
-	@if ! docker buildx inspect cross-builder &> /dev/null; then \
-		echo "Creating a new buildx builder instance"; \
-		docker buildx create --use --driver docker-container --name cross-builder; \
-	else \
-		echo "Using existing buildx builder instance"; \
-		docker buildx use cross-builder; \
-	fi
+.PHONY: build-docker
+build-docker: ## Build the docker image.
+	docker build . -t "$(DOCKER_IMAGE_NAME)" \
+	--build-arg "RUST_PROFILE=$(PROFILE)" \
+	--build-arg "RUST_FEATURES=$(FEATURES)" \
+	--build-arg "TAG_NAME=dev" \
+	--build-arg "VERGEN_GIT_SHA=$(shell git rev-parse HEAD)"
 
 ##@ Test
 
+## Run unit/doc tests and generate html coverage report in `target/llvm-cov/html` folder.
+## Notice that `llvm-cov` supports doc tests only in nightly builds because the `--doc` flag
+## is unstable (https://github.com/taiki-e/cargo-llvm-cov/issues/2).
+.PHONY: test-coverage
+test-coverage:
+	cargo +nightly llvm-cov --no-report nextest --locked -E 'kind(test) & !test(/\b(issue|ext_integration|flaky_)/)' && \
+	cargo +nightly llvm-cov --no-report --doc --locked && \
+	cargo +nightly llvm-cov report --doctests --open
+
 .PHONY: test-unit
 test-unit: ## Run unit tests.
-	cargo nextest run -E 'kind(test) & !test(/\b(issue|ext_integration)/)'
+	cargo nextest run --workspace --locked -E 'kind(test) & !test(/\b(issue|ext_integration|flaky_)/)'
 
 .PHONY: test-doc
 test-doc: ## Run doc tests.
-	cargo test --doc --workspace
+	cargo test --doc --workspace --locked
 
 .PHONY: test
 test: ## Run all tests.
-	make test-unit && \
-	make test-doc
+	$(MAKE) test-unit && \
+	$(MAKE) test-doc
 
 ##@ Linting
 
+.PHONY: fmt
 fmt: ## Run all formatters.
 	cargo +nightly fmt
 	./.github/scripts/format.sh --check
 
+.PHONY: lint-clippy
 lint-clippy: ## Run clippy on the codebase.
 	cargo +nightly clippy \
 	--workspace \
 	--all-targets \
 	--all-features \
+	--locked \
 	-- -D warnings
 
-lint-codespell: ## Run codespell on the codebase.
-	@command -v codespell >/dev/null || { \
-		echo "codespell not found. Please install it by running the command `pipx install codespell` or refer to the following link for more information: https://github.com/codespell-project/codespell" \
+.PHONY: lint-clippy-fix
+lint-clippy-fix: ## Run clippy on the codebase and fix warnings.
+	cargo +nightly clippy \
+	--workspace \
+	--all-targets \
+	--all-features \
+	--locked \
+	--fix \
+	--allow-dirty \
+	--allow-staged \
+	-- -D warnings
+
+.PHONY: lint-typos
+lint-typos: ## Run typos on the codebase.
+	@command -v typos >/dev/null || { \
+		echo "typos not found. Please install it by running the command 'cargo install typos-cli' or refer to the following link for more information: https://github.com/crate-ci/typos"; \
 		exit 1; \
 	}
-	codespell --skip "*.json"
+	typos
 
+.PHONY: lint
 lint: ## Run all linters.
-	make fmt && \
-	make lint-clippy && \
-	make lint-codespell
+	$(MAKE) fmt && \
+	$(MAKE) lint-clippy && \
+	$(MAKE) lint-typos
+
+##@ Documentation
+
+.PHONY: doc
+doc: ## Build the documentation.
+	RUSTDOCFLAGS="--cfg docsrs -D warnings -Zunstable-options --show-type-layout --generate-link-to-definition" \
+	cargo +nightly doc \
+	--workspace \
+	--all-features \
+	--document-private-items \
+	--no-deps \
+	--locked
 
 ##@ Other
+
+.PHONY: lock
+lock: ## Update the Cargo.lock file with the current dependencies.
+	cargo fetch
 
 .PHONY: clean
 clean: ## Clean the project.
 	cargo clean
 
-pr: ## Run all tests and linters in preparation for a PR.
-	make lint && \
-	make test
+.PHONY: deny
+deny: ## Perform a `cargo` deny check.
+	cargo deny --locked --all-features check all
+
+.PHONY: check
+check: ## Run a feature check on all crates and binaries.
+	cargo hack check --locked --feature-powerset --depth 1
+
+.PHONY: shear
+shear: ## Run `cargo shear` to check for unused dependencies.
+	cargo shear --locked
+
+.PHONY: pr
+pr: ## Run all checks and tests.
+	$(MAKE) deny && \
+	$(MAKE) lint && \
+	$(MAKE) test && \
+	$(MAKE) doc
+
+# dprint formatting commands
+.PHONY: dprint-fmt
+dprint-fmt: ## Format code with dprint
+	@if ! command -v dprint > /dev/null; then \
+		echo "Installing dprint..."; \
+		cargo install dprint; \
+	fi
+	dprint fmt
+
+.PHONY: dprint-check
+dprint-check: ## Check formatting with dprint
+	@if ! command -v dprint > /dev/null; then \
+		echo "Installing dprint..."; \
+		cargo install dprint; \
+	fi
+	dprint check

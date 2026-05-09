@@ -1,5 +1,5 @@
 use alloy_json_abi::{Error, Event, Function, JsonAbi};
-use alloy_primitives::{map::HashMap, Selector, B256};
+use alloy_primitives::{B256, Selector, map::HashMap};
 use eyre::Result;
 use foundry_common::{
     abi::{get_error, get_event, get_func},
@@ -59,11 +59,15 @@ impl From<&SignaturesCache> for SignaturesDiskCache {
         let (functions, errors, events) = value.signatures.iter().fold(
             (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             |mut acc, (kind, signature)| {
-                let value = signature.clone().unwrap_or_default();
-                match *kind {
-                    SelectorKind::Function(selector) => _ = acc.0.insert(selector, value),
-                    SelectorKind::Error(selector) => _ = acc.1.insert(selector, value),
-                    SelectorKind::Event(selector) => _ = acc.2.insert(selector, value),
+                // Only persist resolved signatures. Unknown selectors (None) are kept
+                // in-memory for session dedup but not written to disk, so they can be
+                // re-queried in future sessions once the signature database is updated.
+                if let Some(value) = signature.clone() {
+                    match *kind {
+                        SelectorKind::Function(selector) => _ = acc.0.insert(selector, value),
+                        SelectorKind::Error(selector) => _ = acc.1.insert(selector, value),
+                        SelectorKind::Event(selector) => _ = acc.2.insert(selector, value),
+                    }
                 }
                 acc
             },
@@ -83,7 +87,7 @@ impl Serialize for SignaturesCache {
 
 impl SignaturesCache {
     /// Loads the cache from a file.
-    #[instrument(target = "evm::traces")]
+    #[instrument(target = "evm::traces", name = "SignaturesCache::load")]
     pub fn load(path: &Path) -> Self {
         trace!(target: "evm::traces", ?path, "reading signature cache");
         fs::read_json_file(path)
@@ -94,12 +98,12 @@ impl SignaturesCache {
     }
 
     /// Saves the cache to a file.
-    #[instrument(target = "evm::traces", skip(self))]
+    #[instrument(target = "evm::traces", name = "SignaturesCache::save", skip(self))]
     pub fn save(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                warn!(target: "evm::traces", ?parent, %err, "failed to create cache");
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            warn!(target: "evm::traces", ?parent, %err, "failed to create cache");
         }
         if let Err(err) = fs::write_json_file(path, self) {
             warn!(target: "evm::traces", %err, "failed to flush signature cache");
@@ -149,9 +153,12 @@ impl SignaturesCache {
 /// An identifier that tries to identify functions and events using signatures found at
 /// `https://openchain.xyz` or a local cache.
 #[derive(Clone, Debug)]
-pub struct SignaturesIdentifier {
+pub struct SignaturesIdentifier(Arc<SignaturesIdentifierInner>);
+
+#[derive(Debug)]
+struct SignaturesIdentifierInner {
     /// Cached selectors for functions, events and custom errors.
-    cache: Arc<RwLock<SignaturesCache>>,
+    cache: RwLock<SignaturesCache>,
     /// Location where to save the signature cache.
     cache_path: Option<PathBuf>,
     /// The OpenChain client to fetch signatures from. `None` if disabled on construction.
@@ -174,7 +181,7 @@ impl SignaturesIdentifier {
     /// - `cache_dir` is the cache directory to store the signatures.
     /// - `offline` disables the OpenChain client.
     pub fn new_with(cache_dir: Option<&Path>, offline: bool) -> Result<Self> {
-        let client = if !offline { Some(OpenChainClient::new()?) } else { None };
+        let client = if offline { None } else { Some(OpenChainClient::new()?) };
         let (cache, cache_path) = if let Some(cache_dir) = cache_dir {
             let path = cache_dir.join("signatures");
             let cache = SignaturesCache::load(&path);
@@ -182,14 +189,16 @@ impl SignaturesIdentifier {
         } else {
             Default::default()
         };
-        Ok(Self { cache: Arc::new(RwLock::new(cache)), cache_path, client })
+        Ok(Self(Arc::new(SignaturesIdentifierInner {
+            cache: RwLock::new(cache),
+            cache_path,
+            client,
+        })))
     }
 
     /// Saves the cache to the file system.
     pub fn save(&self) {
-        if let Some(path) = &self.cache_path {
-            foundry_compilers::utils::RuntimeOrHandle::new().block_on(self.cache.read()).save(path);
-        }
+        self.0.save();
     }
 
     /// Identifies `Function`s.
@@ -238,20 +247,20 @@ impl SignaturesIdentifier {
         }
         trace!(target: "evm::traces", ?selectors, "identifying selectors");
 
-        let mut cache_r = self.cache.read().await;
-        if let Some(client) = &self.client {
+        let mut cache_r = self.0.cache.read().await;
+        if let Some(client) = &self.0.client {
             let query =
                 selectors.iter().copied().filter(|v| !cache_r.contains_key(v)).collect::<Vec<_>>();
             if !query.is_empty() {
                 drop(cache_r);
-                let mut cache_w = self.cache.write().await;
+                let mut cache_w = self.0.cache.write().await;
                 if let Ok(res) = client.decode_selectors(&query).await {
                     for (selector, signatures) in std::iter::zip(query, res) {
                         cache_w.signatures.insert(selector, signatures.into_iter().next());
                     }
                 }
                 drop(cache_w);
-                cache_r = self.cache.read().await;
+                cache_r = self.0.cache.read().await;
             }
         }
         selectors.iter().map(|selector| cache_r.get(selector).unwrap_or_default()).collect()
@@ -267,8 +276,51 @@ impl SignaturesIdentifier {
     }
 }
 
-impl Drop for SignaturesIdentifier {
+impl SignaturesIdentifierInner {
+    fn save(&self) {
+        // We only identify new signatures if the client is enabled.
+        if let Some(path) = &self.cache_path
+            && self.client.is_some()
+        {
+            self.cache
+                .try_read()
+                .expect("SignaturesIdentifier cache is locked while attempting to save")
+                .save(path);
+        }
+    }
+}
+
+impl Drop for SignaturesIdentifierInner {
     fn drop(&mut self) {
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_signatures_not_persisted_to_disk() {
+        let known_selector = SelectorKind::Function(Selector::from([0xaa, 0xbb, 0xcc, 0xdd]));
+        let unknown_selector = SelectorKind::Error(Selector::from([0x11, 0x22, 0x33, 0x44]));
+
+        let mut cache = SignaturesCache::default();
+        cache.signatures.insert(known_selector, Some("transfer(address,uint256)".into()));
+        cache.signatures.insert(unknown_selector, None);
+
+        // Verify both are in memory.
+        assert!(cache.contains_key(&known_selector));
+        assert!(cache.contains_key(&unknown_selector));
+
+        // Round-trip through the disk format.
+        let disk: SignaturesDiskCache = (&cache).into();
+        let reloaded = SignaturesCache::from(disk);
+
+        // Known signature survives the round-trip.
+        assert_eq!(reloaded.get(&known_selector), Some(Some("transfer(address,uint256)".into())));
+        // Unknown signature is gone — it will be re-queried next session.
+        assert_eq!(reloaded.get(&unknown_selector), None);
+        assert!(!reloaded.contains_key(&unknown_selector));
     }
 }

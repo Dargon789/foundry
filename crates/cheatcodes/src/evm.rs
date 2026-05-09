@@ -1,44 +1,76 @@
 //! Implementations of [`Evm`](spec::Group::Evm) cheatcodes.
 
 use crate::{
-    inspector::{Ecx, RecordDebugStepInfo},
     BroadcastableTransaction, Cheatcode, Cheatcodes, CheatcodesExecutor, CheatsCtxt, Error, Result,
-    Vm::*,
+    Vm::*, inspector::RecordDebugStepInfo,
 };
-use alloy_consensus::TxEnvelope;
+use alloy_consensus::transaction::SignerRecoverable;
+use alloy_evm::FromRecoveredTx;
 use alloy_genesis::{Genesis, GenesisAccount};
-use alloy_primitives::{map::HashMap, Address, Bytes, B256, U256};
+use alloy_network::eip2718::EIP4844_TX_TYPE_ID;
+use alloy_primitives::{
+    Address, B256, U256, hex, keccak256,
+    map::{B256Map, HashMap},
+};
 use alloy_rlp::Decodable;
 use alloy_sol_types::SolValue;
-use foundry_common::fs::{read_json_file, write_json_file};
-use foundry_evm_core::{
-    backend::{DatabaseExt, RevertStateSnapshotAction},
-    constants::{CALLER, CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS, TEST_CONTRACT_ADDRESS},
-    ContextExt,
+use foundry_common::{
+    TransactionMaybeSigned,
+    fs::{read_json_file, write_json_file},
+    slot_identifier::{
+        ENCODING_BYTES, ENCODING_DYN_ARRAY, ENCODING_INPLACE, ENCODING_MAPPING, SlotIdentifier,
+        SlotInfo,
+    },
 };
-use foundry_evm_traces::StackSnapshotType;
+use foundry_compilers::artifacts::EvmVersion;
+use foundry_evm_core::{
+    FoundryBlock, FoundryTransaction,
+    backend::{DatabaseError, DatabaseExt, RevertStateSnapshotAction},
+    constants::{CALLER, CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS, TEST_CONTRACT_ADDRESS},
+    env::FoundryContextExt,
+    evm::{FoundryEvmNetwork, TxEnvFor, TxEnvelopeFor},
+    utils::get_blob_base_fee_update_fraction_by_spec_id,
+};
+use foundry_evm_traces::TraceMode;
 use itertools::Itertools;
 use rand::Rng;
 use revm::{
+    Database,
     bytecode::Bytecode,
-    context::{Block, JournalTr},
-    primitives::{hardfork::SpecId, KECCAK_EMPTY},
-    state::Account,
+    context::{Block, Cfg, ContextTr, Host, JournalTr, Transaction, result::ExecutionResult},
+    inspector::JournalExt,
+    primitives::{KECCAK_EMPTY, hardfork::SpecId},
+    state::{Account, AccountStatus},
 };
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{BTreeMap, HashSet, btree_map::Entry},
     fmt::Display,
     path::Path,
+    str::FromStr,
 };
 
 mod record_debug_step;
-use record_debug_step::{convert_call_trace_to_debug_step, flatten_call_trace};
+use foundry_common::fmt::format_token_raw;
+use foundry_config::evm_spec_id;
+use record_debug_step::{convert_call_trace_ctx_to_debug_step, flatten_call_trace};
 use serde::Serialize;
 
 mod fork;
 pub(crate) mod mapping;
 pub(crate) mod mock;
 pub(crate) mod prank;
+
+/// JSON-serializable log entry for `getRecordedLogsJson`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogJson {
+    /// The topics of the log, including the signature, if any.
+    topics: Vec<String>,
+    /// The raw data of the log, hex-encoded with 0x prefix.
+    data: String,
+    /// The address of the log's emitter.
+    emitter: String,
+}
 
 /// Records storage slots reads and writes.
 #[derive(Clone, Debug, Default)]
@@ -102,6 +134,11 @@ struct SlotStateDiff {
     previous_value: B256,
     /// Current storage value.
     new_value: B256,
+    /// Storage layout metadata (variable name, type, offset).
+    /// Only present when contract has storage layout output.
+    /// This includes decoded values when available.
+    #[serde(skip_serializing_if = "Option::is_none", flatten)]
+    slot_info: Option<SlotInfo>,
 }
 
 /// Balance diff info.
@@ -114,14 +151,28 @@ struct BalanceDiff {
     new_value: U256,
 }
 
+/// Nonce diff info.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NonceDiff {
+    /// Initial nonce value.
+    previous_value: u64,
+    /// Current nonce value.
+    new_value: u64,
+}
+
 /// Account state diff info.
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AccountStateDiffs {
     /// Address label, if any set.
     label: Option<String>,
+    /// Contract identifier from artifact. e.g "src/Counter.sol:Counter"
+    contract: Option<String>,
     /// Account balance changes.
     balance_diff: Option<BalanceDiff>,
+    /// Account nonce changes.
+    nonce_diff: Option<NonceDiff>,
     /// State changes, per slot.
     state_diff: BTreeMap<B256, SlotStateDiff>,
 }
@@ -132,25 +183,62 @@ impl Display for AccountStateDiffs {
         if let Some(label) = &self.label {
             writeln!(f, "label: {label}")?;
         }
+        if let Some(contract) = &self.contract {
+            writeln!(f, "contract: {contract}")?;
+        }
         // Print balance diff if changed.
-        if let Some(balance_diff) = &self.balance_diff {
-            if balance_diff.previous_value != balance_diff.new_value {
-                writeln!(
-                    f,
-                    "- balance diff: {} → {}",
-                    balance_diff.previous_value, balance_diff.new_value
-                )?;
-            }
+        if let Some(balance_diff) = &self.balance_diff
+            && balance_diff.previous_value != balance_diff.new_value
+        {
+            writeln!(
+                f,
+                "- balance diff: {} → {}",
+                balance_diff.previous_value, balance_diff.new_value
+            )?;
+        }
+        // Print nonce diff if changed.
+        if let Some(nonce_diff) = &self.nonce_diff
+            && nonce_diff.previous_value != nonce_diff.new_value
+        {
+            writeln!(f, "- nonce diff: {} → {}", nonce_diff.previous_value, nonce_diff.new_value)?;
         }
         // Print state diff if any.
         if !&self.state_diff.is_empty() {
             writeln!(f, "- state diff:")?;
             for (slot, slot_changes) in &self.state_diff {
-                writeln!(
-                    f,
-                    "@ {slot}: {} → {}",
-                    slot_changes.previous_value, slot_changes.new_value
-                )?;
+                match &slot_changes.slot_info {
+                    Some(slot_info) => {
+                        if let Some(decoded) = &slot_info.decoded {
+                            // Have slot info with decoded values - show decoded values
+                            writeln!(
+                                f,
+                                "@ {slot} ({}, {}): {} → {}",
+                                slot_info.label,
+                                slot_info.slot_type.dyn_sol_type,
+                                format_token_raw(&decoded.previous_value),
+                                format_token_raw(&decoded.new_value)
+                            )?;
+                        } else {
+                            // Have slot info but no decoded values - show raw hex values
+                            writeln!(
+                                f,
+                                "@ {slot} ({}, {}): {} → {}",
+                                slot_info.label,
+                                slot_info.slot_type.dyn_sol_type,
+                                slot_changes.previous_value,
+                                slot_changes.new_value
+                            )?;
+                        }
+                    }
+                    None => {
+                        // No slot info - show raw hex values
+                        writeln!(
+                            f,
+                            "@ {slot}: {} → {}",
+                            slot_changes.previous_value, slot_changes.new_value
+                        )?;
+                    }
+                }
             }
         }
 
@@ -159,7 +247,7 @@ impl Display for AccountStateDiffs {
 }
 
 impl Cheatcode for addrCall {
-    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, _state: &mut Cheatcodes<FEN>) -> Result {
         let Self { privateKey } = self;
         let wallet = super::crypto::parse_wallet(privateKey)?;
         Ok(wallet.address().abi_encode())
@@ -167,25 +255,30 @@ impl Cheatcode for addrCall {
 }
 
 impl Cheatcode for getNonce_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { account } = self;
         get_nonce(ccx, account)
     }
 }
 
 impl Cheatcode for getNonce_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { wallet } = self;
         get_nonce(ccx, &wallet.addr)
     }
 }
 
 impl Cheatcode for loadCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { target, slot } = *self;
-        ensure_not_precompile!(&target, ccx);
-        ccx.ecx.journaled_state.load_account(target)?;
-        let mut val = ccx.ecx.journaled_state.sload(target, slot.into())?;
+        ccx.ensure_not_precompile(&target)?;
+
+        ccx.ecx.journal_mut().load_account(target)?;
+        let mut val = ccx
+            .ecx
+            .journal_mut()
+            .sload(target, slot.into())
+            .map_err(|e| fmt_err!("failed to load storage slot: {:?}", e))?;
 
         if val.is_cold && val.data.is_zero() {
             if ccx.state.has_arbitrary_storage(&target) {
@@ -218,7 +311,7 @@ impl Cheatcode for loadCall {
 }
 
 impl Cheatcode for loadAllocsCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { pathToAllocsJson } = self;
 
         let path = Path::new(pathToAllocsJson);
@@ -235,47 +328,47 @@ impl Cheatcode for loadAllocsCall {
         };
 
         // Then, load the allocs into the database.
-        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
-        db.load_allocs(&allocs, journal)
+        let (db, inner) = ccx.ecx.db_journal_inner_mut();
+        db.load_allocs(&allocs, inner)
             .map(|()| Vec::default())
             .map_err(|e| fmt_err!("failed to load allocs: {e}"))
     }
 }
 
 impl Cheatcode for cloneAccountCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { source, target } = self;
 
-        let (db, journal, _) = ccx.ecx.as_db_env_and_journal();
-        let account = journal.load_account(db, *source)?;
-        let genesis = &genesis_account(account.data);
-        db.clone_account(genesis, target, journal)?;
+        let account = ccx.ecx.journal_mut().load_account(*source)?;
+        let genesis = genesis_account(account.data);
+        let (db, inner) = ccx.ecx.db_journal_inner_mut();
+        db.clone_account(&genesis, target, inner)?;
         // Cloned account should persist in forked envs.
-        ccx.ecx.journaled_state.database.add_persistent_account(*target);
+        ccx.ecx.db_mut().add_persistent_account(*target);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for dumpStateCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { pathToStateJson } = self;
         let path = Path::new(pathToStateJson);
 
         // Do not include system account or empty accounts in the dump.
         let skip = |key: &Address, val: &Account| {
-            key == &CHEATCODE_ADDRESS ||
-                key == &CALLER ||
-                key == &HARDHAT_CONSOLE_ADDRESS ||
-                key == &TEST_CONTRACT_ADDRESS ||
-                key == &ccx.caller ||
-                key == &ccx.state.config.evm_opts.sender ||
-                val.is_empty()
+            key == &CHEATCODE_ADDRESS
+                || key == &CALLER
+                || key == &HARDHAT_CONSOLE_ADDRESS
+                || key == &TEST_CONTRACT_ADDRESS
+                || key == &ccx.caller
+                || key == &ccx.state.config.evm_opts.sender
+                || val.is_empty()
         };
 
         let alloc = ccx
             .ecx
-            .journaled_state
-            .state()
+            .journal_mut()
+            .evm_state_mut()
             .iter_mut()
             .filter(|(key, val)| !skip(key, val))
             .map(|(key, val)| (key, genesis_account(val)))
@@ -287,7 +380,7 @@ impl Cheatcode for dumpStateCall {
 }
 
 impl Cheatcode for recordCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         state.recording_accesses = true;
         state.accesses.clear();
@@ -296,14 +389,14 @@ impl Cheatcode for recordCall {
 }
 
 impl Cheatcode for stopRecordCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         state.recording_accesses = false;
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for accessesCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { target } = *self;
         let result = (
             state.accesses.reads.entry(target).or_default().as_slice(),
@@ -314,7 +407,7 @@ impl Cheatcode for accessesCall {
 }
 
 impl Cheatcode for recordLogsCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         state.recorded_logs = Some(Default::default());
         Ok(Default::default())
@@ -322,14 +415,30 @@ impl Cheatcode for recordLogsCall {
 }
 
 impl Cheatcode for getRecordedLogsCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         Ok(state.recorded_logs.replace(Default::default()).unwrap_or_default().abi_encode())
     }
 }
 
+impl Cheatcode for getRecordedLogsJsonCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let Self {} = self;
+        let logs = state.recorded_logs.replace(Default::default()).unwrap_or_default();
+        let json_logs: Vec<_> = logs
+            .into_iter()
+            .map(|log| LogJson {
+                topics: log.topics.iter().map(|t| format!("{t}")).collect(),
+                data: hex::encode_prefixed(&log.data),
+                emitter: format!("{}", log.emitter),
+            })
+            .collect();
+        Ok(serde_json::to_string(&json_logs)?.abi_encode())
+    }
+}
+
 impl Cheatcode for pauseGasMeteringCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         state.gas_metering.paused = true;
         Ok(Default::default())
@@ -337,7 +446,7 @@ impl Cheatcode for pauseGasMeteringCall {
 }
 
 impl Cheatcode for resumeGasMeteringCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         state.gas_metering.resume();
         Ok(Default::default())
@@ -345,7 +454,7 @@ impl Cheatcode for resumeGasMeteringCall {
 }
 
 impl Cheatcode for resetGasMeteringCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         state.gas_metering.reset();
         Ok(Default::default())
@@ -353,7 +462,7 @@ impl Cheatcode for resetGasMeteringCall {
 }
 
 impl Cheatcode for lastCallGasCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         let Some(last_call_gas) = &state.gas_metering.last_call_gas else {
             bail!("no external call was made yet");
@@ -362,160 +471,171 @@ impl Cheatcode for lastCallGasCall {
     }
 }
 
+impl Cheatcode for getChainIdCall {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self {} = self;
+        Ok(U256::from(ccx.ecx.cfg().chain_id()).abi_encode())
+    }
+}
+
 impl Cheatcode for chainIdCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newChainId } = self;
-        ensure!(*newChainId <= U256::from(u64::MAX), "chain ID must be less than 2^64 - 1");
-        ccx.ecx.cfg.chain_id = newChainId.to();
+        ensure!(*newChainId <= U256::from(u64::MAX), "chain ID must be less than 2^64");
+        ccx.ecx.cfg_mut().chain_id = newChainId.to();
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for coinbaseCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newCoinbase } = self;
-        ccx.ecx.block.beneficiary = *newCoinbase;
+        ccx.ecx.block_mut().set_beneficiary(*newCoinbase);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for difficultyCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newDifficulty } = self;
         ensure!(
-            ccx.ecx.cfg.spec < SpecId::MERGE,
+            (*ccx.ecx.cfg().spec()).into() < SpecId::MERGE,
             "`difficulty` is not supported after the Paris hard fork, use `prevrandao` instead; \
              see EIP-4399: https://eips.ethereum.org/EIPS/eip-4399"
         );
-        ccx.ecx.block.difficulty = *newDifficulty;
+        ccx.ecx.block_mut().set_difficulty(*newDifficulty);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for feeCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newBasefee } = self;
-        ensure!(*newBasefee <= U256::from(u64::MAX), "base fee must be less than 2^64 - 1");
-        ccx.ecx.block.basefee = newBasefee.saturating_to();
+        ensure!(*newBasefee <= U256::from(u64::MAX), "base fee must be less than 2^64");
+        ccx.ecx.block_mut().set_basefee(newBasefee.saturating_to());
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for prevrandao_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newPrevrandao } = self;
         ensure!(
-            ccx.ecx.cfg.spec >= SpecId::MERGE,
+            (*ccx.ecx.cfg().spec()).into() >= SpecId::MERGE,
             "`prevrandao` is not supported before the Paris hard fork, use `difficulty` instead; \
              see EIP-4399: https://eips.ethereum.org/EIPS/eip-4399"
         );
-        ccx.ecx.block.prevrandao = Some(*newPrevrandao);
+        ccx.ecx.block_mut().set_prevrandao(Some(*newPrevrandao));
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for prevrandao_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newPrevrandao } = self;
         ensure!(
-            ccx.ecx.cfg.spec >= SpecId::MERGE,
+            (*ccx.ecx.cfg().spec()).into() >= SpecId::MERGE,
             "`prevrandao` is not supported before the Paris hard fork, use `difficulty` instead; \
              see EIP-4399: https://eips.ethereum.org/EIPS/eip-4399"
         );
-        ccx.ecx.block.prevrandao = Some((*newPrevrandao).into());
+        ccx.ecx.block_mut().set_prevrandao(Some((*newPrevrandao).into()));
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for blobhashesCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { hashes } = self;
         ensure!(
-            ccx.ecx.cfg.spec >= SpecId::CANCUN,
+            (*ccx.ecx.cfg().spec()).into() >= SpecId::CANCUN,
             "`blobhashes` is not supported before the Cancun hard fork; \
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
-        ccx.ecx.tx.blob_hashes.clone_from(hashes);
+        ccx.ecx.tx_mut().set_blob_hashes(hashes.clone());
+        // force this as 4844 txtype
+        ccx.ecx.tx_mut().set_tx_type(EIP4844_TX_TYPE_ID);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for getBlobhashesCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         ensure!(
-            ccx.ecx.cfg.spec >= SpecId::CANCUN,
+            (*ccx.ecx.cfg().spec()).into() >= SpecId::CANCUN,
             "`getBlobhashes` is not supported before the Cancun hard fork; \
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
-        Ok(ccx.ecx.tx.blob_hashes.clone().abi_encode())
+        Ok(ccx.ecx.tx().blob_versioned_hashes().to_vec().abi_encode())
     }
 }
 
 impl Cheatcode for rollCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newHeight } = self;
-        ensure!(*newHeight <= U256::from(u64::MAX), "block height must be less than 2^64 - 1");
-        ccx.ecx.block.number = newHeight.saturating_to();
+        ccx.ecx.block_mut().set_number(*newHeight);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for getBlockNumberCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        Ok(ccx.ecx.block.number.abi_encode())
+        Ok(ccx.ecx.block().number().abi_encode())
     }
 }
 
 impl Cheatcode for txGasPriceCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newGasPrice } = self;
-        ensure!(*newGasPrice <= U256::from(u64::MAX), "gas price must be less than 2^64 - 1");
-        ccx.ecx.tx.gas_price = newGasPrice.saturating_to();
+        ensure!(*newGasPrice <= U256::from(u64::MAX), "gas price must be less than 2^64");
+        ccx.ecx.tx_mut().set_gas_price(newGasPrice.saturating_to());
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for warpCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newTimestamp } = self;
-        ensure!(*newTimestamp <= U256::from(u64::MAX), "timestamp must be less than 2^64 - 1");
-        ccx.ecx.block.timestamp = newTimestamp.saturating_to();
+        ccx.ecx.block_mut().set_timestamp(*newTimestamp);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for getBlockTimestampCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        Ok(ccx.ecx.block.timestamp.abi_encode())
+        Ok(ccx.ecx.block().timestamp().abi_encode())
     }
 }
 
 impl Cheatcode for blobBaseFeeCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { newBlobBaseFee } = self;
         ensure!(
-            ccx.ecx.cfg.spec >= SpecId::CANCUN,
+            (*ccx.ecx.cfg().spec()).into() >= SpecId::CANCUN,
             "`blobBaseFee` is not supported before the Cancun hard fork; \
              see EIP-4844: https://eips.ethereum.org/EIPS/eip-4844"
         );
-        let is_prague = ccx.ecx.cfg.spec >= SpecId::PRAGUE;
-        ccx.ecx.block.set_blob_excess_gas_and_price((*newBlobBaseFee).to(), is_prague);
+
+        let spec: SpecId = (*ccx.ecx.cfg().spec()).into();
+        ccx.ecx.block_mut().set_blob_excess_gas_and_price(
+            (*newBlobBaseFee).to(),
+            get_blob_base_fee_update_fraction_by_spec_id(spec),
+        );
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for getBlobBaseFeeCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        Ok(ccx.ecx.block.blob_excess_gas().unwrap_or(0).abi_encode())
+        Ok(ccx.ecx.block().blob_excess_gas().unwrap_or(0).abi_encode())
     }
 }
 
 impl Cheatcode for dealCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { account: address, newBalance: new_balance } = *self;
         let account = journaled_account(ccx.ecx, address)?;
         let old_balance = std::mem::replace(&mut account.info.balance, new_balance);
@@ -526,19 +646,19 @@ impl Cheatcode for dealCall {
 }
 
 impl Cheatcode for etchCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { target, newRuntimeBytecode } = self;
-        ensure_not_precompile!(target, ccx);
-        ccx.ecx.journaled_state.load_account(*target)?;
-        let bytecode = Bytecode::new_raw_checked(Bytes::copy_from_slice(newRuntimeBytecode))
+        ccx.ensure_not_precompile(target)?;
+        ccx.ecx.journal_mut().load_account(*target)?;
+        let bytecode = Bytecode::new_raw_checked(newRuntimeBytecode.clone())
             .map_err(|e| fmt_err!("failed to create bytecode: {e}"))?;
-        ccx.ecx.journaled_state.set_code(*target, bytecode);
+        ccx.ecx.journal_mut().set_code(*target, bytecode);
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for resetNonceCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { account } = self;
         let account = journaled_account(ccx.ecx, *account)?;
         // Per EIP-161, EOA nonces start at 0, but contract nonces
@@ -553,7 +673,7 @@ impl Cheatcode for resetNonceCall {
 }
 
 impl Cheatcode for setNonceCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { account, newNonce } = *self;
         let account = journaled_account(ccx.ecx, account)?;
         // nonce must increment only
@@ -569,7 +689,7 @@ impl Cheatcode for setNonceCall {
 }
 
 impl Cheatcode for setNonceUnsafeCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { account, newNonce } = *self;
         let account = journaled_account(ccx.ecx, account)?;
         account.info.nonce = newNonce;
@@ -578,20 +698,22 @@ impl Cheatcode for setNonceUnsafeCall {
 }
 
 impl Cheatcode for storeCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { target, slot, value } = *self;
-        ensure_not_precompile!(&target, ccx);
-        // ensure the account is touched
-        let _ = journaled_account(ccx.ecx, target)?;
-        ccx.ecx.journaled_state.sstore(target, slot.into(), value.into())?;
+        ccx.ensure_not_precompile(&target)?;
+        ensure_loaded_account(ccx.ecx, target)?;
+        ccx.ecx
+            .journal_mut()
+            .sstore(target, slot.into(), value.into())
+            .map_err(|e| fmt_err!("failed to store storage slot: {:?}", e))?;
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for coolCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { target } = self;
-        if let Some(account) = ccx.ecx.journaled_state.state.get_mut(target) {
+        if let Some(account) = ccx.ecx.journal_mut().evm_state_mut().get_mut(target) {
             account.unmark_touch();
             account.storage.values_mut().for_each(|slot| slot.mark_cold());
         }
@@ -600,7 +722,7 @@ impl Cheatcode for coolCall {
 }
 
 impl Cheatcode for accessListCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { access } = self;
         let access_list = access
             .iter()
@@ -615,7 +737,7 @@ impl Cheatcode for accessListCall {
 }
 
 impl Cheatcode for noAccessListCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         // Set to empty option in order to override previous applied access list.
         if state.access_list.is_some() {
@@ -626,7 +748,7 @@ impl Cheatcode for noAccessListCall {
 }
 
 impl Cheatcode for warmSlotCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { target, slot } = *self;
         set_cold_slot(ccx, target, slot.into(), false);
         Ok(Default::default())
@@ -634,7 +756,7 @@ impl Cheatcode for warmSlotCall {
 }
 
 impl Cheatcode for coolSlotCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { target, slot } = *self;
         set_cold_slot(ccx, target, slot.into(), true);
         Ok(Default::default())
@@ -642,28 +764,28 @@ impl Cheatcode for coolSlotCall {
 }
 
 impl Cheatcode for readCallersCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        read_callers(ccx.state, &ccx.ecx.tx.caller, ccx.ecx.journaled_state.depth())
+        read_callers(ccx.state, &ccx.ecx.tx().caller(), ccx.ecx.journal().depth())
     }
 }
 
 impl Cheatcode for snapshotValue_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { name, value } = self;
         inner_value_snapshot(ccx, None, Some(name.clone()), value.to_string())
     }
 }
 
 impl Cheatcode for snapshotValue_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { group, name, value } = self;
         inner_value_snapshot(ccx, Some(group.clone()), Some(name.clone()), value.to_string())
     }
 }
 
 impl Cheatcode for snapshotGasLastCall_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { name } = self;
         let Some(last_call_gas) = &ccx.state.gas_metering.last_call_gas else {
             bail!("no external call was made yet");
@@ -673,7 +795,7 @@ impl Cheatcode for snapshotGasLastCall_0Call {
 }
 
 impl Cheatcode for snapshotGasLastCall_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { name, group } = self;
         let Some(last_call_gas) = &ccx.state.gas_metering.last_call_gas else {
             bail!("no external call was made yet");
@@ -688,35 +810,35 @@ impl Cheatcode for snapshotGasLastCall_1Call {
 }
 
 impl Cheatcode for startSnapshotGas_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { name } = self;
         inner_start_gas_snapshot(ccx, None, Some(name.clone()))
     }
 }
 
 impl Cheatcode for startSnapshotGas_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { group, name } = self;
         inner_start_gas_snapshot(ccx, Some(group.clone()), Some(name.clone()))
     }
 }
 
 impl Cheatcode for stopSnapshotGas_0Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         inner_stop_gas_snapshot(ccx, None, None)
     }
 }
 
 impl Cheatcode for stopSnapshotGas_1Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { name } = self;
         inner_stop_gas_snapshot(ccx, None, Some(name.clone()))
     }
 }
 
 impl Cheatcode for stopSnapshotGas_2Call {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { group, name } = self;
         inner_stop_gas_snapshot(ccx, Some(group.clone()), Some(name.clone()))
     }
@@ -724,14 +846,14 @@ impl Cheatcode for stopSnapshotGas_2Call {
 
 // Deprecated in favor of `snapshotStateCall`
 impl Cheatcode for snapshotCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         inner_snapshot_state(ccx)
     }
 }
 
 impl Cheatcode for snapshotStateCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         inner_snapshot_state(ccx)
     }
@@ -739,14 +861,14 @@ impl Cheatcode for snapshotStateCall {
 
 // Deprecated in favor of `revertToStateCall`
 impl Cheatcode for revertToCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { snapshotId } = self;
         inner_revert_to_state(ccx, *snapshotId)
     }
 }
 
 impl Cheatcode for revertToStateCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { snapshotId } = self;
         inner_revert_to_state(ccx, *snapshotId)
     }
@@ -754,14 +876,14 @@ impl Cheatcode for revertToStateCall {
 
 // Deprecated in favor of `revertToStateAndDeleteCall`
 impl Cheatcode for revertToAndDeleteCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { snapshotId } = self;
         inner_revert_to_state_and_delete(ccx, *snapshotId)
     }
 }
 
 impl Cheatcode for revertToStateAndDeleteCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { snapshotId } = self;
         inner_revert_to_state_and_delete(ccx, *snapshotId)
     }
@@ -769,53 +891,59 @@ impl Cheatcode for revertToStateAndDeleteCall {
 
 // Deprecated in favor of `deleteStateSnapshotCall`
 impl Cheatcode for deleteSnapshotCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { snapshotId } = self;
-        inner_delete_state_snapshot(ccx, *snapshotId)
+        let result = ccx.ecx.db_mut().delete_state_snapshot(*snapshotId);
+        Ok(result.abi_encode())
     }
 }
 
 impl Cheatcode for deleteStateSnapshotCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { snapshotId } = self;
-        inner_delete_state_snapshot(ccx, *snapshotId)
+        let result = ccx.ecx.db_mut().delete_state_snapshot(*snapshotId);
+        Ok(result.abi_encode())
     }
 }
 
 // Deprecated in favor of `deleteStateSnapshotsCall`
 impl Cheatcode for deleteSnapshotsCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        inner_delete_state_snapshots(ccx)
+        ccx.ecx.db_mut().delete_state_snapshots();
+        Ok(Default::default())
     }
 }
 
 impl Cheatcode for deleteStateSnapshotsCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        inner_delete_state_snapshots(ccx)
+        ccx.ecx.db_mut().delete_state_snapshots();
+        Ok(Default::default())
     }
 }
 
 impl Cheatcode for startStateDiffRecordingCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         state.recorded_account_diffs_stack = Some(Default::default());
+        // Enable mapping recording to track mapping slot accesses
+        state.mapping_slots.get_or_insert_default();
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for stopAndReturnStateDiffCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self {} = self;
         get_state_diff(state)
     }
 }
 
 impl Cheatcode for getStateDiffCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let mut diffs = String::new();
-        let state_diffs = get_recorded_state_diffs(state);
+        let state_diffs = get_recorded_state_diffs(ccx);
         for (address, state_diffs) in state_diffs {
             diffs.push_str(&format!("{address}\n"));
             diffs.push_str(&format!("{state_diffs}\n"));
@@ -825,29 +953,124 @@ impl Cheatcode for getStateDiffCall {
 }
 
 impl Cheatcode for getStateDiffJsonCall {
-    fn apply(&self, state: &mut Cheatcodes) -> Result {
-        let state_diffs = get_recorded_state_diffs(state);
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let state_diffs = get_recorded_state_diffs(ccx);
         Ok(serde_json::to_string(&state_diffs)?.abi_encode())
     }
 }
 
+impl Cheatcode for getStorageSlotsCall {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { target, variableName } = self;
+
+        let storage_layout = get_contract_data(ccx, *target)
+            .and_then(|(_, data)| data.storage_layout.as_ref().map(|layout| layout.clone()))
+            .ok_or_else(|| fmt_err!("Storage layout not available for contract at {target}. Try compiling contracts with `--extra-output storageLayout`"))?;
+
+        trace!(storage = ?storage_layout.storage, "fetched storage");
+
+        let variable_name_lower = variableName.to_lowercase();
+        let storage = storage_layout
+            .storage
+            .iter()
+            .find(|s| s.label.to_lowercase() == variable_name_lower)
+            .ok_or_else(|| fmt_err!("variable '{variableName}' not found in storage layout"))?;
+
+        let storage_type = storage_layout
+            .types
+            .get(&storage.storage_type)
+            .ok_or_else(|| fmt_err!("storage type not found for variable {variableName}"))?;
+
+        if storage_type.encoding == ENCODING_MAPPING || storage_type.encoding == ENCODING_DYN_ARRAY
+        {
+            return Err(fmt_err!(
+                "cannot get storage slots for variables with mapping or dynamic array types"
+            ));
+        }
+
+        let slot = U256::from_str(&storage.slot).map_err(|_| {
+            fmt_err!("invalid slot {} format for variable {variableName}", storage.slot)
+        })?;
+
+        let mut slots = Vec::new();
+
+        // Always push the base slot
+        slots.push(slot);
+
+        if storage_type.encoding == ENCODING_INPLACE {
+            // For inplace encoding, calculate the number of slots needed
+            let num_bytes = U256::from_str(&storage_type.number_of_bytes).map_err(|_| {
+                fmt_err!(
+                    "invalid number_of_bytes {} for variable {variableName}",
+                    storage_type.number_of_bytes
+                )
+            })?;
+            let num_slots = num_bytes.div_ceil(U256::from(32));
+
+            // Start from 1 since base slot is already added
+            for i in 1..num_slots.to::<usize>() {
+                slots.push(slot + U256::from(i));
+            }
+        }
+
+        if storage_type.encoding == ENCODING_BYTES {
+            // Try to check if it's a long bytes/string by reading the current storage
+            // value
+            if let Ok(value) = ccx.ecx.journal_mut().sload(*target, slot) {
+                let value_bytes = value.data.to_be_bytes::<32>();
+                let length_byte = value_bytes[31];
+                // Check if it's a long bytes/string (LSB is 1)
+                if length_byte & 1 == 1 {
+                    // Calculate data slots for long bytes/string
+                    let length: U256 = value.data >> 1;
+                    let num_data_slots = length.to::<usize>().div_ceil(32);
+                    let data_start = U256::from_be_bytes(keccak256(B256::from(slot).0).0);
+
+                    for i in 0..num_data_slots {
+                        slots.push(data_start + U256::from(i));
+                    }
+                }
+            }
+        }
+
+        Ok(slots.abi_encode())
+    }
+}
+
+impl Cheatcode for getStorageAccessesCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let mut storage_accesses = Vec::new();
+
+        if let Some(recorded_diffs) = &state.recorded_account_diffs_stack {
+            for account_accesses in recorded_diffs.iter().flatten() {
+                storage_accesses.extend(account_accesses.storageAccesses.clone());
+            }
+        }
+
+        Ok(storage_accesses.abi_encode())
+    }
+}
+
 impl Cheatcode for broadcastRawTransactionCall {
-    fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
-        let tx = TxEnvelope::decode(&mut self.data.as_ref())
+    fn apply_full<FEN: FoundryEvmNetwork>(
+        &self,
+        ccx: &mut CheatsCtxt<'_, '_, FEN>,
+        executor: &mut dyn CheatcodesExecutor<FEN>,
+    ) -> Result {
+        let tx = TxEnvelopeFor::<FEN>::decode(&mut self.data.as_ref())
             .map_err(|err| fmt_err!("failed to decode RLP-encoded transaction: {err}"))?;
 
-        let (db, journal, env) = ccx.ecx.as_db_env_and_journal();
-        db.transact_from_tx(
-            &tx.clone().into(),
-            env.to_owned(),
-            journal,
-            &mut *executor.get_inspector(ccx.state),
-        )?;
+        let sender =
+            tx.recover_signer().map_err(|err| fmt_err!("failed to recover signer: {err}"))?;
+        let tx_env = TxEnvFor::<FEN>::from_recovered_tx(&tx, sender);
+        let from = sender;
+
+        executor.transact_from_tx_on_db(ccx.state, ccx.ecx, tx_env)?;
 
         if ccx.state.broadcast.is_some() {
             ccx.state.broadcastable_transactions.push_back(BroadcastableTransaction {
-                rpc: ccx.ecx.journaled_state.database.active_fork_url(),
-                transaction: tx.try_into()?,
+                rpc: ccx.ecx.db().active_fork_url(),
+                transaction: TransactionMaybeSigned::Signed { tx, from },
             });
         }
 
@@ -856,25 +1079,176 @@ impl Cheatcode for broadcastRawTransactionCall {
 }
 
 impl Cheatcode for setBlockhashCall {
-    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { blockNumber, blockHash } = *self;
-        ensure!(blockNumber <= U256::from(u64::MAX), "blockNumber must be less than 2^64 - 1");
+        ensure!(blockNumber <= U256::from(u64::MAX), "blockNumber must be less than 2^64");
         ensure!(
-            blockNumber <= U256::from(ccx.ecx.block.number),
+            blockNumber <= U256::from(ccx.ecx.block().number()),
             "block number must be less than or equal to the current block number"
         );
 
-        ccx.ecx.journaled_state.database.set_blockhash(blockNumber, blockHash);
+        ccx.ecx.db_mut().set_blockhash(blockNumber, blockHash);
 
         Ok(Default::default())
     }
 }
 
-impl Cheatcode for startDebugTraceRecordingCall {
-    fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
-        let Some(tracer) = executor.tracing_inspector().and_then(|t| t.as_mut()) else {
-            return Err(Error::from("no tracer initiated, consider adding -vvv flag"))
+impl Cheatcode for executeTransactionCall {
+    fn apply_full<FEN: FoundryEvmNetwork>(
+        &self,
+        ccx: &mut CheatsCtxt<'_, '_, FEN>,
+        executor: &mut dyn CheatcodesExecutor<FEN>,
+    ) -> Result {
+        use crate::env::FORGE_CONTEXT;
+
+        // Block in script contexts.
+        if let Some(ctx) = FORGE_CONTEXT.get()
+            && *ctx == ForgeContext::ScriptGroup
+        {
+            return Err(fmt_err!("executeTransaction is not allowed in forge script"));
+        }
+
+        // Decode the RLP-encoded signed transaction.
+        let tx = TxEnvelopeFor::<FEN>::decode(&mut self.rawTx.as_ref())
+            .map_err(|err| fmt_err!("failed to decode RLP-encoded transaction: {err}"))?;
+
+        // Build TxEnv from the recovered transaction.
+        let sender =
+            tx.recover_signer().map_err(|err| fmt_err!("failed to recover signer: {err}"))?;
+        let tx_env = TxEnvFor::<FEN>::from_recovered_tx(&tx, sender);
+
+        // Save current env for restoration after execution.
+        let cached_evm_env = ccx.ecx.evm_clone();
+        let cached_tx_env = ccx.ecx.tx_clone();
+
+        // Override env for isolated execution.
+        ccx.ecx.block_mut().set_basefee(0);
+        ccx.ecx.set_tx(tx_env);
+        ccx.ecx.tx_mut().set_gas_price(0);
+        ccx.ecx.tx_mut().set_gas_priority_fee(None);
+
+        // Enable nonce checks for realistic simulation.
+        ccx.ecx.cfg_mut().disable_nonce_check = false;
+
+        // EIP-3860: enforce initcode size limit.
+        ccx.ecx.cfg_mut().limit_contract_initcode_size =
+            Some(revm::primitives::eip3860::MAX_INITCODE_SIZE);
+
+        // Reset the tx gas limit cap so revm applies the spec-defined default (EIP-7825).
+        // Normal test execution sets `Some(u64::MAX)` to disable the cap; clearing it here
+        // lets the nested EVM enforce the real network limit for realistic simulation.
+        ccx.ecx.cfg_mut().tx_gas_limit_cap = None;
+
+        // Snapshot the modified env for EVM construction.
+        let modified_evm_env = ccx.ecx.evm_clone();
+        let modified_tx_env = ccx.ecx.tx_clone();
+
+        // Mark as inner context so isolation mode doesn't trigger a nested transact_inner
+        // when the inner EVM executes calls at depth == 1.
+        executor.set_in_inner_context(true, Some(sender));
+
+        // Clone journaled state and mark all accounts/slots cold.
+        let cold_state = {
+            let (_, journal) = ccx.ecx.db_journal_inner_mut();
+            let mut state = journal.state.clone();
+            for (addr, acc_mut) in &mut state {
+                if journal.warm_addresses.is_cold(addr) {
+                    acc_mut.mark_cold();
+                }
+                for slot_mut in acc_mut.storage.values_mut() {
+                    slot_mut.is_cold = true;
+                    slot_mut.original_value = slot_mut.present_value;
+                }
+            }
+            state
         };
+
+        let mut res = None;
+        let mut cold_state = Some(cold_state);
+        let mut nested_evm_env = {
+            let (db, _) = ccx.ecx.db_journal_inner_mut();
+            executor.with_fresh_nested_evm(ccx.state, db, modified_evm_env, &mut |evm| {
+                // SAFETY: closure is called exactly once by the executor.
+                evm.journal_inner_mut().state = cold_state.take().expect("called once");
+                // Set depth to 1 for proper trace collection.
+                evm.journal_inner_mut().depth = 1;
+                res = Some(evm.transact_raw(modified_tx_env.clone()));
+                Ok(())
+            })?
+        };
+        let res = res.unwrap();
+
+        // Restore env, preserving cheatcode cfg/block changes from the nested EVM
+        // but restoring the original tx and basefee (which we zeroed for the nested call)
+        // as well as cfg overrides that were applied only for the nested execution.
+        nested_evm_env.block_env.set_basefee(cached_evm_env.block_env.basefee());
+        nested_evm_env.cfg_env.disable_nonce_check = cached_evm_env.cfg_env.disable_nonce_check;
+        nested_evm_env.cfg_env.limit_contract_initcode_size =
+            cached_evm_env.cfg_env.limit_contract_initcode_size;
+        nested_evm_env.cfg_env.tx_gas_limit_cap = cached_evm_env.cfg_env.tx_gas_limit_cap;
+        ccx.ecx.set_evm(nested_evm_env);
+        ccx.ecx.set_tx(cached_tx_env);
+
+        // Reset inner context flag.
+        executor.set_in_inner_context(false, None);
+
+        let res = res.map_err(|e| fmt_err!("transaction execution failed: {e}"))?;
+
+        // Merge state changes back into the parent journaled state.
+        for (addr, mut acc) in res.state {
+            let Some(acc_mut) = ccx.ecx.journal_mut().evm_state_mut().get_mut(&addr) else {
+                ccx.ecx.journal_mut().evm_state_mut().insert(addr, acc);
+                continue;
+            };
+
+            // Preserve warm account status from parent context.
+            if acc.status.contains(AccountStatus::Cold)
+                && !acc_mut.status.contains(AccountStatus::Cold)
+            {
+                acc.status -= AccountStatus::Cold;
+            }
+            acc_mut.info = acc.info;
+            acc_mut.status |= acc.status;
+
+            // Merge storage changes.
+            for (key, val) in acc.storage {
+                let Some(slot_mut) = acc_mut.storage.get_mut(&key) else {
+                    acc_mut.storage.insert(key, val);
+                    continue;
+                };
+                slot_mut.present_value = val.present_value;
+                slot_mut.is_cold &= val.is_cold;
+            }
+        }
+
+        // Return output bytes.
+        let output = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            ExecutionResult::Halt { reason, .. } => {
+                return Err(fmt_err!("transaction halted: {reason:?}"));
+            }
+            ExecutionResult::Revert { output, .. } => {
+                return Err(fmt_err!("transaction reverted: {}", hex::encode_prefixed(&output)));
+            }
+        };
+
+        Ok(output.abi_encode())
+    }
+}
+
+impl Cheatcode for startDebugTraceRecordingCall {
+    fn apply_full<FEN: FoundryEvmNetwork>(
+        &self,
+        ccx: &mut CheatsCtxt<'_, '_, FEN>,
+        executor: &mut dyn CheatcodesExecutor<FEN>,
+    ) -> Result {
+        let Some(tracer) = executor.tracing_inspector() else {
+            return Err(Error::from("no tracer initiated, consider adding -vvv flag"));
+        };
+
+        if ccx.state.record_debug_steps_info.is_some() {
+            bail!("debug trace recording was already started");
+        }
 
         let mut info = RecordDebugStepInfo {
             // will be updated later
@@ -883,13 +1257,8 @@ impl Cheatcode for startDebugTraceRecordingCall {
             original_tracer_config: *tracer.config(),
         };
 
-        // turn on tracer configuration for recording
-        tracer.update_config(|config| {
-            config
-                .set_steps(true)
-                .set_memory_snapshots(true)
-                .set_stack_snapshots(StackSnapshotType::Full)
-        });
+        // turn on tracer debug configuration for recording
+        *tracer.config_mut() = TraceMode::Debug.into_config().expect("cannot be None");
 
         // track where the recording starts
         if let Some(last_node) = tracer.traces().nodes().last() {
@@ -902,13 +1271,17 @@ impl Cheatcode for startDebugTraceRecordingCall {
 }
 
 impl Cheatcode for stopAndReturnDebugTraceRecordingCall {
-    fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
-        let Some(tracer) = executor.tracing_inspector().and_then(|t| t.as_mut()) else {
-            return Err(Error::from("no tracer initiated, consider adding -vvv flag"))
+    fn apply_full<FEN: FoundryEvmNetwork>(
+        &self,
+        ccx: &mut CheatsCtxt<'_, '_, FEN>,
+        executor: &mut dyn CheatcodesExecutor<FEN>,
+    ) -> Result {
+        let Some(tracer) = executor.tracing_inspector() else {
+            return Err(Error::from("no tracer initiated, consider adding -vvv flag"));
         };
 
         let Some(record_info) = ccx.state.record_debug_steps_info else {
-            return Err(Error::from("nothing recorded"))
+            return Err(Error::from("nothing recorded"));
         };
 
         // Use the trace nodes to flatten the call trace
@@ -916,7 +1289,7 @@ impl Cheatcode for stopAndReturnDebugTraceRecordingCall {
         let steps = flatten_call_trace(0, root, record_info.start_node_idx);
 
         let debug_steps: Vec<DebugStep> =
-            steps.iter().map(|&step| convert_call_trace_to_debug_step(step)).collect();
+            steps.iter().map(|step| convert_call_trace_ctx_to_debug_step(step)).collect();
         // Free up memory by clearing the steps if they are not recorded outside of cheatcode usage.
         if !record_info.original_tracer_config.record_steps {
             tracer.traces_mut().nodes_mut().iter_mut().for_each(|node| {
@@ -936,57 +1309,86 @@ impl Cheatcode for stopAndReturnDebugTraceRecordingCall {
     }
 }
 
-pub(super) fn get_nonce(ccx: &mut CheatsCtxt, address: &Address) -> Result {
-    let account = ccx.ecx.journaled_state.load_account(*address)?;
-    Ok(account.info.nonce.abi_encode())
+impl Cheatcode for setEvmVersionCall {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { evm } = self;
+        let spec_id = evm_spec_id(
+            EvmVersion::from_str(evm)
+                .map_err(|_| Error::from(format!("invalid evm version {evm}")))?,
+        );
+        ccx.state.execution_evm_version = Some(spec_id);
+        Ok(Default::default())
+    }
 }
 
-fn inner_snapshot_state(ccx: &mut CheatsCtxt) -> Result {
-    let (db, journal, mut env) = ccx.ecx.as_db_env_and_journal();
-    Ok(db.snapshot_state(journal, &mut env).abi_encode())
+impl Cheatcode for getEvmVersionCall {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let spec = (*ccx.ecx.cfg().spec()).into();
+        Ok(spec.to_string().to_lowercase().abi_encode())
+    }
 }
 
-fn inner_revert_to_state(ccx: &mut CheatsCtxt, snapshot_id: U256) -> Result {
-    let (db, journal, mut env) = ccx.ecx.as_db_env_and_journal();
-    let result = if let Some(journaled_state) =
-        db.revert_state(snapshot_id, &*journal, &mut env, RevertStateSnapshotAction::RevertKeep)
-    {
-        // we reset the evm's journaled_state to the state of the snapshot previous state
-        ccx.ecx.journaled_state.inner = journaled_state;
-        true
+pub(super) fn get_nonce<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    address: &Address,
+) -> Result {
+    let account = ccx.ecx.journal_mut().load_account(*address)?;
+    Ok(account.data.info.nonce.abi_encode())
+}
+
+fn inner_snapshot_state<FEN: FoundryEvmNetwork>(ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+    let evm_env = ccx.ecx.evm_clone();
+    let (db, inner) = ccx.ecx.db_journal_inner_mut();
+    let id = db.snapshot_state(inner, &evm_env);
+    Ok(id.abi_encode())
+}
+
+fn inner_revert_to_state<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    snapshot_id: U256,
+) -> Result {
+    let mut evm_env = ccx.ecx.evm_clone();
+    let caller = ccx.ecx.caller();
+    let (db, inner) = ccx.ecx.db_journal_inner_mut();
+    if let Some(restored) = db.revert_state(
+        snapshot_id,
+        inner,
+        &mut evm_env,
+        caller,
+        RevertStateSnapshotAction::RevertKeep,
+    ) {
+        *inner = restored;
+        ccx.ecx.set_evm(evm_env);
+        Ok(true.abi_encode())
     } else {
-        false
-    };
-    Ok(result.abi_encode())
+        Ok(false.abi_encode())
+    }
 }
 
-fn inner_revert_to_state_and_delete(ccx: &mut CheatsCtxt, snapshot_id: U256) -> Result {
-    let (db, journal, mut env) = ccx.ecx.as_db_env_and_journal();
-
-    let result = if let Some(journaled_state) =
-        db.revert_state(snapshot_id, &*journal, &mut env, RevertStateSnapshotAction::RevertRemove)
-    {
-        // we reset the evm's journaled_state to the state of the snapshot previous state
-        ccx.ecx.journaled_state.inner = journaled_state;
-        true
+fn inner_revert_to_state_and_delete<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    snapshot_id: U256,
+) -> Result {
+    let mut evm_env = ccx.ecx.evm_clone();
+    let caller = ccx.ecx.caller();
+    let (db, inner) = ccx.ecx.db_journal_inner_mut();
+    if let Some(restored) = db.revert_state(
+        snapshot_id,
+        inner,
+        &mut evm_env,
+        caller,
+        RevertStateSnapshotAction::RevertRemove,
+    ) {
+        *inner = restored;
+        ccx.ecx.set_evm(evm_env);
+        Ok(true.abi_encode())
     } else {
-        false
-    };
-    Ok(result.abi_encode())
+        Ok(false.abi_encode())
+    }
 }
 
-fn inner_delete_state_snapshot(ccx: &mut CheatsCtxt, snapshot_id: U256) -> Result {
-    let result = ccx.ecx.journaled_state.database.delete_state_snapshot(snapshot_id);
-    Ok(result.abi_encode())
-}
-
-fn inner_delete_state_snapshots(ccx: &mut CheatsCtxt) -> Result {
-    ccx.ecx.journaled_state.database.delete_state_snapshots();
-    Ok(Default::default())
-}
-
-fn inner_value_snapshot(
-    ccx: &mut CheatsCtxt,
+fn inner_value_snapshot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
     group: Option<String>,
     name: Option<String>,
     value: String,
@@ -998,8 +1400,8 @@ fn inner_value_snapshot(
     Ok(Default::default())
 }
 
-fn inner_last_gas_snapshot(
-    ccx: &mut CheatsCtxt,
+fn inner_last_gas_snapshot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
     group: Option<String>,
     name: Option<String>,
     value: u64,
@@ -1011,14 +1413,13 @@ fn inner_last_gas_snapshot(
     Ok(value.abi_encode())
 }
 
-fn inner_start_gas_snapshot(
-    ccx: &mut CheatsCtxt,
+fn inner_start_gas_snapshot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
     group: Option<String>,
     name: Option<String>,
 ) -> Result {
     // Revert if there is an active gas snapshot as we can only have one active snapshot at a time.
-    if ccx.state.gas_metering.active_gas_snapshot.is_some() {
-        let (group, name) = ccx.state.gas_metering.active_gas_snapshot.as_ref().unwrap().clone();
+    if let Some((group, name)) = &ccx.state.gas_metering.active_gas_snapshot {
         bail!("gas snapshot was already started with group: {group} and name: {name}");
     }
 
@@ -1028,7 +1429,7 @@ fn inner_start_gas_snapshot(
         group: group.clone(),
         name: name.clone(),
         gas_used: 0,
-        depth: ccx.ecx.journaled_state.depth(),
+        depth: ccx.ecx.journal().depth(),
     });
 
     ccx.state.gas_metering.active_gas_snapshot = Some((group, name));
@@ -1038,16 +1439,16 @@ fn inner_start_gas_snapshot(
     Ok(Default::default())
 }
 
-fn inner_stop_gas_snapshot(
-    ccx: &mut CheatsCtxt,
+fn inner_stop_gas_snapshot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
     group: Option<String>,
     name: Option<String>,
 ) -> Result {
     // If group and name are not provided, use the last snapshot group and name.
-    let (group, name) = group.zip(name).unwrap_or_else(|| {
-        let (group, name) = ccx.state.gas_metering.active_gas_snapshot.as_ref().unwrap().clone();
-        (group, name)
-    });
+    let (group, name) = group
+        .zip(name)
+        .or_else(|| ccx.state.gas_metering.active_gas_snapshot.clone())
+        .ok_or_else(|| fmt_err!("no active gas snapshot; call `startGasSnapshot` first"))?;
 
     if let Some(record) = ccx
         .state
@@ -1076,10 +1477,11 @@ fn inner_stop_gas_snapshot(
             .retain(|record| record.group != group && record.name != name);
 
         // Clear last snapshot cache if we have an exact match.
-        if let Some((snapshot_group, snapshot_name)) = &ccx.state.gas_metering.active_gas_snapshot {
-            if snapshot_group == &group && snapshot_name == &name {
-                ccx.state.gas_metering.active_gas_snapshot = None;
-            }
+        if let Some((snapshot_group, snapshot_name)) = &ccx.state.gas_metering.active_gas_snapshot
+            && snapshot_group == &group
+            && snapshot_name == &name
+        {
+            ccx.state.gas_metering.active_gas_snapshot = None;
         }
 
         Ok(value.abi_encode())
@@ -1089,8 +1491,8 @@ fn inner_stop_gas_snapshot(
 }
 
 // Derives the snapshot group and name from the provided group and name or the running contract.
-fn derive_snapshot_name(
-    ccx: &CheatsCtxt,
+fn derive_snapshot_name<FEN: FoundryEvmNetwork>(
+    ccx: &CheatsCtxt<'_, '_, FEN>,
     group: Option<String>,
     name: Option<String>,
 ) -> (String, String) {
@@ -1124,7 +1526,11 @@ fn derive_snapshot_name(
 /// - If no caller modification is active:
 ///     - caller_mode will be equal to [CallerMode::None],
 ///     - `msg.sender` and `tx.origin` will be equal to the default sender address.
-fn read_callers(state: &Cheatcodes, default_sender: &Address, call_depth: usize) -> Result {
+fn read_callers<FEN: FoundryEvmNetwork>(
+    state: &Cheatcodes<FEN>,
+    default_sender: &Address,
+    call_depth: usize,
+) -> Result {
     let mut mode = CallerMode::None;
     let mut new_caller = default_sender;
     let mut new_origin = default_sender;
@@ -1148,13 +1554,23 @@ fn read_callers(state: &Cheatcodes, default_sender: &Address, call_depth: usize)
 }
 
 /// Ensures the `Account` is loaded and touched.
-pub(super) fn journaled_account<'a>(
-    ecx: Ecx<'a, '_, '_>,
+pub(super) fn journaled_account<
+    CTX: ContextTr<Db: Database<Error = DatabaseError>, Journal: JournalExt>,
+>(
+    ecx: &mut CTX,
     addr: Address,
-) -> Result<&'a mut Account> {
-    ecx.journaled_state.load_account(addr)?;
-    ecx.journaled_state.touch(addr);
-    Ok(ecx.journaled_state.state.get_mut(&addr).expect("account is loaded"))
+) -> Result<&mut Account> {
+    ensure_loaded_account(ecx, addr)?;
+    Ok(ecx.journal_mut().evm_state_mut().get_mut(&addr).expect("account is loaded"))
+}
+
+pub(super) fn ensure_loaded_account<CTX: ContextTr<Db: Database<Error = DatabaseError>>>(
+    ecx: &mut CTX,
+    addr: Address,
+) -> Result<()> {
+    ecx.journal_mut().load_account(addr)?;
+    ecx.journal_mut().touch_account(addr);
+    Ok(())
 }
 
 /// Consumes recorded account accesses and returns them as an abi encoded
@@ -1164,7 +1580,7 @@ pub(super) fn journaled_account<'a>(
 /// In the case where `stopAndReturnStateDiff` is called at a lower
 /// depth than `startStateDiffRecording`, multiple `Vec<RecordedAccountAccesses>`
 /// will be flattened, preserving the order of the accesses.
-fn get_state_diff(state: &mut Cheatcodes) -> Result {
+fn get_state_diff<FEN: FoundryEvmNetwork>(state: &mut Cheatcodes<FEN>) -> Result {
     let res = state
         .recorded_account_diffs_stack
         .replace(Default::default())
@@ -1193,15 +1609,51 @@ fn genesis_account(account: &Account) -> GenesisAccount {
 }
 
 /// Helper function to returns state diffs recorded for each changed account.
-fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, AccountStateDiffs> {
+fn get_recorded_state_diffs<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+) -> BTreeMap<Address, AccountStateDiffs> {
     let mut state_diffs: BTreeMap<Address, AccountStateDiffs> = BTreeMap::default();
-    if let Some(records) = &state.recorded_account_diffs_stack {
+
+    // First, collect all unique addresses we need to look up
+    let mut addresses_to_lookup = HashSet::new();
+    if let Some(records) = &ccx.state.recorded_account_diffs_stack {
+        for account_access in records.iter().flatten() {
+            if !account_access.storageAccesses.is_empty()
+                || account_access.oldBalance != account_access.newBalance
+            {
+                addresses_to_lookup.insert(account_access.account);
+                for storage_access in &account_access.storageAccesses {
+                    if storage_access.isWrite && !storage_access.reverted {
+                        addresses_to_lookup.insert(storage_access.account);
+                    }
+                }
+            }
+        }
+    }
+
+    // Look up contract names and storage layouts for all addresses
+    let mut contract_names = HashMap::new();
+    let mut storage_layouts = HashMap::new();
+    for address in addresses_to_lookup {
+        if let Some((artifact_id, contract_data)) = get_contract_data(ccx, address) {
+            contract_names.insert(address, artifact_id.identifier());
+
+            // Also get storage layout if available
+            if let Some(storage_layout) = &contract_data.storage_layout {
+                storage_layouts.insert(address, storage_layout.clone());
+            }
+        }
+    }
+
+    // Now process the records
+    if let Some(records) = &ccx.state.recorded_account_diffs_stack {
         records
             .iter()
             .flatten()
             .filter(|account_access| {
-                !account_access.storageAccesses.is_empty() ||
-                    account_access.oldBalance != account_access.newBalance
+                !account_access.storageAccesses.is_empty()
+                    || account_access.oldBalance != account_access.newBalance
+                    || account_access.oldNonce != account_access.newNonce
             })
             .for_each(|account_access| {
                 // Record account balance diffs.
@@ -1209,7 +1661,8 @@ fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, Account
                     let account_diff =
                         state_diffs.entry(account_access.account).or_insert_with(|| {
                             AccountStateDiffs {
-                                label: state.labels.get(&account_access.account).cloned(),
+                                label: ccx.state.labels.get(&account_access.account).cloned(),
+                                contract: contract_names.get(&account_access.account).cloned(),
                                 ..Default::default()
                             }
                         });
@@ -1224,25 +1677,100 @@ fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, Account
                     }
                 }
 
+                // Record account nonce diffs.
+                if account_access.oldNonce != account_access.newNonce {
+                    let account_diff =
+                        state_diffs.entry(account_access.account).or_insert_with(|| {
+                            AccountStateDiffs {
+                                label: ccx.state.labels.get(&account_access.account).cloned(),
+                                contract: contract_names.get(&account_access.account).cloned(),
+                                ..Default::default()
+                            }
+                        });
+                    // Update nonce diff. Do not overwrite the initial nonce if already set.
+                    if let Some(diff) = &mut account_diff.nonce_diff {
+                        diff.new_value = account_access.newNonce;
+                    } else {
+                        account_diff.nonce_diff = Some(NonceDiff {
+                            previous_value: account_access.oldNonce,
+                            new_value: account_access.newNonce,
+                        });
+                    }
+                }
+
+                // Collect all storage accesses for this account
+                let raw_changes_by_slot = account_access
+                    .storageAccesses
+                    .iter()
+                    .filter_map(|access| {
+                        (access.isWrite && !access.reverted)
+                            .then_some((access.slot, (access.previousValue, access.newValue)))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+
                 // Record account state diffs.
                 for storage_access in &account_access.storageAccesses {
                     if storage_access.isWrite && !storage_access.reverted {
                         let account_diff = state_diffs
                             .entry(storage_access.account)
                             .or_insert_with(|| AccountStateDiffs {
-                                label: state.labels.get(&storage_access.account).cloned(),
+                                label: ccx.state.labels.get(&storage_access.account).cloned(),
+                                contract: contract_names.get(&storage_access.account).cloned(),
                                 ..Default::default()
                             });
+                        let layout = storage_layouts.get(&storage_access.account);
                         // Update state diff. Do not overwrite the initial value if already set.
-                        match account_diff.state_diff.entry(storage_access.slot) {
+                        let entry = match account_diff.state_diff.entry(storage_access.slot) {
                             Entry::Vacant(slot_state_diff) => {
+                                // Get storage layout info for this slot
+                                // Include mapping slots if available for the account
+                                let mapping_slots = ccx
+                                    .state
+                                    .mapping_slots
+                                    .as_ref()
+                                    .and_then(|slots| slots.get(&storage_access.account));
+
+                                let slot_info = layout.and_then(|layout| {
+                                    let decoder = SlotIdentifier::new(layout.clone());
+                                    decoder.identify(&storage_access.slot, mapping_slots).or_else(
+                                        || {
+                                            // Create a map of new values for bytes/string
+                                            // identification. These values are used to determine
+                                            // the length of the data which helps determine how many
+                                            // slots to search
+                                            let current_base_slot_values = raw_changes_by_slot
+                                                .iter()
+                                                .map(|(slot, (_, new_val))| (*slot, *new_val))
+                                                .collect::<B256Map<_>>();
+                                            decoder.identify_bytes_or_string(
+                                                &storage_access.slot,
+                                                &current_base_slot_values,
+                                            )
+                                        },
+                                    )
+                                });
+
                                 slot_state_diff.insert(SlotStateDiff {
                                     previous_value: storage_access.previousValue,
                                     new_value: storage_access.newValue,
-                                });
+                                    slot_info,
+                                })
                             }
-                            Entry::Occupied(mut slot_state_diff) => {
-                                slot_state_diff.get_mut().new_value = storage_access.newValue;
+                            Entry::Occupied(slot_state_diff) => {
+                                let entry = slot_state_diff.into_mut();
+                                entry.new_value = storage_access.newValue;
+                                entry
+                            }
+                        };
+
+                        // Update decoded values if we have slot info
+                        if let Some(slot_info) = &mut entry.slot_info {
+                            slot_info.decode_values(entry.previous_value, storage_access.newValue);
+                            if slot_info.is_bytes_or_string() {
+                                slot_info.decode_bytes_or_string_values(
+                                    &storage_access.slot,
+                                    &raw_changes_by_slot,
+                                );
                             }
                         }
                     }
@@ -1252,11 +1780,66 @@ fn get_recorded_state_diffs(state: &mut Cheatcodes) -> BTreeMap<Address, Account
     state_diffs
 }
 
+/// EIP-1967 implementation storage slot
+const EIP1967_IMPL_SLOT: &str = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
+/// EIP-1822 UUPS implementation storage slot: keccak256("PROXIABLE")
+const EIP1822_PROXIABLE_SLOT: &str =
+    "c5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7";
+
+/// Helper function to get the contract data from the deployed code at an address.
+fn get_contract_data<'a, FEN: FoundryEvmNetwork>(
+    ccx: &'a mut CheatsCtxt<'_, '_, FEN>,
+    address: Address,
+) -> Option<(&'a foundry_compilers::ArtifactId, &'a foundry_common::contracts::ContractData)> {
+    // Check if we have available artifacts to match against
+    let artifacts = ccx.state.config.available_artifacts.as_ref()?;
+
+    // Try to load the account and get its code
+    let account = ccx.ecx.journal_mut().load_account(address).ok()?;
+    let code = account.data.info.code.as_ref()?;
+
+    // Skip if code is empty
+    if code.is_empty() {
+        return None;
+    }
+
+    // Try to find the artifact by deployed code
+    let code_bytes = code.original_bytes();
+    // First check for proxy patterns
+    let hex_str = hex::encode(&code_bytes);
+    let find_by_suffix =
+        |suffix: &str| artifacts.iter().find(|(a, _)| a.identifier().ends_with(suffix));
+    // Simple proxy detection based on storage slot patterns
+    if hex_str.contains(EIP1967_IMPL_SLOT)
+        && let Some(result) = find_by_suffix(":TransparentUpgradeableProxy")
+    {
+        return Some(result);
+    } else if hex_str.contains(EIP1822_PROXIABLE_SLOT)
+        && let Some(result) = find_by_suffix(":UUPSUpgradeable")
+    {
+        return Some(result);
+    }
+
+    // Try exact match
+    if let Some(result) = artifacts.find_by_deployed_code_exact(&code_bytes) {
+        return Some(result);
+    }
+
+    // Fallback to fuzzy matching if exact match fails
+    artifacts.find_by_deployed_code(&code_bytes)
+}
+
 /// Helper function to set / unset cold storage slot of the target address.
-fn set_cold_slot(ccx: &mut CheatsCtxt, target: Address, slot: U256, cold: bool) {
-    if let Some(account) = ccx.ecx.journaled_state.state.get_mut(&target) {
-        if let Some(storage_slot) = account.storage.get_mut(&slot) {
-            storage_slot.is_cold = cold;
-        }
+fn set_cold_slot<FEN: FoundryEvmNetwork>(
+    ccx: &mut CheatsCtxt<'_, '_, FEN>,
+    target: Address,
+    slot: U256,
+    cold: bool,
+) {
+    if let Some(account) = ccx.ecx.journal_mut().evm_state_mut().get_mut(&target)
+        && let Some(storage_slot) = account.storage.get_mut(&slot)
+    {
+        storage_slot.is_cold = cold;
     }
 }

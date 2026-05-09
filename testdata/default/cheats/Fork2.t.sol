@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.18;
 
-import "ds-test/test.sol";
-import "../logs/console.sol";
-import "cheats/Vm.sol";
+import "utils/Test.sol";
 
 struct MyStruct {
     uint256 value;
@@ -13,7 +11,7 @@ contract MyContract {
     uint256 forkId;
     bytes32 blockHash;
 
-    constructor(uint256 _forkId) public {
+    constructor(uint256 _forkId) {
         forkId = _forkId;
         blockHash = blockhash(block.number - 1);
     }
@@ -27,9 +25,7 @@ contract MyContract {
     }
 }
 
-contract ForkTest is DSTest {
-    Vm constant vm = Vm(HEVM_ADDRESS);
-
+contract ForkTest is Test {
     uint256 mainnetFork;
     uint256 optimismFork;
 
@@ -98,14 +94,14 @@ contract ForkTest is DSTest {
     // test that we can "roll" blocks until a transaction
     function testCanRollForkUntilTransaction() public {
         // block to run transactions from
-        uint256 block = 16261704;
+        uint256 blockNumber = 16261704;
 
         // fork until previous block
-        uint256 fork = vm.createSelectFork("mainnet", block - 1);
+        uint256 fork = vm.createSelectFork("mainnet", blockNumber - 1);
 
         // block transactions in order: https://beaconcha.in/block/16261704#transactions
         // run transactions from current block until tx
-        bytes32 tx = 0x67cbad73764049e228495a3f90144aab4a37cb4b5fd697dffc234aa5ed811ace;
+        bytes32 transaction = 0x67cbad73764049e228495a3f90144aab4a37cb4b5fd697dffc234aa5ed811ace;
 
         // account that sends ether in 2 transaction before tx
         address account = 0xAe45a8240147E6179ec7c9f92c5A18F9a97B3fCA;
@@ -119,7 +115,7 @@ contract ForkTest is DSTest {
         uint256 newBalance = account.balance - transferAmount;
 
         // execute transactions in block until tx
-        vm.rollFork(tx);
+        vm.rollFork(transaction);
 
         // balance must be less than newBalance due to gas spent
         assert(account.balance < newBalance);
@@ -150,13 +146,13 @@ contract ForkTest is DSTest {
         assertEq(dummy.val(), expectedValue);
     }
 
-    // checks diagnostic
+    /// forge-config: default.allow_internal_expect_revert = true
     function testNonExistingContractRevert() public {
         vm.selectFork(mainnetFork);
         DummyContract dummy = new DummyContract();
 
         // this will succeed since `dummy` is deployed on the currently active fork
-        string memory msg = dummy.hello();
+        string memory message = dummy.hello();
 
         address dummyAddress = address(dummy);
 
@@ -164,7 +160,8 @@ contract ForkTest is DSTest {
         assertEq(dummyAddress, address(dummy));
 
         // this will revert since `dummy` does not exists on the currently active fork
-        string memory msg2 = dummy.hello();
+        vm.expectRevert();
+        dummy.noop();
     }
 
     struct EthGetLogsJsonParseable {
@@ -235,15 +232,140 @@ contract ForkTest is DSTest {
         assertGt(decodedResult, 20_000_000);
     }
 
+    struct Withdrawal {
+        address addr;
+        bytes amount;
+        bytes index;
+        bytes validatorIndex;
+    }
+
+    struct BlockResult {
+        bytes baseFeePerGas;
+        bytes blobGasUsed;
+        bytes difficulty;
+        bytes excessBlobGas;
+        bytes extraData;
+        bytes gasLimit;
+        bytes gasUsed;
+        bytes32 hash;
+        bytes logsBloom;
+        address miner;
+        bytes32 mixHash;
+        bytes nonce;
+        bytes number;
+        bytes32 parentBeaconBlockRoot;
+        bytes32 parentHash;
+        bytes32 receiptsRoot;
+        bytes32 sha3Uncles;
+        bytes size;
+        bytes32 stateRoot;
+        bytes timestamp;
+        bytes32[] transactions;
+        bytes32 transactionsRoot;
+        bytes32[] uncles;
+        Withdrawal[] withdrawals;
+        bytes32 withdrawalsRoot;
+    }
+
+    function testRpcBlockByNumberFullReturndata() public {
+        bytes memory data = vm.rpc("sepolia", "eth_getBlockByNumber", '["0x588b24", false]');
+        BlockResult memory blockResult = abi.decode(data, (BlockResult));
+        // Verify block hash
+        assertEq(
+            blockResult.hash,
+            bytes32(hex"50b08560cfeef4a4005333a78bef1190f3d8708a074c549e0e5d834c6d7eab3f"),
+            "hash mismatch"
+        );
+        // Verify parent hash
+        assertEq(
+            blockResult.parentHash,
+            bytes32(hex"ee012f100cea384420e993e4eab8c3cf0ed35a49f75769eb8a37c9e0c93ea235"),
+            "parentHash mismatch"
+        );
+        // Verify block number (0x588b24)
+        assertEq(blockResult.number, hex"588b24", "number mismatch");
+        // Verify nested struct arrays
+        assertEq(blockResult.withdrawals.length, 16, "withdrawals length mismatch");
+        assertEq(
+            blockResult.withdrawals[0].addr, 0x25c4a76E7d118705e7Ea2e9b7d8C59930d8aCD3b, "withdrawal address mismatch"
+        );
+        // Verify transaction hashes array
+        assertEq(blockResult.transactions.length, 133, "transactions length mismatch");
+        // Verify uncles array (should be empty for this block)
+        assertEq(blockResult.uncles.length, 0, "uncles should be empty");
+    }
+
+    function testRpcClientVersion() public {
+        bytes memory data = vm.rpc("sepolia", "web3_clientVersion", "[]");
+        string memory clientVersion = abi.decode(data, (string));
+        assertGt(bytes(clientVersion).length, 0, "clientVersion should not be empty");
+    }
+
+    function testRpcNetListening() public {
+        bytes memory data = vm.rpc("sepolia", "net_listening", "[]");
+        bool listening = abi.decode(data, (bool));
+        assertTrue(listening, "net_listening should return true");
+    }
+
+    // Verify abi.decode works for eth_chainId (simple hex scalar to uint).
+    function testRpcChainId() public {
+        bytes memory data = vm.rpc("sepolia", "eth_chainId", "[]");
+        // Sepolia chain ID is 11155111 (0xaa36a7)
+        assertEq(data, hex"aa36a7", "chain ID mismatch");
+    }
+
+    // Verify null response handling (eth_getBlockByNumber for a non-existent future block).
+    function testRpcNullResponse() public {
+        bytes memory data = vm.rpc("sepolia", "eth_getBlockByNumber", '["0xffffffffffffff", false]');
+        // Null responses are encoded as zero bytes32
+        assertEq(data.length, 32, "null should encode as bytes32");
+    }
+
+    // Struct matching a legacy (type 0) transaction fields sorted alphabetically.
+    struct LegacyTransactionResult {
+        bytes32 blockHash;
+        bytes blockNumber;
+        bytes blockTimestamp;
+        bytes chainId;
+        address from;
+        bytes gas;
+        bytes gasPrice;
+        bytes32 hash;
+        bytes input;
+        bytes nonce;
+        bytes32 r;
+        bytes32 s;
+        address to;
+        bytes transactionIndex;
+        bytes type_;
+        bytes v;
+        bytes value;
+    }
+
+    // Verify struct decoding for transaction objects (original issue #7858).
+    // Hardcode the DRPC URL to avoid provider-specific non-standard fields
+    // (e.g. `blockTimestamp` from PublicNode) that shift ABI decoding offsets.
     // <https://github.com/foundry-rs/foundry/issues/7858>
     function testRpcTransactionByHash() public {
-        string memory param = string.concat('["0xe1a0fba63292976050b2fbf4379a1901691355ed138784b4e0d1854b4cf9193e"]');
-        vm.rpc("sepolia", "eth_getTransactionByHash", param);
+        bytes memory data = vm.rpc(
+            "https://sepolia.drpc.org",
+            "eth_getTransactionByHash",
+            '["0xe1a0fba63292976050b2fbf4379a1901691355ed138784b4e0d1854b4cf9193e"]'
+        );
+        LegacyTransactionResult memory txn = abi.decode(data, (LegacyTransactionResult));
+        assertEq(
+            txn.hash, bytes32(hex"e1a0fba63292976050b2fbf4379a1901691355ed138784b4e0d1854b4cf9193e"), "tx hash mismatch"
+        );
+        assertEq(txn.from, 0x8Be6209bC9BD1a8e6e015ADe090F6BE7BE6f032A, "tx from mismatch");
+        assertEq(txn.to, 0xF04fd9a66DE511BC389D3b830C1F850a4A4A8c61, "tx to mismatch");
+        assertEq(txn.blockNumber, hex"588b24", "tx blockNumber mismatch");
     }
 }
 
 contract DummyContract {
     uint256 public val;
+
+    function noop() external pure {}
 
     function hello() external view returns (string memory) {
         return "hello";

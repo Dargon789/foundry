@@ -1,6 +1,5 @@
 use super::{Preprocessor, PreprocessorId};
 use crate::{Comments, Document, ParseItem, ParseSource};
-use forge_fmt::solang_ext::SafeUnwrap;
 use regex::{Captures, Match, Regex};
 use std::{
     borrow::Cow,
@@ -85,13 +84,16 @@ impl InferInlineHyperlinks {
         for item in items {
             match &item.source {
                 ParseSource::Contract(contract) => {
-                    let name = &contract.name.safe_unwrap().name;
+                    let name = &contract.name;
                     if name == link.identifier {
                         if link.part.is_none() {
-                            return Some(InlineLinkTarget::borrowed(name, target_path.to_path_buf()))
+                            return Some(InlineLinkTarget::borrowed(
+                                name,
+                                target_path.to_path_buf(),
+                            ));
                         }
                         // try to find the referenced item in the contract's children
-                        return Self::find_match(link, target_path, item.children.iter())
+                        return Self::find_match(link, target_path, item.children.iter());
                     }
                 }
                 ParseSource::Function(fun) => {
@@ -100,39 +102,42 @@ impl InferInlineHyperlinks {
                     // have so we can match the correct one
                     if let Some(id) = &fun.name {
                         // Note: constructors don't have a name
-                        if id.name == link.ref_name() {
-                            return Some(InlineLinkTarget::borrowed(
-                                &id.name,
-                                target_path.to_path_buf(),
-                            ))
+                        if id == link.ref_name() {
+                            return Some(InlineLinkTarget::borrowed(id, target_path.to_path_buf()));
                         }
                     } else if link.ref_name() == "constructor" {
                         return Some(InlineLinkTarget::borrowed(
                             "constructor",
                             target_path.to_path_buf(),
-                        ))
+                        ));
                     }
                 }
                 ParseSource::Variable(_) => {}
                 ParseSource::Event(ev) => {
-                    let ev_name = &ev.name.safe_unwrap().name;
+                    let ev_name = &ev.name;
                     if ev_name == link.ref_name() {
-                        return Some(InlineLinkTarget::borrowed(ev_name, target_path.to_path_buf()))
+                        return Some(InlineLinkTarget::borrowed(
+                            ev_name,
+                            target_path.to_path_buf(),
+                        ));
                     }
                 }
                 ParseSource::Error(err) => {
-                    let err_name = &err.name.safe_unwrap().name;
+                    let err_name = &err.name;
                     if err_name == link.ref_name() {
-                        return Some(InlineLinkTarget::borrowed(err_name, target_path.to_path_buf()))
+                        return Some(InlineLinkTarget::borrowed(
+                            err_name,
+                            target_path.to_path_buf(),
+                        ));
                     }
                 }
                 ParseSource::Struct(structdef) => {
-                    let struct_name = &structdef.name.safe_unwrap().name;
+                    let struct_name = &structdef.name;
                     if struct_name == link.ref_name() {
                         return Some(InlineLinkTarget::borrowed(
                             struct_name,
                             target_path.to_path_buf(),
-                        ))
+                        ));
                     }
                 }
                 ParseSource::Enum(_) => {}
@@ -195,7 +200,7 @@ struct InlineLinkTarget<'a> {
 }
 
 impl<'a> InlineLinkTarget<'a> {
-    fn borrowed(section: &'a str, target_path: PathBuf) -> Self {
+    const fn borrowed(section: &'a str, target_path: PathBuf) -> Self {
         Self { section: Cow::Borrowed(section), target_path }
     }
 }
@@ -227,7 +232,7 @@ impl<'a> InlineLink<'a> {
     }
 
     fn captures(s: &'a str) -> impl Iterator<Item = Self> + 'a {
-        RE_INLINE_LINK.captures(s).map(Self::from_capture).into_iter().flatten()
+        RE_INLINE_LINK.captures_iter(s).filter_map(Self::from_capture)
     }
 
     /// Parses the first inline link.
@@ -253,22 +258,8 @@ impl<'a> InlineLink<'a> {
         self.exact_identifier().split('-').next().unwrap()
     }
 
-    fn exact_identifier(&self) -> &str {
-        let mut name = self.identifier;
-        if let Some(part) = self.part {
-            name = part;
-        }
-        name
-    }
-
-    /// Returns the name of the referenced item and its arguments, if any.
-    ///
-    /// Eg: `safeMint-address-uint256-` returns `("safeMint", ["address", "uint256"])`
-    #[expect(unused)]
-    fn ref_name_exact(&self) -> (&str, impl Iterator<Item = &str> + '_) {
-        let identifier = self.exact_identifier();
-        let mut iter = identifier.split('-');
-        (iter.next().unwrap(), iter.filter(|s| !s.is_empty()))
+    const fn exact_identifier(&self) -> &str {
+        if let Some(part) = self.part { part } else { self.identifier }
     }
 
     /// Returns the content of the matched link.
@@ -277,7 +268,7 @@ impl<'a> InlineLink<'a> {
     }
 
     /// Returns true if the link is external.
-    fn is_external(&self) -> bool {
+    const fn is_external(&self) -> bool {
         self.part.is_some()
     }
 }

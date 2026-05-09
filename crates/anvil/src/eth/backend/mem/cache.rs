@@ -55,24 +55,21 @@ impl DiskStateCache {
         }
     }
 
-    /// Stores the snapshot for the given hash
+    /// Stores the snapshot for the given hash synchronously.
     ///
-    /// Note: this writes the state on a new spawned task
-    ///
-    /// Caution: this requires a running tokio Runtime.
-    pub fn write(&mut self, hash: B256, state: StateSnapshot) {
-        self.with_cache_file(hash, |file| {
-            tokio::task::spawn(async move {
-                match foundry_common::fs::write_json_file(&file, &state) {
-                    Ok(_) => {
-                        trace!(target: "backend", ?hash, "wrote state json file");
-                    }
-                    Err(err) => {
-                        error!(target: "backend", %err, ?hash, "Failed to load state snapshot");
-                    }
-                };
-            });
-        });
+    /// Returns `true` if the write was successful, `false` otherwise.
+    pub fn write(&mut self, hash: B256, state: &StateSnapshot) -> bool {
+        self.with_cache_file(hash, |file| match foundry_common::fs::write_json_file(&file, state) {
+            Ok(_) => {
+                trace!(target: "backend", ?hash, "wrote state json file");
+                true
+            }
+            Err(err) => {
+                error!(target: "backend", %err, ?hash, "Failed to write state snapshot");
+                false
+            }
+        })
+        .unwrap_or(false)
     }
 
     /// Loads the snapshot file for the given hash
@@ -119,11 +116,7 @@ fn build_tmp_dir(p: Option<&Path>) -> io::Result<TempDir> {
     let prefix = now.format("anvil-state-%d-%m-%Y-%H-%M").to_string();
     builder.prefix(&prefix);
 
-    if let Some(p) = p {
-        builder.tempdir_in(p)
-    } else {
-        builder.tempdir()
-    }
+    if let Some(p) = p { builder.tempdir_in(p) } else { builder.tempdir() }
 }
 
 #[cfg(test)]
@@ -136,20 +129,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path();
         let cache_dir = build_tmp_dir(Some(p)).unwrap();
-        assert!(cache_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("anvil-state-"));
+        assert!(
+            cache_dir.path().file_name().unwrap().to_str().unwrap().starts_with("anvil-state-")
+        );
         let cache_dir = build_tmp_dir(None).unwrap();
-        assert!(cache_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("anvil-state-"));
+        assert!(
+            cache_dir.path().file_name().unwrap().to_str().unwrap().starts_with("anvil-state-")
+        );
     }
 }
