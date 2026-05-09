@@ -1,6 +1,6 @@
 use super::{install, watch::WatchArgs};
 use clap::Parser;
-use eyre::{Context, Result};
+use eyre::Result;
 use forge_lint::{linter::Linter, sol::SolidityLinter};
 use foundry_cli::{
     opts::{BuildOpts, configure_pcx_from_solc, get_solar_sources_from_compile_output},
@@ -61,6 +61,14 @@ pub struct BuildArgs {
     #[serde(skip)]
     pub ignore_eip_3860: bool,
 
+    /// Skip the post-build lint step for this invocation.
+    ///
+    /// Equivalent to setting `lint_on_build = false` under `[lint]` in foundry.toml,
+    /// but only for the current command.
+    #[arg(long, visible_alias = "skip-lint")]
+    #[serde(skip)]
+    pub no_lint: bool,
+
     #[command(flatten)]
     #[serde(flatten)]
     pub build: BuildOpts,
@@ -117,9 +125,16 @@ impl BuildArgs {
         }
 
         // Only run the `SolidityLinter` if lint on build and no compilation errors.
-        if config.lint.lint_on_build && !output.output().errors.iter().any(|e| e.is_error()) {
-            self.lint(&project, &config, self.paths.as_deref(), &mut output)
-                .wrap_err("Lint failed")?;
+        if !self.no_lint
+            && config.lint.lint_on_build
+            && !output.output().errors.iter().any(|e| e.is_error())
+            && let Err(err) = self.lint(&project, &config, self.paths.as_deref(), &mut output)
+        {
+            emit_lint_failure_notice();
+            return Err(err.wrap_err(
+                "post-build lint step failed; rerun with --no-lint or set \
+                 `lint_on_build = false` under `[lint]` in foundry.toml to bypass",
+            ));
         }
 
         Ok(output)
@@ -188,8 +203,12 @@ impl BuildArgs {
 
             // NOTE(rusowsky): Once solar can drop unsupported versions, rather than creating a new
             // compiler, we should reuse the parser from the project output.
+            //
+            // Buffer emitter so parse-phase errors surface verbatim in `convert_solar_errors`.
             let mut compiler = solar::sema::Compiler::new(
-                solar::interface::Session::builder().with_stderr_emitter().build(),
+                solar::interface::Session::builder()
+                    .with_buffer_emitter(Default::default())
+                    .build(),
             );
 
             // Load the solar-compatible sources to the pcx before linting
@@ -199,6 +218,18 @@ impl BuildArgs {
                 pcx.set_resolve_imports(true);
                 pcx.parse();
             });
+
+            // Flush buffered parse-phase warnings; on error, `convert_solar_errors` surfaces
+            // them in the returned error instead, so skip to avoid duplicates.
+            if compiler.sess().dcx.has_errors().is_ok()
+                && let Some(diags) = compiler.sess().emitted_diagnostics()
+            {
+                let s = diags.to_string();
+                if !s.is_empty() {
+                    let _ = sh_eprint!("{s}");
+                }
+            }
+
             linter.lint(&input_files, config.deny, &mut compiler)?;
         }
 
@@ -320,6 +351,21 @@ impl BuildArgs {
             }
         }
     }
+}
+
+/// Notice shown on lint-on-build failure; printed separately so it survives single-line
+/// cause-chain rendering.
+const LINT_FAILURE_NOTICE: &str = "\
+note: post-build lint failed, but compilation succeeded.
+bypass with `--no-lint` or set `lint_on_build = false` under `[lint]` in foundry.toml
+docs: https://getfoundry.sh/forge/linting#disable-linting-on-build
+";
+
+fn emit_lint_failure_notice() {
+    if shell::is_json() {
+        return;
+    }
+    let _ = sh_eprintln!("\n{LINT_FAILURE_NOTICE}");
 }
 
 // Make this args a `figment::Provider` so that it can be merged into the `Config`
