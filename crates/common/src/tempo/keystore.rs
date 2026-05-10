@@ -108,10 +108,29 @@ pub(crate) fn test_env_mutex() -> &'static tokio::sync::Mutex<()> {
 
 /// Resolve the Tempo home directory.
 ///
-/// Uses `TEMPO_HOME` env var if set, otherwise `~/.tempo`.
+/// Uses `TEMPO_HOME` env var if set (as a single relative directory name under
+/// the user's home), otherwise `~/.tempo`.
 pub fn tempo_home() -> Option<PathBuf> {
     if let Ok(home) = env::var(TEMPO_HOME_ENV) {
-        return Some(PathBuf::from(home));
+        let candidate = home.trim();
+        let p = PathBuf::from(candidate);
+
+        // Accept only a single safe path component to avoid traversal/absolute paths.
+        if !candidate.is_empty()
+            && !candidate.contains("..")
+            && !candidate.contains('/')
+            && !candidate.contains('\\')
+            && !p.is_absolute()
+            && p.components().count() == 1
+        {
+            return dirs::home_dir().map(|h| h.join(p));
+        }
+
+        tracing::warn!(
+            %candidate,
+            "{} is invalid; falling back to default",
+            TEMPO_HOME_ENV
+        );
     }
     dirs::home_dir().map(|h| h.join(DEFAULT_TEMPO_HOME))
 }
