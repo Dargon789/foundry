@@ -64,10 +64,10 @@ function resolveArgs() {
     strict: true
   })
 
-  const tool = requireValue(values.tool || process.env.TARGET_TOOL, 'tool')
-  const platform = requireValue(values.platform || process.env.PLATFORM_NAME, 'platform')
-  const arch = requireValue(values.arch || process.env.ARCH, 'arch')
-  const releaseVersion = requireValue(
+  const tool = requireSafeIdentifier(values.tool || process.env.TARGET_TOOL, 'tool')
+  const platform = requireSafeIdentifier(values.platform || process.env.PLATFORM_NAME, 'platform')
+  const arch = requireSafeIdentifier(values.arch || process.env.ARCH, 'arch')
+  const releaseVersion = requireSafeIdentifier(
     values.release || values['release-version'] || process.env.RELEASE_VERSION,
     'release version'
   )
@@ -93,6 +93,26 @@ function resolveArgs() {
 function requireValue(value, name) {
   if (typeof value === 'string' && value.trim()) return value.trim()
   throw new Error(`Missing required ${name}`)
+}
+
+/**
+ * Ensure a required value is present and consists only of safe identifier
+ * characters suitable for use in file and directory names.
+ *
+ * Allowed characters: letters, digits, dot, underscore, and hyphen.
+ *
+ * @param {string | undefined} value
+ * @param {string} name
+ * @returns {string}
+ */
+function requireSafeIdentifier(value, name) {
+  const trimmed = requireValue(value, name)
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid ${name}: "${trimmed}". Only letters, digits, ".", "_", and "-" are allowed.`
+    )
+  }
+  return trimmed
 }
 
 /**
