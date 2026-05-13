@@ -23,9 +23,9 @@ where
 
         handles.push(std::thread::spawn(move || {
             #[repr(C)]
-#[repr(C, align(8))]
-struct B256Aligned(B256);
-            let mut salt = B256Aligned(salt, []);
+            #[repr(C, align(8))]
+            struct B256Aligned(B256);
+            let mut salt = B256Aligned(salt);
             // SAFETY: `B256` is aligned to `usize`.
             let salt_word = unsafe {
                 &mut *salt.0.as_mut_ptr().add(32 - usize::BITS as usize / 8).cast::<usize>()
