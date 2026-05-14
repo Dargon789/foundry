@@ -122,32 +122,36 @@ impl ScriptTester {
         fs::create_dir_all(&to_dir)?;
         let from_dir = from_dir.canonicalize()?;
         for entry in fs::read_dir(&from_dir)? {
-            let file = entry?.path();
-            // Only operate on regular files to avoid following symlinks or directories
-            let metadata = fs::symlink_metadata(&file)?;
-            let ftype = metadata.file_type();
-            if !ftype.is_file() {
-                continue;
-            }
-            let name = match file.file_name() {
-                Some(name) => name,
-                None => continue,
-            };
+            let entry = entry?;
+            let name = entry.file_name();
+
             // Validate file name to avoid path traversal and absolute paths
             let name_str = name.to_string_lossy();
             if name_str.contains("..") || name_str.contains("/") || name_str.contains("\\") {
                 // Skip invalid (potentially dangerous) file names
                 continue;
             }
+
+            // Build the source path from trusted base dir + validated single path component
+            let file = from_dir.join(&name);
+
             // Verify canonicalized file is in from_dir to avoid symlink traversal
-            if let Ok(canonical_file) = file.canonicalize() {
-                if !canonical_file.starts_with(&from_dir) {
-                    continue;
-                }
-            } else {
+            let canonical_file = match file.canonicalize() {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if !canonical_file.starts_with(&from_dir) {
                 continue;
             }
-            fs::copy(&file, to_dir.join(name))?;
+
+            // Only operate on regular files to avoid following symlinks or directories
+            let metadata = fs::symlink_metadata(&canonical_file)?;
+            let ftype = metadata.file_type();
+            if !ftype.is_file() {
+                continue;
+            }
+
+            fs::copy(&canonical_file, to_dir.join(&name))?;
         }
         Ok(())
     }
