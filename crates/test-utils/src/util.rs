@@ -250,7 +250,7 @@ fn copy_dir_filtered_inner(
         let ty = entry.file_type()?;
         let src_path = entry.path();
         // Ensure that any path we operate on stays within the original source base directory.
-        let canonical_src_path = src_path.canonicalize()?;
+        let Ok(canonical_src_path) = src_path.canonicalize() else { continue };
         if !canonical_src_path.starts_with(base_src) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
