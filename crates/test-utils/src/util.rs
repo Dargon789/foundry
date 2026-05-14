@@ -285,7 +285,7 @@ fn copy_dir_filtered_inner(
         }
         let dst_path = base_dst.join(relative_src_path);
 
-        if ty.is_dir() {
+        if canonical_src_path.is_dir() {
             // Skip build artifact directories at the root level
             if is_root
                 && let Some(name) = entry.file_name().to_str()
