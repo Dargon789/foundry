@@ -530,7 +530,7 @@ tempo-precompiles = { git = "https://github.com/tempoxyz/tempo", rev = "6bf9903d
 ## Pinned dependencies. Enabled for the workspace in crates/test-utils.
 
 # testing
-snapbox = { version = "0.6", features = ["json", "regex", "term-svg"] }
+snapbox = { version = "1.2", features = ["json", "regex", "term-svg"] }
 
 # Use unicode-rs which has a smaller binary size than the default ICU4X as the IDNA backend, used
 # by the `url` crate.
