@@ -804,7 +804,7 @@ impl WorkerCorpus {
     ) -> Result<()> {
         // Mutate value with 15% probability for payable functions.
         if function.state_mutability == alloy_json_abi::StateMutability::Payable
-            && test_runner.rng().random_ratio(15, 100)
+            && test_runner.rng().gen_ratio(15, 100)
         {
             tx.call_details.value = Some(generate_msg_value(test_runner));
         }
