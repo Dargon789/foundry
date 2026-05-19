@@ -39,7 +39,7 @@ fn is_unused_return_call(hir: &Hir<'_>, expr: &Expr<'_>) -> bool {
     let ExprKind::Member(contract_expr, func_ident) = &callee.kind else { return false };
 
     // Arity from either positional or named args.
-    let arity = call_args.kind.len();
+    let arity = call_args.len();
 
     let Some(cid) = (match &contract_expr.kind {
         // Pre-instantiated contract variable: `oracle.f()`
