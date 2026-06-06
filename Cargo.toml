@@ -459,13 +459,13 @@ evmole = "0.8"
 eyre = "0.6"
 figment = { package = "figment2", version = "0.11" }
 futures = { version = "0.3", default-features = false }
-hyper = "1.8"
+hyper = "1.10"
 indicatif = "0.18"
 itertools = "0.14"
 jsonpath_lib = "0.3"
 k256 = "0.13"
 mesc = "0.3"
-memchr = "2.7"
+memchr = "2.8"
 num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1.9.0"
@@ -504,7 +504,7 @@ jiff = { version = "0.2", default-features = false, features = [
     "perf-inline",
 ] }
 heck = "0.5"
-uuid = "1.19.0"
+uuid = "1.23.2"
 flate2 = "1.1"
 ethereum_ssz = "0.10"
 
@@ -535,7 +535,7 @@ snapbox = { version = "0.6", features = ["json", "regex", "term-svg"] }
 # Use unicode-rs which has a smaller binary size than the default ICU4X as the IDNA backend, used
 # by the `url` crate.
 # See the `idna_adapter` README.md for more details: https://docs.rs/crate/idna_adapter/latest
-idna_adapter = "=1.1.0"
+idna_adapter = "=1.2.1"
 
 [patch.crates-io]
 ## alloy-core
