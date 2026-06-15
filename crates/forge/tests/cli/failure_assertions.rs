@@ -71,7 +71,7 @@ Suite result: FAILED. 0 passed; 7 failed; 0 skipped; [ELAPSED]
             r#"No files changed, compilation skipped
 ...
 [FAIL: Reverter != expected reverter: [..] != 0x000000000000000000000000000000000000dEaD] testShouldFailExpectPartialRevertWrongReverterTopLevelCreate() ([GAS])
-[FAIL: Reverter != expected reverter: [..] != [..]] testShouldFailExpectRevertNestedCreateInnerAddress() ([GAS])
+[FAIL: Reverter != expected reverter: [..] != [..]] testShouldFailExpectRevertNestedCreateOuterAddress() ([GAS])
 [FAIL: Reverter != expected reverter: [..] != 0x000000000000000000000000000000000000dEaD] testShouldFailExpectRevertWithBytesWrongReverterTopLevelCreate() ([GAS])
 [FAIL: Reverter != expected reverter: [..] != 0x000000000000000000000000000000000000dEaD] testShouldFailExpectRevertWrongReverterNestedCreate() ([GAS])
 [FAIL: Reverter != expected reverter: [..] != 0x000000000000000000000000000000000000dEaD] testShouldFailExpectRevertWrongReverterTopLevelCreate() ([GAS])
@@ -206,7 +206,7 @@ forgetest!(flaky_expect_emit_tests_should_fail, |prj, cmd| {
     cmd.forge_fuse().arg("build").assert_success();
     cmd.forge_fuse().args(["selectors", "cache"]).assert_success();
 
-    cmd.forge_fuse().args(["test", "--mc", "ExpectEmitFailureTest"]).assert_failure().stdout_eq(str![[r#"No files changed, compilation skipped
+    cmd.forge_fuse().args(["test", "--mc", "ExpectEmitFailureTest"]).assert_failure().stdout_eq(str![[r#"[COMPILING_FILES] with [SOLC_VERSION]
 ...
 [FAIL: E != expected A] testShouldFailCanMatchConsecutiveEvents() ([GAS])
 [FAIL: log != expected SomethingElse] testShouldFailDifferentIndexedParameters() ([GAS])

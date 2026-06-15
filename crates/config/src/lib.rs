@@ -53,7 +53,9 @@ use std::{
 mod macros;
 
 pub mod utils;
-pub use foundry_evm_hardforks::{FoundryHardfork, FromEvmVersion, evm_spec_id};
+pub use foundry_evm_hardforks::{
+    ExecutionSpec, FoundryHardfork, FromEvmVersion, evm_spec_id, evm_spec_id_from_str,
+};
 pub use utils::*;
 
 mod endpoints;
@@ -109,7 +111,16 @@ mod fuzz;
 pub use fuzz::{FuzzConfig, FuzzCorpusConfig, FuzzDictionaryConfig};
 
 mod invariant;
-pub use invariant::InvariantConfig;
+pub use invariant::{InvariantConfig, InvariantWorkers};
+
+mod symbolic;
+pub use symbolic::{SymbolicConfig, SymbolicExplorationOrder, SymbolicStorageLayout};
+
+mod coverage;
+pub use coverage::{CoverageConfig, CoverageReportKind, parse_lcov_version};
+
+pub mod mutation;
+pub use mutation::{MutationConfig, MutatorType};
 
 mod inline;
 pub use inline::{InlineConfig, InlineConfigError, NatSpec};
@@ -349,6 +360,8 @@ pub struct Config {
     pub coverage_pattern_inverse: Option<RegexWrapper>,
     /// Path where last test run failures are recorded.
     pub test_failures_file: PathBuf,
+    /// Path where mutation tests are cached, to resume running them
+    pub mutation_dir: PathBuf,
     /// Max concurrent threads to use.
     pub threads: Option<usize>,
     /// Whether to show test execution progress.
@@ -357,6 +370,12 @@ pub struct Config {
     pub fuzz: FuzzConfig,
     /// Configuration for invariant testing
     pub invariant: InvariantConfig,
+    /// Configuration for symbolic testing
+    pub symbolic: SymbolicConfig,
+    /// Configuration for `forge coverage`
+    pub coverage: CoverageConfig,
+    /// Configuration for mutation testing
+    pub mutation: MutationConfig,
     /// Whether to allow ffi cheatcodes in test
     pub ffi: bool,
     /// Whether to show `console.log` outputs in realtime during script/test execution
@@ -708,6 +727,8 @@ impl Config {
         "doc",
         "fuzz",
         "invariant",
+        "coverage",
+        "mutation",
         "labels",
         "dependencies",
         "soldeer",
@@ -1345,6 +1366,9 @@ impl Config {
                 ));
             }
         }
+
+        // Remove mutation test cache directory
+        let _ = fs::remove_dir_all(project.root().join(&self.mutation_dir));
 
         // Remove fuzz and invariant cache directories.
         let mut remove_test_dir = |test_dir: &Option<PathBuf>| {
@@ -2667,7 +2691,7 @@ impl Default for Config {
             out: "out".into(),
             libs: vec!["lib".into()],
             cache: true,
-            dynamic_test_linking: false,
+            dynamic_test_linking: true,
             cache_path: "cache".into(),
             broadcast: "broadcast".into(),
             snapshots: "snapshots".into(),
@@ -2701,10 +2725,14 @@ impl Default for Config {
             path_pattern_inverse: None,
             coverage_pattern_inverse: None,
             test_failures_file: "cache/test-failures".into(),
+            mutation_dir: "cache/mutation".into(),
             threads: None,
             show_progress: false,
             fuzz: FuzzConfig::new("cache/fuzz".into()),
             invariant: InvariantConfig::new("cache/invariant".into()),
+            symbolic: SymbolicConfig::default(),
+            coverage: CoverageConfig::default(),
+            mutation: MutationConfig::default(),
             always_use_create_2_factory: false,
             ffi: false,
             live_logs: false,
@@ -2972,10 +3000,10 @@ mod tests {
         ModelCheckerEngine, YulDetails,
         vyper::{VyperOptimizationLevel, VyperOptimizationMode, VyperVenomSettings},
     };
-    use foundry_evm_hardforks::TempoHardfork;
+    use foundry_evm_hardforks::{TempoHardfork, latest_active_tempo_hardfork};
     use similar_asserts::assert_eq;
     use soldeer_core::remappings::RemappingsLocation;
-    use std::{fs::File, io::Write};
+    use std::{fs::File, io::Write, num::NonZeroUsize};
     use tempfile::tempdir;
 
     // Helper function to clear `__warnings` in config, since it will be populated during loading
@@ -4190,6 +4218,7 @@ mod tests {
                 [invariant]
                 runs = 256
                 depth = 500
+                workers = 1
                 fail_on_revert = false
                 call_override = false
                 shrink_run_limit = 5000
@@ -5002,6 +5031,7 @@ mod tests {
                 [invariant]
                 runs = 512
                 depth = 10
+                workers = 4
             ",
             )?;
 
@@ -5011,6 +5041,7 @@ mod tests {
                 InvariantConfig {
                     runs: 512,
                     depth: 10,
+                    workers: InvariantWorkers::Fixed(NonZeroUsize::new(4).unwrap()),
                     failure_persist_dir: Some(PathBuf::from("cache/invariant")),
                     ..Default::default()
                 }
@@ -5037,11 +5068,36 @@ mod tests {
             jail.set_env("FOUNDRY_FMT_LINE_LENGTH", "95");
             jail.set_env("FOUNDRY_FUZZ_DICTIONARY_WEIGHT", "99");
             jail.set_env("FOUNDRY_INVARIANT_DEPTH", "5");
+            jail.set_env("FOUNDRY_INVARIANT_WORKERS", "3");
 
             let config = Config::load().unwrap();
             assert_eq!(config.fmt.line_length, 95);
             assert_eq!(config.fuzz.dictionary.dictionary_weight, 99);
             assert_eq!(config.invariant.depth, 5);
+            assert_eq!(
+                config.invariant.workers,
+                InvariantWorkers::Fixed(NonZeroUsize::new(3).unwrap())
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_invariant_workers_env_accepts_auto() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r"
+                [invariant]
+                workers = 3
+            ",
+            )?;
+
+            jail.set_env("FOUNDRY_INVARIANT_WORKERS", "auto");
+
+            let config = Config::load().unwrap();
+            assert_eq!(config.invariant.workers, InvariantWorkers::Auto);
 
             Ok(())
         });
@@ -5107,6 +5163,25 @@ mod tests {
         };
 
         assert_eq!(config.evm_spec_id::<TempoHardfork>(), TempoHardfork::T3);
+    }
+
+    #[test]
+    fn tempo_network_defaults_to_latest_tempo_hardfork() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                network = "tempo"
+            "#,
+            )?;
+
+            let config = Config::load().unwrap();
+            assert!(config.networks.is_tempo());
+            assert_eq!(config.evm_spec_id::<TempoHardfork>(), latest_active_tempo_hardfork());
+
+            Ok(())
+        });
     }
 
     #[test]
@@ -6946,6 +7021,9 @@ mod tests {
                 runs = 256
                 unknown_invariant_key = "should_warn"
 
+                [mutation]
+                unknown_mutation_key = "should_warn"
+
                 [vyper]
                 unknown_vyper_key = "should_warn"
 
@@ -6973,6 +7051,9 @@ mod tests {
                 [profile.default.invariant]
                 runs = 512
                 unknown_nested_invariant_key = "should_warn"
+
+                [profile.default.mutation]
+                unknown_nested_mutation_key = "should_warn"
 
                 [profile.default.vyper]
                 unknown_nested_vyper_key = "should_warn"
@@ -7012,6 +7093,7 @@ mod tests {
                 ("unknown_doc_key", "doc"),
                 ("unknown_fuzz_key", "fuzz"),
                 ("unknown_invariant_key", "invariant"),
+                ("unknown_mutation_key", "mutation"),
                 ("unknown_vyper_key", "vyper"),
                 ("unknown_bind_json_key", "bind_json"),
             ];
@@ -7037,6 +7119,7 @@ mod tests {
                 ("unknown_nested_doc_key", "doc"),
                 ("unknown_nested_fuzz_key", "fuzz"),
                 ("unknown_nested_invariant_key", "invariant"),
+                ("unknown_nested_mutation_key", "mutation"),
                 ("unknown_nested_vyper_key", "vyper"),
                 ("unknown_nested_bind_json_key", "bind_json"),
             ];
@@ -7085,11 +7168,11 @@ mod tests {
                 })
                 .collect();
 
-            // 1 profile key + 7 standalone + 7 nested + 2 array = 17 total
+            // 1 profile key + 8 standalone + 8 nested + 2 array = 19 total
             assert_eq!(
                 unknown_key_warnings.len(),
-                17,
-                "Expected 17 unknown key warnings (1 profile + 7 standalone + 7 nested + 2 array), got {}: {:?}",
+                19,
+                "Expected 19 unknown key warnings (1 profile + 8 standalone + 8 nested + 2 array), got {}: {:?}",
                 unknown_key_warnings.len(),
                 unknown_key_warnings
             );
@@ -7564,6 +7647,98 @@ mod tests {
             assert_eq!(config.invariant.runs, 375);
             assert_eq!(config.invariant.depth, 500);
 
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn coverage_section_in_profile() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default.coverage]
+                report = ["summary", "lcov"]
+                lcov_version = "2.2.0"
+                ir_minimum = true
+                report_file = "out/lcov.info"
+                include_libs = true
+                exclude_tests = true
+                skip_files = ["test/**", "src/mocks/**"]
+                "#,
+            )?;
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(
+                config.coverage.report,
+                vec![CoverageReportKind::Summary, CoverageReportKind::Lcov]
+            );
+            assert_eq!(config.coverage.lcov_version, semver::Version::new(2, 2, 0));
+            assert!(config.coverage.ir_minimum);
+            assert_eq!(
+                config.coverage.report_file.as_deref(),
+                Some(std::path::Path::new("out/lcov.info"))
+            );
+            assert!(config.coverage.include_libs);
+            assert!(config.coverage.exclude_tests);
+            assert_eq!(
+                config.coverage.skip_files,
+                vec!["test/**".to_string(), "src/mocks/**".to_string()]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn coverage_standalone_section_falls_back_to_default_profile() {
+        figment::Jail::expect_with(|jail| {
+            // Standalone `[coverage]` should populate the active profile,
+            // matching how `[fuzz]` / `[invariant]` work.
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [coverage]
+                skip_files = ["script/**"]
+                exclude_tests = true
+                "#,
+            )?;
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.coverage.skip_files, vec!["script/**".to_string()]);
+            assert!(config.coverage.exclude_tests);
+            // Untouched fields keep their defaults.
+            assert_eq!(config.coverage.report, vec![CoverageReportKind::Summary]);
+            assert_eq!(config.coverage.lcov_version, semver::Version::new(1, 0, 0));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn coverage_per_profile_overrides_default() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default.coverage]
+                skip_files = ["script/**"]
+
+                [profile.ci.coverage]
+                skip_files = ["test/**", "lib/**"]
+                exclude_tests = true
+                "#,
+            )?;
+
+            // Default profile sees the default-profile coverage block.
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.coverage.skip_files, vec!["script/**".to_string()]);
+            assert!(!config.coverage.exclude_tests);
+
+            // CI profile sees its own override.
+            jail.set_env("FOUNDRY_PROFILE", "ci");
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(
+                config.coverage.skip_files,
+                vec!["test/**".to_string(), "lib/**".to_string()]
+            );
+            assert!(config.coverage.exclude_tests);
             Ok(())
         });
     }

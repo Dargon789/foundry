@@ -3,24 +3,47 @@
 pub mod auth;
 
 use crate::FoundryTransactionBuilder;
+use alloy_chains::Chain;
 use alloy_network::Network;
-use alloy_primitives::{Address, B256, Signature};
+use alloy_primitives::{Address, B256, Signature, address};
 use alloy_signer::Signer;
 use eyre::{Context, Result};
 use foundry_wallets::{RawWalletOpts, WalletOpts, WalletSigner};
 use std::sync::Arc;
+use tempo_alloy::contracts::precompiles::DEFAULT_FEE_TOKEN;
+pub use tempo_alloy::contracts::precompiles::PATH_USD_ADDRESS;
 
 mod keystore;
+mod registry;
+mod session;
+mod session_policy;
+#[cfg(test)]
+mod test_utils;
+mod tip20;
 
 pub(crate) use auth::is_known_tempo_endpoint;
 pub use auth::{AccessKeyOutcome, EnsureAccessKeyConfig, ensure_access_key};
 pub use keystore::*;
+pub use session::*;
+pub use session_policy::{
+    GeneratedSessionKey, PreparedSessionAuthorization, SessionAuthorizationRequest,
+    SessionSpendLimit,
+};
+pub use tip20::{
+    TIP20_ALLOWED_LOGO_URI_SCHEMES, TIP20_MAX_LOGO_URI_BYTES, Tip20LogoUriValidationError,
+    validate_tip20_logo_uri,
+};
 
 #[cfg(test)]
-pub(crate) use keystore::test_env_mutex;
+pub(crate) use test_utils::{test_env_mutex, with_tempo_home};
 
 #[cfg(test)]
 mod tests;
+
+/// Placeholder rendered by `Debug` impls in place of secret key material.
+fn redacted_debug(value: &str) -> &'static str {
+    if value.trim().is_empty() { "<empty>" } else { "<redacted>" }
+}
 
 /// Conservative gas buffer for browser wallet transactions on Tempo chains.
 ///
@@ -32,6 +55,59 @@ mod tests;
 ///
 /// See <https://github.com/tempoxyz/tempo/blob/6ebf1a8/crates/revm/src/handler.rs#L108-L124>
 pub const TEMPO_BROWSER_GAS_BUFFER: u64 = 7_000;
+
+/// Reserved Tempo TIP20 fee-token addresses created during Foundry genesis.
+///
+/// Unlike [`PATH_USD_ADDRESS`], these tokens are not defined by the canonical
+/// `tempo-contracts` crate; they only exist in Foundry's local genesis setup, so
+/// they are defined here as the single source of truth and re-exported elsewhere.
+pub const ALPHA_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000001");
+pub const BETA_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000002");
+pub const THETA_USD_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000003");
+
+/// Resolves an explicit Tempo fee token or the canonical default for a known Tempo network.
+pub fn resolve_fee_token(
+    chain: Option<Chain>,
+    explicit_fee_token: Option<Address>,
+) -> Option<Address> {
+    explicit_fee_token.or_else(|| chain.is_some_and(Chain::is_tempo).then_some(DEFAULT_FEE_TOKEN))
+}
+
+/// Returns the known symbol for a Tempo fee token without making an RPC call.
+pub const fn known_fee_token_symbol(fee_token: Address) -> Option<&'static str> {
+    match fee_token {
+        PATH_USD_ADDRESS => Some("PathUSD"),
+        ALPHA_USD_ADDRESS => Some("AlphaUSD"),
+        BETA_USD_ADDRESS => Some("BetaUSD"),
+        THETA_USD_ADDRESS => Some("ThetaUSD"),
+        _ => None,
+    }
+}
+
+/// Formats a Tempo fee-token selection for command output.
+pub fn format_fee_token_selection(fee_token: Address) -> String {
+    match known_fee_token_symbol(fee_token) {
+        Some(symbol) => format!("Paying gas in {symbol} ({fee_token})"),
+        None => format!("Paying gas in {fee_token}"),
+    }
+}
+
+/// Prints the selected Tempo fee token when one is set.
+pub fn print_fee_token_selection(fee_token: Option<Address>) -> Result<()> {
+    if let Some(fee_token) = fee_token {
+        sh_status!("{}", format_fee_token_selection(fee_token))?;
+    }
+    Ok(())
+}
+
+/// Prints the fee token selected for display, resolving the chain default without mutating a
+/// transaction request.
+pub fn print_resolved_fee_token_selection(
+    chain: Option<Chain>,
+    fee_token: Option<Address>,
+) -> Result<()> {
+    print_fee_token_selection(resolve_fee_token(chain, fee_token))
+}
 
 /// Gas sponsor configuration for Tempo fee-payer signatures.
 #[derive(Clone, Debug)]
