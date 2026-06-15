@@ -7,7 +7,7 @@ use crate::{
     tempo,
     tx::{CastTxSender, SendTxOpts, TxParams},
 };
-use alloy_network::{Network, TransactionBuilder};
+use alloy_network::Network;
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use alloy_signer::Signer;
@@ -21,6 +21,7 @@ use foundry_common::{
     fmt::{UIfmt, UIfmtReceiptExt},
     provider::ProviderBuilder,
     shell,
+    tempo::print_resolved_fee_token_selection,
 };
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use serde_json::json;
@@ -154,7 +155,14 @@ async fn register(
     send_tx: SendTxOpts,
     mut tx_opts: TxParams,
 ) -> Result<B256> {
-    let (signer, tempo_access_key) = send_tx.eth.wallet.maybe_signer().await?;
+    let config = send_tx.eth.load_config()?;
+    let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
+    let provider = ProviderBuilder::<TempoNetwork>::from_config(&config)?.build()?;
+    let chain = get_chain(config.chain, &provider).await?;
+    tempo::ensure_session_not_browser(&tx_opts.tempo, send_tx.browser.browser)?;
+    let (signer, tempo_access_key) =
+        tempo::resolve_session_or_wallet_signer(&tx_opts.tempo, &send_tx.eth.wallet, chain.id())
+            .await?;
     let signer = signer.ok_or_else(|| {
         eyre::eyre!("cast vaddr create requires a signer (for example --private-key or --from)")
     })?;
@@ -168,23 +176,20 @@ async fn register(
         );
     }
 
-    let config = send_tx.eth.load_config()?;
-    let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
-    let provider = ProviderBuilder::<TempoNetwork>::from_config(&config)?.build()?;
-
     let mut tx = IAddressRegistry::new(ADDRESS_REGISTRY_ADDRESS, &provider)
         .registerVirtualMaster(salt)
         .into_transaction_request();
     let expires_at = tx_opts.tempo.resolve_expires();
     tempo::print_expires(expires_at)?;
-    tx_opts.apply::<TempoNetwork>(&mut tx, get_chain(config.chain, &provider).await?.is_legacy());
+    tx_opts.apply::<TempoNetwork>(&mut tx, chain.is_legacy());
 
     sh_status!("Submitting registerVirtualMaster({salt})...")?;
 
     if let Some(ref access_key) = tempo_access_key {
+        tempo::fill_access_key_transaction(&provider, &mut tx, access_key, chain).await?;
         if shell::is_json() {
-            tx.set_from(access_key.wallet_address);
-            tx.set_key_id(access_key.key_address);
+            // JSON mode bypasses `cast_send_with_access_key`, so report the selection here.
+            print_resolved_fee_token_selection(Some(chain), tx.fee_token())?;
             let raw_tx = tx
                 .sign_with_access_key(
                     &provider,
@@ -210,6 +215,7 @@ async fn register(
                 tx,
                 &signer,
                 access_key,
+                Some(chain),
                 send_tx.cast_async,
                 send_tx.confirmations,
                 timeout,
@@ -219,6 +225,8 @@ async fn register(
     } else {
         let provider = build_provider_with_signer::<TempoNetwork>(&send_tx, signer)?;
         if shell::is_json() {
+            // JSON mode bypasses `cast_send`, so report the selection here.
+            print_resolved_fee_token_selection(Some(chain), tx.fee_token())?;
             let cast = CastTxSender::new(&provider);
             if send_tx.sync {
                 cast.send_sync(tx).await.map(|(tx_hash, _)| tx_hash)
@@ -239,6 +247,7 @@ async fn register(
             cast_send(
                 provider,
                 tx,
+                Some(chain),
                 send_tx.cast_async,
                 send_tx.sync,
                 send_tx.confirmations,
