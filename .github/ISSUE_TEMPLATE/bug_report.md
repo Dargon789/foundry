@@ -25,6 +25,7 @@ If applicable, add screenshots to help explain your problem.
 
 **Desktop (please complete the following information):**
  - OS: [e.g. iOS]
+ - Browser [e.g. Chrome, Safari]
  - Browser [e.g. Chrome, safari]
  - Version [e.g. 22]
 
