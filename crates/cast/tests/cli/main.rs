@@ -1946,15 +1946,14 @@ Transaction successfully executed.
 
 // tests that `cast --to-base` commands are working correctly.
 casttest!(to_base, |_prj, cmd| {
+    // One value per distinct code path (small positive, u256 max in decimal and
+    // hex form, small negative, i256 min) to keep the number of spawned `cast`
+    // processes low and avoid timing out on slow Windows/macOS/ARM CI runners.
     let values = [
         "1",
-        "100",
-        "100000",
         "115792089237316195423570985008687907853269984665640564039457584007913129639935",
         "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "-1",
-        "-100",
-        "-100000",
         "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
     ];
     for value in values {
@@ -2387,6 +2386,41 @@ casttest!(mktx_raw_unsigned, |_prj, cmd| {
 
 "#
     ]]);
+});
+
+casttest!(mktx_raw_unsigned_curl_skips_unknown_fee_token_symbol_lookup, |_prj, cmd| {
+    let output = cmd
+        .args([
+            "mktx",
+            "0x0000000000000000000000000000000000001234",
+            "--chain",
+            "tempo",
+            "--rpc-url",
+            "https://example.invalid",
+            "--curl",
+            "--tempo.fee-token",
+            "0x20C00000000000000000000014f22CA97301EB73",
+            "--from",
+            "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+            "--nonce",
+            "0",
+            "--gas-limit",
+            "100000",
+            "--gas-price",
+            "1000000000",
+            "--priority-gas-price",
+            "1000000000",
+            "--value",
+            "0",
+            "--raw-unsigned",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    assert!(output.starts_with("0x"), "expected raw transaction hex, got:\n{output}");
+    assert!(!output.contains("eth_call"), "unexpected fee-token symbol lookup curl:\n{output}");
+    assert!(!output.contains("0x95d89b41"), "unexpected symbol() calldata:\n{output}");
 });
 
 casttest!(mktx_raw_unsigned_no_from_missing_chain, async |_prj, cmd| {

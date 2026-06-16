@@ -18,8 +18,9 @@ use foundry_common::{
     FoundryTransactionBuilder,
     fmt::{UIfmt, UIfmtReceiptExt},
     provider::ProviderBuilder,
-    tempo::TEMPO_BROWSER_GAS_BUFFER,
+    tempo::{TEMPO_BROWSER_GAS_BUFFER, maybe_print_resolved_fee_token},
 };
+use foundry_config::Chain;
 use foundry_wallets::{TempoAccessKeyConfig, WalletSigner};
 use tempo_alloy::{
     TempoNetwork,
@@ -309,6 +310,7 @@ impl SendTxArgs {
                 }
             }
 
+            let chain = builder.chain();
             let (mut tx_request, _) = builder.build(config.sender).await?;
             maybe_print_resolved_lane(
                 resolved_lane.as_ref(),
@@ -321,10 +323,12 @@ impl SendTxArgs {
             cast_send(
                 provider,
                 tx_request,
+                Some(chain),
                 send_tx.cast_async,
                 send_tx.sync,
                 send_tx.confirmations,
                 timeout,
+                !config.eth_rpc_curl,
             )
             .await?;
         // Case 2:
@@ -349,6 +353,12 @@ impl SendTxArgs {
             if let Some(sponsor) = &tempo_sponsor {
                 sponsor.attach_and_print::<N>(&mut tx_request, browser.address()).await?;
             }
+            maybe_print_resolved_fee_token(
+                (!config.eth_rpc_curl).then_some(&provider),
+                Some(chain),
+                tx_request.fee_token(),
+            )
+            .await?;
 
             let tx_hash = browser.send_transaction_via_browser(tx_request).await?;
 
@@ -363,6 +373,7 @@ impl SendTxArgs {
                 Some(s) => s,
                 None => send_tx.eth.wallet.signer().await?,
             };
+            let chain = builder.chain();
             let (mut tx_request, _) = builder.build_with_access_key(ak.wallet_address, &ak).await?;
             maybe_print_resolved_lane(
                 resolved_lane.as_ref(),
@@ -376,9 +387,11 @@ impl SendTxArgs {
                 tx_request,
                 &signer,
                 &ak,
+                Some(chain),
                 send_tx.cast_async,
                 send_tx.confirmations,
                 timeout,
+                !config.eth_rpc_curl,
             )
             .await?;
         // Case 4:
@@ -393,6 +406,7 @@ impl SendTxArgs {
 
             tx::validate_from_address(send_tx.eth.wallet.from, from)?;
 
+            let chain = builder.chain();
             let (mut tx_request, _) = builder.build(&signer).await?;
             maybe_print_resolved_lane(
                 resolved_lane.as_ref(),
@@ -415,10 +429,12 @@ impl SendTxArgs {
             cast_send(
                 provider,
                 tx_request,
+                Some(chain),
                 send_tx.cast_async,
                 send_tx.sync,
                 send_tx.confirmations,
                 timeout,
+                !config.eth_rpc_curl,
             )
             .await?;
         // Case 5:
@@ -434,6 +450,7 @@ impl SendTxArgs {
 
             tx::validate_from_address(send_tx.eth.wallet.from, from)?;
 
+            let chain = builder.chain();
             let (mut tx_request, _) = builder.build(&signer).await?;
             maybe_print_resolved_lane(
                 resolved_lane.as_ref(),
@@ -452,10 +469,12 @@ impl SendTxArgs {
             cast_send(
                 provider,
                 tx_request,
+                Some(chain),
                 send_tx.cast_async,
                 send_tx.sync,
                 send_tx.confirmations,
                 timeout,
+                !config.eth_rpc_curl,
             )
             .await?;
         }
@@ -464,18 +483,27 @@ impl SendTxArgs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cast_send<N: Network, P: Provider<N>>(
     provider: P,
     tx: N::TransactionRequest,
+    chain: Option<Chain>,
     cast_async: bool,
     sync: bool,
     confs: u64,
     timeout: u64,
+    resolve_unknown_fee_token_symbol: bool,
 ) -> Result<B256>
 where
-    N::TransactionRequest: FoundryTransactionBuilder<N>,
+    N::TransactionRequest: Default + FoundryTransactionBuilder<N>,
     N::ReceiptResponse: UIfmt + UIfmtReceiptExt,
 {
+    maybe_print_resolved_fee_token(
+        resolve_unknown_fee_token_symbol.then_some(&provider),
+        chain,
+        tx.fee_token(),
+    )
+    .await?;
     let cast = CastTxSender::new(provider);
 
     if sync {
@@ -498,21 +526,30 @@ where
 /// with [`CastTxBuilder`] (fields already set) and also with sol!-bindings (fields not yet set).
 ///
 /// NOTE: The default implementation returns an error. Only `TempoNetwork` supports this.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cast_send_with_access_key<N: Network, P: Provider<N>>(
     provider: &P,
     mut tx: N::TransactionRequest,
     signer: &WalletSigner,
     access_key: &TempoAccessKeyConfig,
+    chain: Option<Chain>,
     cast_async: bool,
     confirmations: u64,
     timeout: u64,
+    resolve_unknown_fee_token_symbol: bool,
 ) -> Result<B256>
 where
-    N::TransactionRequest: FoundryTransactionBuilder<N>,
+    N::TransactionRequest: Default + FoundryTransactionBuilder<N>,
     N::ReceiptResponse: UIfmt + UIfmtReceiptExt,
 {
     tx.set_from(access_key.wallet_address);
     tx.set_key_id(access_key.key_address);
+    maybe_print_resolved_fee_token(
+        resolve_unknown_fee_token_symbol.then_some(provider),
+        chain,
+        tx.fee_token(),
+    )
+    .await?;
     let raw_tx = tx
         .sign_with_access_key(
             provider,

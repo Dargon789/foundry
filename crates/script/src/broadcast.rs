@@ -35,7 +35,8 @@ use foundry_common::{
     provider::{ProviderBuilder, try_get_http_provider},
     shell,
     tempo::{
-        KeyEntry, KeysFile, TempoSponsor, WALLET_KEYS_PATH, decode_key_authorization, tempo_home,
+        KeyEntry, KeysFile, TempoSponsor, WALLET_KEYS_PATH, decode_key_authorization,
+        maybe_print_fee_token, tempo_home,
     },
 };
 use foundry_config::Config;
@@ -182,6 +183,7 @@ where
             let from = tx.from().expect("no sender");
             sponsor.attach_and_print::<N>(tx, from).await?;
         }
+        maybe_print_fee_token(Some(provider), tx.fee_token()).await?;
 
         Ok(())
     }
@@ -1257,6 +1259,7 @@ impl BundledState<TempoEvmNetwork> {
         if let Some(sponsor) = &tempo_sponsor {
             sponsor.attach_and_print::<TempoNetwork>(&mut batch_tx, sender).await?;
         }
+        maybe_print_fee_token(Some(provider.as_ref()), batch_tx.fee_token()).await?;
 
         // Sign and send.
         let tx_hash = match batch_signer {

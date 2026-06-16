@@ -183,7 +183,7 @@ use storage::{Blockchain, DEFAULT_HISTORY_LIMIT, MinedTransaction};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::evm::TempoEvmFactory;
 use tempo_precompiles::{
-    extend_tempo_precompiles,
+    TIP_FEE_MANAGER_ADDRESS, extend_tempo_precompiles,
     storage::StorageCtx,
     tip_fee_manager::{IFeeManager, TipFeeManager},
     tip20::{ISSUER_ROLE, ITIP20, TIP20Token},
@@ -2157,6 +2157,7 @@ impl<N: Network> Backend<N> {
                     // `setup_fork_db_config`
                     node_config.base_fee.take();
                     node_config.fork_urls = vec![eth_rpc_url.clone()];
+                    node_config.apply_tempo_fork_beneficiary_default(&mut evm_env);
 
                     node_config.setup_fork_db_config(eth_rpc_url, &mut evm_env, &self.fees).await?
                 };
@@ -3897,7 +3898,13 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
         }
         // reset the block env
         if let Some(block) = state.block.clone() {
-            self.evm_env.write().block_env = block.clone();
+            {
+                let mut env = self.evm_env.write();
+                env.block_env = block.clone();
+                if self.is_tempo() && self.is_fork() && env.block_env.beneficiary.is_zero() {
+                    env.block_env.beneficiary = TIP_FEE_MANAGER_ADDRESS;
+                }
+            }
 
             // Set the current best block number.
             // Defaults to block number for compatibility with existing state files.
@@ -3976,6 +3983,27 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
                 "Loading state not supported with the current configuration",
             )
             .into());
+        }
+
+        // Backfill the EVM-level block hash cache from the freshly loaded blocks so that the
+        // BLOCKHASH opcode stays consistent after loading state. Reuses the hashes already
+        // computed by `load_blocks` above. Only collect the last 256 blocks since that's all
+        // BLOCKHASH can access.
+        let block_hashes: Vec<_> = {
+            let storage = self.blockchain.storage.read();
+            let min_block = storage.best_number.saturating_sub(256);
+            storage
+                .hashes
+                .iter()
+                .filter(|(num, _)| **num >= min_block)
+                .map(|(&num, &hash)| (num, hash))
+                .collect()
+        };
+        {
+            let mut db = self.db.write().await;
+            for (block_num, hash) in block_hashes {
+                db.insert_block_hash(U256::from(block_num), hash);
+            }
         }
 
         if let Some(historical_states) = state.historical_states {
