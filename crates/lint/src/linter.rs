@@ -45,7 +45,7 @@ impl<'s> LintContext<'s> {
     }
 
     // Helper method to emit diagnostics easily from passes
-    pub fn emit<L: Lint>(&self, lint: &'static L, span: Span) {
+    pub fn emit<L: Lint>(&self, lint: &L, span: Span) {
         let desc = if self.desc { lint.description() } else { "" };
         let diag: DiagBuilder<'_, ()> = self
             .sess
