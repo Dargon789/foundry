@@ -60,7 +60,7 @@ impl<'s> LintContext<'s> {
 }
 
 /// Trait for lints that operate directly on the AST.
-/// Its methods mirror `solar_ast::visit::Visit`, with the addition of `LintCotext`.
+/// Its methods mirror `solar_ast::visit::Visit`, with the addition of `LintContext`.
 pub trait EarlyLintPass<'ast>: Send + Sync {
     fn check_expr(&mut self, _ctx: &LintContext<'_>, _expr: &'ast Expr<'ast>) {}
     fn check_item_struct(&mut self, _ctx: &LintContext<'_>, _struct: &'ast ItemStruct<'ast>) {}
