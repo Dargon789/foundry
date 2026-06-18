@@ -49,7 +49,9 @@ pub async fn handle_request<Handler: RpcHandler>(
         Request::Single(call) => handle_call(call, handler).await.map(Response::Single),
         Request::Batch(calls) => {
             if calls.is_empty() {
-                return Some(Response::error(RpcError::invalid_request()));
+                return Some(Response::Batch(vec![anvil_rpc::response::RpcResponse::from(
+                    RpcError::invalid_request(),
+                )]));
             }
             future::join_all(calls.into_iter().map(move |call| handle_call(call, handler.clone())))
                 .map(responses_as_batch)

@@ -138,6 +138,7 @@ impl BenchmarkProject {
         let root = root_path.to_str().unwrap();
 
         // Remove all files in the directory
+        let root_path = root_path.canonicalize()?;
         for entry in std::fs::read_dir(&root_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -146,12 +147,8 @@ impl BenchmarkProject {
                 Ok(p) => p,
                 Err(_) => continue, // Skip if unable to canonicalize
             };
-            let canon_root = match root_path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => root_path.clone(),
-            };
             // Ensure canonicalized path stays strictly within root_path (TempProject root)
-            if !canon.starts_with(&canon_root) {
+            if !canon.starts_with(root_path.canonicalize().unwrap_or_else(|_| root_path.clone())) {
                 sh_eprintln!("⚠️  Skipping suspicious path during cleanup: {:?}", canon);
                 continue;
             }

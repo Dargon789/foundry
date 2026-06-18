@@ -19,7 +19,7 @@ use std::{ops::ControlFlow, path::PathBuf};
 ///
 /// # Required Methods
 ///
-/// - `lint`: Scans the provided source files emitting a daignostic for lints found.
+/// - `lint`: Scans the provided source files emitting a diagnostic for lints found.
 pub trait Linter: Send + Sync + Clone {
     type Language: Language;
     type Lint: Lint;

@@ -53,8 +53,8 @@ impl ConfigArgs {
         } else {
             config.to_string_pretty()?
         };
-
         sh_println!("{s}")?;
+
         Ok(())
     }
 }
