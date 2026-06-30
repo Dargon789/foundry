@@ -39,7 +39,7 @@ use foundry_common::{
 };
 use foundry_compilers::ArtifactId;
 use foundry_config::{
-    Config, figment,
+    Config, Eip1559FeeEstimatePreset, figment,
     figment::{
         Metadata, Profile, Provider,
         value::{Dict, Map},
@@ -61,7 +61,7 @@ use foundry_evm::{
     },
     opts::EvmOpts,
     revm::interpreter::InstructionResult,
-    traces::{TraceMode, Traces},
+    traces::{TraceRequirements, Traces},
 };
 use foundry_evm_networks::NetworkConfigs;
 use foundry_wallets::MultiWalletOpts;
@@ -127,6 +127,16 @@ pub struct ScriptArgs {
     /// This is auto-enabled for common networks without EIP1559.
     #[arg(long)]
     pub legacy: bool,
+
+    /// How to estimate EIP-1559 fees: `low`, `market` (default), or `aggressive`.
+    ///
+    /// The preset sets the priority-fee percentile and the `maxFeePerGas` buffer
+    /// (`low`: `base_fee * 1.5`, others: `* 2`); `low`'s tighter buffer is more
+    /// likely to stall if the base fee rises. `--with-gas-price` and
+    /// `--priority-gas-price` override only `maxFeePerGas` and
+    /// `maxPriorityFeePerGas` respectively. Ignored for `--legacy`.
+    #[arg(long = "estimate", value_name = "PRESET")]
+    pub eip1559_fee_estimate: Option<Eip1559FeeEstimatePreset>,
 
     /// Broadcasts the transactions.
     #[arg(long)]
@@ -301,10 +311,9 @@ impl ScriptArgs {
             // If no sender was explicitly set via --sender, auto-detect it from available signers:
             // use the sole signer's address if there's exactly one, or fall back to the browser
             // wallet address if present.
-            if let Ok(signers) = script_wallets.signers()
-                && signers.len() == 1
-            {
-                evm_opts.sender = signers[0];
+            let addresses = script_wallets.addresses();
+            if addresses.len() == 1 {
+                evm_opts.sender = addresses[0];
             } else if let Some(signer) = browser_wallet.as_ref().map(|b| b.address()) {
                 evm_opts.sender = signer
             }
@@ -337,30 +346,39 @@ impl ScriptArgs {
             eyre::bail!("--tempo.session/TEMPO_SESSION_ID cannot be combined with --unlocked");
         }
 
+        // Box each branch's future to keep its large async state off `run_script`'s future;
+        // otherwise `run_command` trips `clippy::large_stack_frames` by a small margin.
         if is_tempo {
             let batch = self.batch;
-            let bundled = match self.prepare_bundled::<TempoEvmNetwork>(config, evm_opts).await? {
-                Some(bundled) => bundled,
-                None => return Ok(()),
-            };
-            // batch mode owns its own pending recovery inside broadcast_batch(); running the
-            // generic wait_for_pending() first would race with that and could double-process
-            // an already-confirmed batch hash.
-            let bundled = if batch { bundled } else { bundled.wait_for_pending().await? };
-            let broadcasted =
-                if batch { bundled.broadcast_batch().await? } else { bundled.broadcast().await? };
-            if broadcasted.args.verify {
-                broadcasted.verify().await?;
-            }
-            return Ok(());
+            return Box::pin(async move {
+                let bundled =
+                    match self.prepare_bundled::<TempoEvmNetwork>(config, evm_opts).await? {
+                        Some(bundled) => bundled,
+                        None => return Ok(()),
+                    };
+                // batch mode owns its own pending recovery inside broadcast_batch(); running the
+                // generic wait_for_pending() first would race with that and could double-process
+                // an already-confirmed batch hash.
+                let bundled = if batch { bundled } else { bundled.wait_for_pending().await? };
+                let broadcasted = if batch {
+                    bundled.broadcast_batch().await?
+                } else {
+                    bundled.broadcast().await?
+                };
+                if broadcasted.args.verify {
+                    broadcasted.verify().await?;
+                }
+                Ok(())
+            })
+            .await;
         }
 
         #[cfg(feature = "optimism")]
         if evm_opts.networks.is_optimism() {
-            return self.run_generic_script::<OpEvmNetwork>(config, evm_opts).await;
+            return Box::pin(self.run_generic_script::<OpEvmNetwork>(config, evm_opts)).await;
         }
 
-        self.run_generic_script::<EthEvmNetwork>(config, evm_opts).await
+        Box::pin(self.run_generic_script::<EthEvmNetwork>(config, evm_opts)).await
     }
 
     /// Prepares the bundled state (compile, simulate, bundle) and returns it
@@ -664,6 +682,13 @@ impl Provider for ScriptArgs {
             dict.insert("transaction_timeout".to_string(), timeout.into());
         }
 
+        if let Some(preset) = self.eip1559_fee_estimate {
+            dict.insert(
+                "eip1559_fee_estimate".to_string(),
+                figment::value::Value::from(preset.to_string()),
+            );
+        }
+
         Ok(Map::from([(Config::selected_profile(), dict)]))
     }
 }
@@ -843,7 +868,9 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
             .inspectors(|stack| {
                 stack
                     .logs(self.config.live_logs)
-                    .trace_mode(if debug { TraceMode::Debug } else { TraceMode::Call })
+                    .trace_requirements(
+                        TraceRequirements::none().with_calls(true).with_debug(debug),
+                    )
                     .networks(self.evm_opts.networks)
                     .create2_deployer(self.evm_opts.create2_deployer)
             })
@@ -1451,6 +1478,16 @@ mod tests {
         let args =
             ScriptArgs::parse_from(["foundry-cli", "DeployV1", "--priority-gas-price", "100"]);
         assert!(args.priority_gas_price.is_some());
+    }
+
+    #[test]
+    fn test_eip1559_fee_estimate() {
+        // Defaults to unset (config provides `market`).
+        let args = ScriptArgs::parse_from(["foundry-cli", "DeployV1"]);
+        assert!(args.eip1559_fee_estimate.is_none());
+
+        let args = ScriptArgs::parse_from(["foundry-cli", "DeployV1", "--estimate", "aggressive"]);
+        assert_eq!(args.eip1559_fee_estimate, Some(Eip1559FeeEstimatePreset::Aggressive));
     }
 
     // <https://github.com/foundry-rs/foundry/issues/5910>
