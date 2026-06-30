@@ -75,9 +75,9 @@ use alloy_rpc_types::{
     trace::{
         filter::TraceFilter,
         geth::{
-            FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
-            GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, NoopFrame,
-            TraceResult,
+            CallConfig, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig,
+            GethDebugTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
+            NoopFrame, TraceResult,
         },
         parity::{LocalizedTransactionTrace, TraceResultsWithTransactionHash, TraceType},
     },
@@ -183,7 +183,8 @@ use storage::{Blockchain, DEFAULT_HISTORY_LIMIT, MinedTransaction};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::evm::TempoEvmFactory;
 use tempo_precompiles::{
-    storage::StorageCtx,
+    TIP_FEE_MANAGER_ADDRESS, extend_tempo_precompiles,
+    storage::{StorageActions, StorageCtx},
     tip_fee_manager::{IFeeManager, TipFeeManager},
     tip20::{ISSUER_ROLE, ITIP20, TIP20Token},
 };
@@ -214,6 +215,20 @@ impl DatabaseRef for dyn crate::eth::backend::db::Db {}
 pub const MIN_TRANSACTION_GAS: u128 = 21000;
 // Gas per transaction creating a contract.
 pub const MIN_CREATE_GAS: u128 = 53000;
+
+fn call_config_from_tracer_config(
+    tracer_config: GethDebugTracerConfig,
+) -> Result<CallConfig, serde_json::Error> {
+    let mut tracer_config = tracer_config.into_json();
+    if let Some(config) = tracer_config.as_object_mut()
+        && !config.contains_key("onlyTopCall")
+        && let Some(only_top_level_call) = config.remove("onlyTopLevelCall")
+    {
+        config.insert("onlyTopCall".to_string(), only_top_level_call);
+    }
+
+    GethDebugTracerConfig(tracer_config).into_call_config()
+}
 
 pub type State = foundry_evm::utils::StateChangeset;
 
@@ -557,8 +572,23 @@ impl<N: Network> Backend<N> {
     }
 
     /// Returns the active hardfork.
-    pub const fn hardfork(&self) -> FoundryHardfork {
+    pub fn hardfork(&self) -> FoundryHardfork {
+        if let Some(hardfork) =
+            self.fork.read().as_ref().and_then(|fork| fork.config.read().hardfork)
+        {
+            return hardfork;
+        }
         self.hardfork
+    }
+
+    /// Returns the active Tempo hardfork.
+    pub fn tempo_hardfork(&self) -> TempoHardfork {
+        TempoHardfork::from(self.hardfork())
+    }
+
+    /// Returns whether a Tempo hardfork is active on this backend.
+    pub fn is_tempo_hardfork_active(&self, hardfork: TempoHardfork) -> bool {
+        self.is_tempo() && self.tempo_hardfork() >= hardfork
     }
 
     /// Returns the precompiles for the current spec.
@@ -572,7 +602,8 @@ impl<N: Network> Backend<N> {
         }
 
         // Extend with configured network precompiles.
-        precompiles_map.extend(self.networks.precompiles());
+        precompiles_map
+            .extend(self.networks.precompiles(self.is_tempo().then(|| self.tempo_hardfork())));
 
         if let Some(factory) = &self.precompile_factory {
             for (address, precompile) in factory.precompiles() {
@@ -786,6 +817,12 @@ impl<N: Network> Backend<N> {
         rx
     }
 
+    /// Returns the number of new-block listeners. Closed listeners are pruned lazily on the next
+    /// new block notification.
+    pub fn new_block_listeners_count(&self) -> usize {
+        self.new_block_listeners.lock().len()
+    }
+
     /// Notifies all `new_block_listeners` about the new block
     fn notify_on_new_block(&self, header: Header, hash: B256) {
         // cleanup closed notification streams first, if the channel is closed we can remove the
@@ -813,33 +850,7 @@ impl<N: Network> Backend<N> {
 
     /// Returns the block and its hash for the given id
     fn get_block_with_hash(&self, id: impl Into<BlockId>) -> Option<(Block, B256)> {
-        let hash = match id.into() {
-            BlockId::Hash(hash) => hash.block_hash,
-            BlockId::Number(number) => {
-                let storage = self.blockchain.storage.read();
-                let slots_in_an_epoch = self.slots_in_an_epoch;
-                match number {
-                    BlockNumber::Latest => storage.best_hash,
-                    BlockNumber::Earliest => storage.genesis_hash,
-                    BlockNumber::Pending => return None,
-                    BlockNumber::Number(num) => *storage.hashes.get(&num)?,
-                    BlockNumber::Safe => {
-                        if storage.best_number > (slots_in_an_epoch) {
-                            *storage.hashes.get(&(storage.best_number - (slots_in_an_epoch)))?
-                        } else {
-                            storage.genesis_hash // treat the genesis block as safe "by definition"
-                        }
-                    }
-                    BlockNumber::Finalized => {
-                        if storage.best_number > (slots_in_an_epoch * 2) {
-                            *storage.hashes.get(&(storage.best_number - (slots_in_an_epoch * 2)))?
-                        } else {
-                            storage.genesis_hash
-                        }
-                    }
-                }
-            }
-        };
+        let hash = self.blockchain.hash(id.into(), self.slots_in_an_epoch)?;
         let block = self.get_block_by_hash(hash)?;
         Some((block, hash))
     }
@@ -1165,7 +1176,7 @@ impl<N: Network> Backend<N> {
         self.networks.inject_precompiles(precompiles);
 
         if let Some(factory) = &self.precompile_factory {
-            precompiles.extend_precompiles(factory.precompiles());
+            factory.install(precompiles);
         }
 
         let cheats = Arc::new(self.cheats.clone());
@@ -1178,6 +1189,23 @@ impl<N: Network> Backend<N> {
                 ))
             });
         }
+    }
+
+    fn inject_tempo_precompiles<DB, I>(&self, evm: &mut tempo_evm::evm::TempoEvm<DB, I>)
+    where
+        DB: Database,
+        I: Inspector<TempoContext<DB>>,
+    {
+        self.inject_precompiles(evm.precompiles_mut());
+        // Re-extend Tempo precompiles, preserving shared non-creditable slots.
+        let cfg = evm.ctx().cfg.clone();
+        let non_creditable_slots = evm.non_creditable_slots();
+        extend_tempo_precompiles(
+            evm.precompiles_mut(),
+            &cfg,
+            StorageActions::disabled(),
+            non_creditable_slots,
+        );
     }
 
     /// Creates a concrete EVM, injects precompiles, transacts, and returns the result mapped
@@ -1284,7 +1312,7 @@ impl<N: Network> Backend<N> {
         I: Inspector<TempoContext<WrapDatabaseRef<&'db DB>>>,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
-        let hardfork = TempoHardfork::from(self.hardfork);
+        let hardfork = self.tempo_hardfork();
         let tempo_env = EvmEnv::new(
             evm_env.cfg_env.clone().with_spec_and_gas_params(hardfork, tempo_gas_params(hardfork)),
             TempoBlockEnv { inner: evm_env.block_env.clone(), timestamp_millis_part: 0 },
@@ -1294,7 +1322,7 @@ impl<N: Network> Backend<N> {
             tempo_env,
             inspector,
         );
-        self.inject_precompiles(evm.precompiles_mut());
+        self.inject_tempo_precompiles(&mut evm);
         let result = evm.transact(tx_env)?;
         Ok(ResultAndState {
             result: result.result.map_haltreason(|h| match h {
@@ -1358,7 +1386,7 @@ impl<N: Network> Backend<N> {
         }
 
         if self.is_tempo() {
-            let hardfork = TempoHardfork::from(self.hardfork);
+            let hardfork = self.tempo_hardfork();
             let tempo_env = EvmEnv::new(
                 evm_env
                     .cfg_env
@@ -1542,13 +1570,17 @@ impl<N: Network> Backend<N> {
                     // manager needs a non-zero hash; the actual value doesn't matter
                     // because the state is discarded after estimation.
                     let estimation_hash = keccak256(base.data.as_ref());
+                    // T1B+ uses `TempoTxEnv::unique_tx_identifier` (sender-scoped) as
+                    // the expiring-nonce replay hash; pre-T1B uses `tx_hash`.
+                    // Set both so the synthetic env works across hardforks.
+                    tempo_tx.unique_tx_identifier = Some(estimation_hash);
                     tempo_tx.tempo_tx_env = Some(Box::new(TempoBatchCallEnv {
                         nonce_key,
                         valid_before,
                         valid_after,
                         aa_calls: vec![Call { to: base.kind, value: base.value, input: base.data }],
                         tx_hash: estimation_hash,
-                        expiring_nonce_hash: Some(estimation_hash),
+                        expiring_nonce_idx: Some(0),
                         ..Default::default()
                     }));
                 }
@@ -2118,7 +2150,7 @@ impl<N: Network> Backend<N> {
             let chain_id = self.evm_env.read().cfg_env.chain_id;
             let timestamp = self.genesis.timestamp;
             let test_accounts: Vec<Address> = self.genesis.accounts.clone();
-            let hardfork = TempoHardfork::from(self.hardfork);
+            let hardfork = self.tempo_hardfork();
             let mut db = self.db.write().await;
             crate::eth::backend::tempo::initialize_tempo_precompiles(
                 &mut **db,
@@ -2152,6 +2184,7 @@ impl<N: Network> Backend<N> {
                     // `setup_fork_db_config`
                     node_config.base_fee.take();
                     node_config.fork_urls = vec![eth_rpc_url.clone()];
+                    node_config.apply_tempo_fork_beneficiary_default(&mut evm_env);
 
                     node_config.setup_fork_db_config(eth_rpc_url, &mut evm_env, &self.fees).await?
                 };
@@ -2969,8 +3002,7 @@ where
                 return match tracer {
                     GethDebugTracerType::BuiltInTracer(tracer) => match tracer {
                         GethDebugBuiltInTracerType::CallTracer => {
-                            let call_config = tracer_config
-                                .into_call_config()
+                            let call_config = call_config_from_tracer_config(tracer_config)
                                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
 
                             let mut inspector = self.build_inspector().with_tracing_config(
@@ -3634,7 +3666,7 @@ where
                         return Ok(res);
                     }
                     GethDebugBuiltInTracerType::CallTracer => {
-                        return match tracer_config.into_call_config() {
+                        return match call_config_from_tracer_config(tracer_config) {
                             Ok(call_config) => {
                                 let inspector = TracingInspector::new(
                                     TracingInspectorConfig::from_geth_call_config(&call_config),
@@ -3892,14 +3924,20 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
         }
         // reset the block env
         if let Some(block) = state.block.clone() {
-            self.evm_env.write().block_env = block.clone();
+            {
+                let mut env = self.evm_env.write();
+                env.block_env = block.clone();
+                if self.is_tempo() && self.is_fork() && env.block_env.beneficiary.is_zero() {
+                    env.block_env.beneficiary = TIP_FEE_MANAGER_ADDRESS;
+                }
+            }
 
             // Set the current best block number.
             // Defaults to block number for compatibility with existing state files.
             let fork_num_and_hash = self.get_fork().map(|f| (f.block_number(), f.block_hash()));
 
             let best_number = state.best_block_number.unwrap_or(block.number.saturating_to());
-            if let Some((number, hash)) = fork_num_and_hash {
+            let selected_best_number = if let Some((number, hash)) = fork_num_and_hash {
                 trace!(target: "backend", state_block_number=?best_number, fork_block_number=?number);
                 // If the state.block_number is greater than the fork block number, set best number
                 // to the state block number.
@@ -3917,11 +3955,13 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
                             )))
                         })?;
                     self.blockchain.storage.write().best_hash = best_hash;
+                    best_number
                 } else {
                     // If loading state file on a fork, set best number to the fork block number.
                     // Ref: https://github.com/foundry-rs/foundry/pull/9215#issue-2618681838
                     self.blockchain.storage.write().best_number = number;
                     self.blockchain.storage.write().best_hash = hash;
+                    number
                 }
             } else {
                 self.blockchain.storage.write().best_number = best_number;
@@ -3939,6 +3979,13 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
                     })?;
 
                 self.blockchain.storage.write().best_hash = best_hash;
+                best_number
+            };
+
+            // Keep NUMBER aligned with the canonical local head chosen above. Arbitrum state dumps
+            // can intentionally keep BlockEnv.number distinct from the best L2 block number.
+            if !is_arbitrum(self.chain_id().to()) {
+                self.set_block_number(selected_best_number);
             }
         }
 
@@ -3971,6 +4018,27 @@ impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> Backend<N> {
                 "Loading state not supported with the current configuration",
             )
             .into());
+        }
+
+        // Backfill the EVM-level block hash cache from the freshly loaded blocks so that the
+        // BLOCKHASH opcode stays consistent after loading state. Reuses the hashes already
+        // computed by `load_blocks` above. Only collect the last 256 blocks since that's all
+        // BLOCKHASH can access.
+        let block_hashes: Vec<_> = {
+            let storage = self.blockchain.storage.read();
+            let min_block = storage.best_number.saturating_sub(256);
+            storage
+                .hashes
+                .iter()
+                .filter(|(num, _)| **num >= min_block)
+                .map(|(&num, &hash)| (num, hash))
+                .collect()
+        };
+        {
+            let mut db = self.db.write().await;
+            for (block_num, hash) in block_hashes {
+                db.insert_block_hash(U256::from(block_num), hash);
+            }
         }
 
         if let Some(historical_states) = state.historical_states {
@@ -4322,7 +4390,10 @@ fn get_pool_transactions_nonce(
 ) -> Option<u64> {
     if let Some(highest_nonce) = pool_transactions
         .iter()
-        .filter(|tx| *tx.pending_transaction.sender() == address)
+        .filter(|tx| {
+            *tx.pending_transaction.sender() == address
+                && !tx.pending_transaction.transaction.as_ref().has_nonzero_tempo_nonce_key()
+        })
         .map(|tx| tx.pending_transaction.nonce())
         .max()
     {
@@ -4429,8 +4500,10 @@ where
             return Err(InvalidTransactionError::TempoNativeValueTransfer);
         }
 
-        // Tempo AA: cap authorization list size
-        if let FoundryTxEnvelope::Tempo(aa_tx) = tx.as_ref() {
+        // Tempo AA T5: cap authorization list size
+        if self.is_tempo_hardfork_active(TempoHardfork::T5)
+            && let FoundryTxEnvelope::Tempo(aa_tx) = tx.as_ref()
+        {
             const MAX_TEMPO_AUTHORIZATIONS: usize = 16;
             let auth_count = aa_tx.tx().tempo_authorization_list.len();
             if auth_count > MAX_TEMPO_AUTHORIZATIONS {

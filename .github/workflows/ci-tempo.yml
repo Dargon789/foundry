@@ -39,13 +39,17 @@ env:
 
 jobs:
   tempo-check:
-    runs-on: depot-ubuntu-latest
+    # Skip on PRs from forks (only run for branches in foundry-rs/foundry, i.e. maintainer PRs).
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: depot-ubuntu-latest-16
     timeout-minutes: 60
     permissions:
       contents: read
     steps:
       # Checkout the repository
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
@@ -58,7 +62,7 @@ jobs:
       # Build and install binaries
       - name: Build and install Foundry binaries
         run: |
-          cargo build --profile dev --locked -p forge -p cast -p anvil -p chisel
+          cargo build --profile dev --locked --bin forge --bin cast --bin anvil --bin chisel
           echo "${{ github.workspace }}/target/debug" >> "$GITHUB_PATH"
 
       - name: Check Tempo fork schedule compatibility
@@ -71,7 +75,6 @@ jobs:
 
       - name: Run Tempo check on mainnet
         if: |
-          github.event_name == 'schedule' ||
           github.event.inputs.network == 'mainnet' ||
           github.event.inputs.network == 'all'
         env:
@@ -142,7 +145,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: JasonEtco/create-an-issue@1b14a70e4d8dc185e5cc76d3bec9eab20257b2c5 # v2.9.2
