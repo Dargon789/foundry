@@ -21,6 +21,7 @@ use alloy_rpc_types::{
     BlockId, BlockNumberOrTag, BlockTransactions, request::TransactionRequest,
     state::AccountOverride,
 };
+use alloy_rpc_types_eth::{Bundle, EthCallResponse};
 use alloy_serde::WithOtherFields;
 use alloy_sol_types::SolCall;
 use anvil::{CHAIN_ID, EthereumHardfork, NodeConfig, eth::api::CLIENT_VERSION, spawn};
@@ -519,6 +520,56 @@ async fn can_call_with_state_override() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn can_call_many() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let wallet = handle.dev_wallets().next().unwrap();
+    let signer: EthereumWallet = wallet.clone().into();
+    let from = wallet.address();
+
+    let provider = http_provider_with_signer(&handle.http_endpoint(), signer);
+
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "initial".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("updated".to_string());
+    let get_value = simple_storage_contract.getValue();
+    let transactions = vec![
+        WithOtherFields::new(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(*simple_storage_contract.address())
+                .with_input(set_value.calldata().clone()),
+        ),
+        WithOtherFields::new(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(*simple_storage_contract.address())
+                .with_input(get_value.calldata().clone()),
+        ),
+    ];
+
+    let response: Vec<Vec<EthCallResponse>> = provider
+        .client()
+        .request(
+            "eth_callMany",
+            (vec![
+                Bundle { transactions, block_override: None },
+                Bundle { transactions: Vec::new(), block_override: None },
+            ],),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.len(), 2);
+    assert_eq!(response[0].len(), 2);
+    assert!(response[1].is_empty());
+    assert_eq!(response[0][0].error, None);
+    let output = response[0][1].clone().ensure_ok().unwrap();
+    let value = SimpleStorage::getValueCall::abi_decode_returns(&output).unwrap();
+    assert_eq!(value, "updated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn can_mine_while_mining() {
     let (api, _) = spawn(NodeConfig::test()).await;
 
@@ -695,6 +746,18 @@ async fn can_get_code_by_hash() {
 
     let code = api.debug_code_by_hash(code_hash, None).await.unwrap();
     assert_eq!(&code.unwrap(), foundry_evm::constants::DEFAULT_CREATE2_DEPLOYER_RUNTIME_CODE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_debug_get_modified_accounts_by_number() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let response: serde_json::Value = provider
+        .raw_request("debug_getModifiedAccountsByNumber".into(), (0u64, 1u64))
+        .await
+        .unwrap();
+    assert_eq!(response, serde_json::Value::Null);
 }
 
 #[tokio::test(flavor = "multi_thread")]
