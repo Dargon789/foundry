@@ -1160,7 +1160,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1184,7 +1184,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1240,8 +1240,8 @@ dependencies = [
  "op-alloy-rpc-types",
  "op-revm",
  "parking_lot",
+ "rand 0.10.2",
  "rand 0.8.6",
- "rand 0.9.4",
  "reqwest 0.13.4",
  "revm",
  "revm-inspectors",
@@ -1278,7 +1278,7 @@ dependencies = [
  "foundry-common",
  "foundry-evm",
  "foundry-primitives",
- "rand 0.9.4",
+ "rand 0.10.2",
  "revm",
  "serde",
  "serde_json",
@@ -2941,8 +2941,8 @@ dependencies = [
  "op-alloy-flz",
  "op-alloy-network",
  "path-slash",
+ "rand 0.10.2",
  "rand 0.8.6",
- "rand 0.9.4",
  "rayon",
  "regex",
  "revm",
@@ -3198,7 +3198,7 @@ dependencies = [
  "terminfo",
  "thiserror 2.0.18",
  "which",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3357,7 +3357,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4422,7 +4422,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4683,7 +4683,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5034,7 +5034,7 @@ dependencies = [
  "path-slash",
  "proptest",
  "quick-junit",
- "rand 0.9.4",
+ "rand 0.10.2",
  "rayon",
  "regex",
  "reqwest 0.13.4",
@@ -5312,7 +5312,7 @@ dependencies = [
  "p256",
  "parking_lot",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.2",
  "revm",
  "revm-inspectors",
  "semver 1.0.28",
@@ -5466,7 +5466,7 @@ dependencies = [
  "tempo-primitives",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "tower",
  "tracing",
@@ -5626,7 +5626,7 @@ dependencies = [
  "snapbox",
  "solar-compiler",
  "soldeer-core",
- "strum 0.27.2",
+ "strum 0.28.0",
  "tempfile",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
@@ -5684,7 +5684,7 @@ dependencies = [
  "indicatif",
  "parking_lot",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.2",
  "rayon",
  "revm",
  "revm-inspectors",
@@ -5800,7 +5800,7 @@ dependencies = [
  "itertools 0.15.0",
  "parking_lot",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.2",
  "revm",
  "serde",
  "solar-compiler",
@@ -5990,7 +5990,7 @@ dependencies = [
  "foundry-config",
  "idna_adapter",
  "parking_lot",
- "rand 0.9.4",
+ "rand 0.10.2",
  "regex",
  "reqwest 0.13.4",
  "serde_json",
@@ -6250,7 +6250,7 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
+ "windows-link 0.1.3",
  "windows-result 0.4.1",
 ]
 
@@ -7030,7 +7030,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7843,7 +7843,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9122,7 +9122,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10585,7 +10585,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10644,7 +10644,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11368,7 +11368,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11506,7 +11506,7 @@ dependencies = [
  "solar-config",
  "solar-data-structures",
  "solar-macros",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "tracing",
  "unicode-width 0.2.2",
 ]
@@ -11848,7 +11848,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "url",
  "zip",
 ]
@@ -11976,7 +11976,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12195,7 +12195,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12454,8 +12454,12 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite 0.29.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -12856,6 +12860,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
 ]
@@ -13384,7 +13390,7 @@ dependencies = [
  "watchexec-events",
  "watchexec-signals",
  "watchexec-supervisor",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13522,7 +13528,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
