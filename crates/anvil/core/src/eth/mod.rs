@@ -575,6 +575,10 @@ pub enum EthRequest {
     )]
     DealERC20(Address, Address, #[serde(deserialize_with = "deserialize_number")] U256),
 
+    /// Modifies the TIP-20 balance of an account.
+    #[serde(rename = "anvil_dealTIP20")]
+    DealTIP20(Address, Address, #[serde(deserialize_with = "deserialize_number")] U256),
+
     /// Sets the ERC20 allowance for a spender
     #[serde(rename = "anvil_setERC20Allowance")]
     SetERC20Allowance(
@@ -605,6 +609,10 @@ pub enum EthRequest {
     /// Sets the coinbase address
     #[serde(rename = "anvil_setCoinbase", alias = "hardhat_setCoinbase", with = "sequence")]
     SetCoinbase(Address),
+
+    /// Sets the `prevrandao` value of the next block
+    #[serde(rename = "anvil_setNextBlockPrevRandao", with = "sequence")]
+    SetNextBlockPrevRandao(B256),
 
     /// Sets the chain id
     #[serde(rename = "anvil_setChainId", deserialize_with = "deserialize_u64_seq")]
@@ -1420,6 +1428,13 @@ mod tests {
     fn test_serde_custom_coinbase() {
         let s = r#"{"method": "anvil_setCoinbase", "params":
 ["0x295a70b2de5e3953354a6a8344e616ed314d7251"]}"#;
+        let value: serde_json::Value = serde_json::from_str(s).unwrap();
+        let _req = serde_json::from_value::<EthRequest>(value).unwrap();
+    }
+
+    #[test]
+    fn test_serde_custom_set_next_block_prevrandao() {
+        let s = r#"{"method": "anvil_setNextBlockPrevRandao", "params": ["0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"]}"#;
         let value: serde_json::Value = serde_json::from_str(s).unwrap();
         let _req = serde_json::from_value::<EthRequest>(value).unwrap();
     }
