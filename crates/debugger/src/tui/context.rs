@@ -1,6 +1,6 @@
 //! Debugger context and event handler implementation.
 
-use super::storage::{StorageAccess, hex_u256, storage_access_at};
+use super::storage::{StorageAccess, StorageSpace, hex_u256, storage_access_at};
 use crate::{DebugNode, DebuggerLayout, ExitReason, debugger::DebuggerContext};
 use alloy_primitives::{Address, U256, hex};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -318,9 +318,8 @@ impl TUIContext<'_> {
             }
 
             // Go to previous call
-            KeyCode::Char('c') => {
-                self.draw_memory.inner_call_index =
-                    self.draw_memory.inner_call_index.saturating_sub(1);
+            KeyCode::Char('c') if self.draw_memory.inner_call_index > 0 => {
+                self.draw_memory.inner_call_index -= 1;
                 self.current_step = self.n_steps() - 1;
                 self.scroll_memory_to_current_write();
             }
@@ -654,7 +653,9 @@ impl TUIContext<'_> {
         } else if RETURNDATA_COMMANDS.contains(&command) {
             self.run_buffer_command(command, BufferKind::Returndata, parts);
         } else if STORAGE_COMMANDS.contains(&command) {
-            self.run_storage_command(command, parts);
+            self.run_storage_command(command, StorageSpace::Persistent, parts);
+        } else if TRANSIENT_STORAGE_COMMANDS.contains(&command) {
+            self.run_storage_command(command, StorageSpace::Transient, parts);
         } else if LINE_COMMANDS.contains(&command) {
             let Some(line) = parts.next() else {
                 return self.set_error(command_usage(command, "<line>"));
@@ -693,14 +694,19 @@ impl TUIContext<'_> {
         self.goto_buffer_offset(buffer, offset);
     }
 
-    fn run_storage_command<'a>(&mut self, command: &str, mut args: impl Iterator<Item = &'a str>) {
+    fn run_storage_command<'a>(
+        &mut self,
+        command: &str,
+        space: StorageSpace,
+        mut args: impl Iterator<Item = &'a str>,
+    ) {
         let Some(slot) = args.next() else {
             return self.set_error(command_usage(command, "<slot>"));
         };
         if args.next().is_some() {
             return self.set_error(command_usage(command, "<slot>"));
         }
-        self.goto_storage_slot_from_input(slot);
+        self.goto_storage_slot_from_input(slot, space);
     }
 
     fn goto_source_line_from_input(&mut self, input: &str) {
@@ -808,7 +814,7 @@ impl TUIContext<'_> {
         self.set_info(format!("{} pane: {state}", pane.label()));
     }
 
-    fn goto_storage_slot_from_input(&mut self, input: &str) {
+    fn goto_storage_slot_from_input(&mut self, input: &str, space: StorageSpace) {
         let slot = match parse_storage_slot(input) {
             Ok(slot) => slot,
             Err(err) => {
@@ -822,8 +828,16 @@ impl TUIContext<'_> {
             self.draw_memory.inner_call_index,
             self.current_step,
             slot,
+            space,
         ) else {
-            self.set_error(format!("Storage slot {} not accessed in current call", hex_u256(slot)));
+            let storage = match space {
+                StorageSpace::Persistent => "Storage",
+                StorageSpace::Transient => "Transient storage",
+            };
+            self.set_error(format!(
+                "{storage} slot {} not accessed in current call",
+                hex_u256(slot)
+            ));
             return;
         };
 
@@ -1008,6 +1022,7 @@ const MEMORY_COMMANDS: &[&str] = &["mem", "memory"];
 const CALLDATA_COMMANDS: &[&str] = &["calldata", "cd"];
 const RETURNDATA_COMMANDS: &[&str] = &["returndata", "ret", "rd"];
 const STORAGE_COMMANDS: &[&str] = &["storage", "store", "slot"];
+const TRANSIENT_STORAGE_COMMANDS: &[&str] = &["transient", "tslot"];
 const LINE_COMMANDS: &[&str] = &["line", "ln"];
 const OPCODE_COMMANDS: &[&str] = &["opcodes", "opcode", "ops"];
 const SOURCE_COMMANDS: &[&str] = &["source", "src"];
@@ -1040,13 +1055,14 @@ fn command_usage(command: &str, arg: &str) -> String {
 
 fn command_help() -> String {
     format!(
-        "Commands: {} <pc>, {} <pc>, {} <offset>, {} <offset>, {} <offset>, {} <slot>, {} <line>, {}, {}, {}, {}",
+        "Commands: {} <pc>, {} <pc>, {} <offset>, {} <offset>, {} <offset>, {} <slot>, {} <slot>, {} <line>, {}, {}, {}, {}",
         command_aliases(CONTINUE_COMMANDS),
         command_aliases(PC_COMMANDS),
         command_aliases(MEMORY_COMMANDS),
         command_aliases(CALLDATA_COMMANDS),
         command_aliases(RETURNDATA_COMMANDS),
         command_aliases(STORAGE_COMMANDS),
+        command_aliases(TRANSIENT_STORAGE_COMMANDS),
         command_aliases(LINE_COMMANDS),
         command_aliases(OPCODE_COMMANDS),
         command_aliases(SOURCE_COMMANDS),
@@ -1276,14 +1292,19 @@ fn find_storage_target(
     current_node_index: usize,
     current_step: usize,
     slot: U256,
+    space: StorageSpace,
 ) -> Option<StorageTarget> {
     let current_node = arena.get(current_node_index)?;
     let trace_node_idx = current_node.trace_node_idx;
     let current_absolute_step = current_node.step_offset.saturating_add(current_step);
 
-    storage_target_at(arena, current_node_index, current_step, slot)
-        .or_else(|| find_storage_target_after(arena, trace_node_idx, current_absolute_step, slot))
-        .or_else(|| find_storage_target_before(arena, trace_node_idx, current_absolute_step, slot))
+    storage_target_at(arena, current_node_index, current_step, slot, space)
+        .or_else(|| {
+            find_storage_target_after(arena, trace_node_idx, current_absolute_step, slot, space)
+        })
+        .or_else(|| {
+            find_storage_target_before(arena, trace_node_idx, current_absolute_step, slot, space)
+        })
 }
 
 fn storage_target_at(
@@ -1291,10 +1312,11 @@ fn storage_target_at(
     node_index: usize,
     step_index: usize,
     slot: U256,
+    space: StorageSpace,
 ) -> Option<StorageTarget> {
     let node = arena.get(node_index)?;
     storage_access_at(&node.steps, step_index)
-        .filter(|access| access.slot() == slot)
+        .filter(|access| access.slot() == slot && access.space() == space)
         .map(|access| StorageTarget { node_index, access })
 }
 
@@ -1303,6 +1325,7 @@ fn find_storage_target_after(
     trace_node_idx: usize,
     current_absolute_step: usize,
     slot: U256,
+    space: StorageSpace,
 ) -> Option<StorageTarget> {
     let mut best = None;
 
@@ -1317,8 +1340,8 @@ fn find_storage_target_after(
                 continue;
             }
 
-            let Some(access) =
-                storage_access_at(&node.steps, step_index).filter(|access| access.slot() == slot)
+            let Some(access) = storage_access_at(&node.steps, step_index)
+                .filter(|access| access.slot() == slot && access.space() == space)
             else {
                 continue;
             };
@@ -1339,6 +1362,7 @@ fn find_storage_target_before(
     trace_node_idx: usize,
     current_absolute_step: usize,
     slot: U256,
+    space: StorageSpace,
 ) -> Option<StorageTarget> {
     let mut best = None;
 
@@ -1353,8 +1377,8 @@ fn find_storage_target_before(
                 continue;
             }
 
-            let Some(access) =
-                storage_access_at(&node.steps, step_index).filter(|access| access.slot() == slot)
+            let Some(access) = storage_access_at(&node.steps, step_index)
+                .filter(|access| access.slot() == slot && access.space() == space)
             else {
                 continue;
             };
@@ -1689,6 +1713,24 @@ mod tests {
         let _ = tui.handle_key_event(key(KeyCode::Char('h')));
         assert!(tui.show_shortcuts);
         assert_eq!(tui.status.as_ref().unwrap().text, "Shortcut help: shown");
+    }
+
+    #[test]
+    fn previous_call_shortcut_respects_root_boundary() {
+        let address = Address::repeat_byte(1);
+        let mut context = context_with_arena(vec![
+            node(address, CallKind::Call, &[1, 2]),
+            node(address, CallKind::Call, &[3]),
+        ]);
+        let mut tui = TUIContext::new(&mut context);
+        tui.init();
+
+        let _ = tui.handle_key_event(key(KeyCode::Char('c')));
+        assert_eq!((tui.draw_memory.inner_call_index, tui.current_step), (0, 0));
+
+        tui.draw_memory.inner_call_index = 1;
+        let _ = tui.handle_key_event(key(KeyCode::Char('c')));
+        assert_eq!((tui.draw_memory.inner_call_index, tui.current_step), (0, 1));
     }
 
     #[test]
@@ -2108,6 +2150,37 @@ mod tests {
     }
 
     #[test]
+    fn command_prompt_jumps_to_transient_storage_slot_access() {
+        let address = Address::repeat_byte(1);
+        let steps = vec![step(1), step_with_stack(42, OpCode::TSTORE, &[0xbeef, 0x2a])];
+        let mut context = context_with_arena(vec![DebugNode::new(
+            address,
+            CallKind::Call,
+            steps,
+            Bytes::new(),
+            0,
+            None,
+        )]);
+        let mut tui = TUIContext::new(&mut context);
+        tui.init();
+
+        tui.run_command_from_input("transient 2a");
+
+        assert_eq!(tui.current_step, 1);
+        assert_eq!(
+            tui.status.as_ref().unwrap().text,
+            "Jumped to transient storage TSTORE slot 0x2a = 0xbeef at PC 0x2a (42)"
+        );
+
+        tui.run_command_from_input("storage 2a");
+        assert_eq!(tui.current_step, 1);
+        assert_eq!(
+            tui.status.as_ref().unwrap().text,
+            "Storage slot 0x2a not accessed in current call"
+        );
+    }
+
+    #[test]
     fn command_prompt_searches_storage_across_split_call_segments() {
         let address = Address::repeat_byte(1);
         let mut store = step(42);
@@ -2299,6 +2372,7 @@ mod tests {
             CALLDATA_COMMANDS,
             RETURNDATA_COMMANDS,
             STORAGE_COMMANDS,
+            TRANSIENT_STORAGE_COMMANDS,
             LINE_COMMANDS,
             OPCODE_COMMANDS,
             SOURCE_COMMANDS,
