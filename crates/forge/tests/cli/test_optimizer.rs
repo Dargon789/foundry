@@ -1,5 +1,46 @@
 //! Tests for the `forge test` with preprocessed cache.
 
+#[cfg(unix)]
+forgetest_init!(filtered_tests_reuse_preprocessed_cache, |prj, cmd| {
+    use foundry_test_utils::util::OutputExt;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    prj.initialize_default_contracts();
+    prj.update_config(|config| config.dynamic_test_linking = true);
+    cmd.arg("build").assert_success();
+
+    let solc = prj.root().join("fake-solc");
+    let invoked = prj.root().join("fake-solc.invoked");
+    fs::write(
+        &solc,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+touch "$0.invoked"
+exit 1
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&solc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&solc, permissions).unwrap();
+    prj.update_config(|config| {
+        config.solc = Some(foundry_config::SolcReq::Local(solc));
+    });
+
+    let output =
+        cmd.forge_fuse().args(["test", "--match-contract", "CounterTest"]).assert_success();
+    let stdout = output.get_output().stdout_lossy();
+    assert!(
+        stdout.contains("Ran 2 tests for test/Counter.t.sol:CounterTest"),
+        "cached ABI did not select CounterTest: {stdout}"
+    );
+    assert!(!invoked.exists(), "filtered test compilation did not reuse the preprocessed cache");
+});
+
 // Test cache is invalidated when `forge build` if optimize test option toggled.
 forgetest_init!(toggle_invalidate_cache_on_build, |prj, cmd| {
     prj.initialize_default_contracts();
@@ -1417,9 +1458,9 @@ Ran 1 test for test/Counter.t.sol:CounterTest
 Traces:
   [..] CounterTest::test_Increment()
     ├─ [0] VM::deployCode("src/Counter.sol:Counter")
-    │   ├─ [96345] → new Counter@0x2e234DAe75C793f67A35089C9d99245E1C58470b
+    │   ├─ [96345] → new Counter@0xF62849F9A0B5Bf2913b396098F7c7019b51A820a
     │   │   └─ ← [Return] 481 bytes of code
-    │   └─ ← [Return] Counter: [0x2e234DAe75C793f67A35089C9d99245E1C58470b]
+    │   └─ ← [Return] Counter: [0xF62849F9A0B5Bf2913b396098F7c7019b51A820a]
     ├─ [..] Counter::setNumber(0)
     │   └─ ← [Stop]
     ├─ [..] Counter::increment()

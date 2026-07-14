@@ -1,13 +1,16 @@
 use crate::{
     executors::{
         DURATION_BETWEEN_METRICS_REPORT, EarlyExit, EvmError, Executor, RawCallResult,
-        corpus::{DynamicTargetCtx, ReplayTarget, WorkerCorpus, WorkerCorpusSeed},
+        corpus::{
+            CorpusInsertionMode, DynamicTargetCtx, ReplayTarget, WorkerCorpus, WorkerCorpusSeed,
+        },
     },
     inspectors::Fuzzer,
 };
 use alloy_json_abi::Function;
 use alloy_primitives::{
-    Address, Bytes, FixedBytes, I256, Selector, U256, keccak256, map::AddressMap,
+    Address, Bytes, FixedBytes, I256, Selector, U256, keccak256,
+    map::{AddressMap, hash_map::Entry as AddressMapEntry},
 };
 use alloy_sol_types::{SolCall, sol};
 use eyre::{ContextCompat, Result, eyre};
@@ -16,7 +19,7 @@ use foundry_common::{
     contracts::{ContractsByAddress, ContractsByArtifact},
     sh_eprintln, sh_println,
 };
-use foundry_config::{InvariantConfig, InvariantWorkers};
+use foundry_config::{FuzzCorpusConfig, InvariantConfig, InvariantDepthMode, InvariantWorkers};
 use foundry_evm_core::{
     FoundryBlock,
     constants::{
@@ -26,7 +29,7 @@ use foundry_evm_core::{
     precompiles::PRECOMPILES,
 };
 use foundry_evm_fuzz::{
-    BasicTxDetails, FuzzCase, FuzzFixtures,
+    BasicTxDetails, FuzzCase, FuzzFixtures, ObservedCall,
     invariant::{
         ArtifactFilters, FuzzRunIdentifiedContracts, InvariantContract, InvariantSettings,
         RandomCallGenerator, SenderFilters, TargetedContract, TargetedContracts,
@@ -37,14 +40,16 @@ use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use indicatif::ProgressBar;
 use parking_lot::RwLock;
 use proptest::{
+    prelude::Rng,
     strategy::Strategy,
     test_runner::{RngAlgorithm, TestRng, TestRunner},
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use result::{assert_after_invariant, can_continue, did_fail_on_assert, invariant_preflight_check};
+pub(crate) use result::did_fail_on_assert;
+use result::{assert_after_invariant, can_continue, invariant_preflight_check};
 use revm::{context::Block, state::Account};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap as Map, HashSet, btree_map::Entry},
     sync::Arc,
@@ -52,6 +57,7 @@ use std::{
 };
 
 mod error;
+pub(crate) use error::snapshot_edge_fingerprint;
 pub use error::{
     FailureKey, HandlerAssertionFailure, InvariantFailures, InvariantFuzzError,
     handler_site_already_minimal,
@@ -72,8 +78,9 @@ pub use result::InvariantFuzzTestResult;
 
 mod shrink;
 pub use shrink::{
-    CheckSequenceOptions, HandlerReplayOutcome, check_sequence, check_sequence_value,
-    replay_handler_failure_sequence,
+    CheckSequenceFailureSite, CheckSequenceOptions, CheckSequenceOutcome, HandlerReplayOutcome,
+    SequenceShrink, ShrinkCandidateKeys, ShrinkRun, ShrinkRunStats, check_sequence,
+    check_sequence_value, replay_handler_failure_sequence, shrink_sequence_by_removing,
 };
 
 /// Minimum number of logical runs assigned to each auto invariant worker at the default invariant
@@ -86,6 +93,8 @@ const DEFAULT_DEPTH_FOR_INVARIANT_WORKER_CAP: u32 = 500;
 /// Minimum estimated handler calls assigned to each auto invariant worker.
 const MIN_ESTIMATED_CALLS_PER_INVARIANT_WORKER: u64 =
     MIN_RUNS_PER_INVARIANT_WORKER as u64 * DEFAULT_DEPTH_FOR_INVARIANT_WORKER_CAP as u64;
+/// Share of parallel workers reserved for selector focus mode.
+const INVARIANT_FOCUS_WORKER_DIVISOR: usize = 8;
 
 sol! {
     interface IInvariantTest {
@@ -152,6 +161,17 @@ pub struct InvariantMetrics {
     pub discards: usize,
 }
 
+impl InvariantMetrics {
+    const fn record_call(&mut self, reverted: bool, discarded: bool) {
+        self.calls += 1;
+        if discarded {
+            self.discards += 1;
+        } else if reverted {
+            self.reverts += 1;
+        }
+    }
+}
+
 /// Campaign-level throughput metrics for invariant progress reporting.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct InvariantThroughputMetrics {
@@ -173,6 +193,20 @@ fn max_invariant_workers_for_campaign(runs: u32, depth: u32) -> usize {
     let estimated_calls = u64::from(runs) * u64::from(depth.max(1));
     usize::try_from((estimated_calls / MIN_ESTIMATED_CALLS_PER_INVARIANT_WORKER).max(1))
         .unwrap_or(usize::MAX)
+}
+
+fn invariant_run_depth(config: &InvariantConfig, runner: &mut TestRunner) -> u32 {
+    match config.depth_mode {
+        InvariantDepthMode::Fixed => config.depth,
+        InvariantDepthMode::Random => {
+            let min_depth = config.min_depth.max(1);
+            if config.depth <= min_depth {
+                config.depth.max(1)
+            } else {
+                runner.rng().random_range(min_depth..=config.depth)
+            }
+        }
+    }
 }
 
 fn auto_invariant_worker_count(
@@ -201,10 +235,142 @@ fn invariant_worker_count_with_threads(
     }
 }
 
+const fn invariant_worker_config(
+    mut config: InvariantConfig,
+    worker_id: u32,
+    worker_count: usize,
+) -> InvariantConfig {
+    // Keep one- and two-worker campaigns on the stable default, but let one extra worker explore
+    // the broader fresh-input setting once the user has enough workers to keep the exploratory
+    // share below half of the campaign. The last worker does not receive remainder runs from
+    // campaign sharding, so this keeps exposure bounded to one worker shard.
+    let exploratory_worker_id = worker_count.saturating_sub(1) as u32;
+    if worker_count > 2
+        && worker_id == exploratory_worker_id
+        && !config.corpus_random_sequence_weight_configured
+        && config.corpus.corpus_random_sequence_weight
+            == FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+    {
+        config.corpus.corpus_random_sequence_weight =
+            FuzzCorpusConfig::ENSEMBLE_CORPUS_RANDOM_SEQUENCE_WEIGHT;
+    }
+    config
+}
+
 fn gas_report_samples_for_worker(total_samples: u32, worker_id: u32, worker_count: usize) -> usize {
     let total_samples = total_samples as usize;
     let worker_count = worker_count.max(1);
     total_samples / worker_count + usize::from((worker_id as usize) < total_samples % worker_count)
+}
+
+fn invariant_worker_collects_evm_cmp_log(
+    config: &InvariantConfig,
+    worker_id: u32,
+    worker_count: usize,
+) -> bool {
+    config.corpus.collect_evm_cmp_log() && (worker_count <= 1 || worker_id == 0)
+}
+
+fn invariant_focus_worker_count(worker_count: usize) -> usize {
+    if worker_count <= 1 {
+        0
+    } else {
+        let max_focus_workers = if worker_count > 2 { worker_count - 2 } else { worker_count - 1 };
+        (worker_count / INVARIANT_FOCUS_WORKER_DIVISOR).max(1).min(max_focus_workers)
+    }
+}
+
+fn invariant_focus_worker_index(worker_id: u32, worker_count: usize) -> Option<usize> {
+    let worker_id = worker_id as usize;
+    let focus_workers = invariant_focus_worker_count(worker_count);
+    if focus_workers == 0 || worker_id >= worker_count {
+        return None;
+    }
+
+    let focus_worker_end = if worker_count > 2 { worker_count - 1 } else { worker_count };
+    let first_focus_worker = focus_worker_end - focus_workers;
+    (worker_id >= first_focus_worker && worker_id < focus_worker_end)
+        .then(|| worker_id - first_focus_worker)
+}
+
+#[cfg(test)]
+fn campaign_seed_for_worker(
+    campaign_seed: &InvariantCampaignSeed,
+    plan: InvariantWorkerPlan,
+    worker_count: usize,
+) -> InvariantCampaignSeed {
+    focused_campaign_seed_for_worker(campaign_seed, plan, worker_count, None)
+        .unwrap_or_else(|| campaign_seed.clone())
+}
+
+fn focused_campaign_seed_for_worker(
+    campaign_seed: &InvariantCampaignSeed,
+    plan: InvariantWorkerPlan,
+    worker_count: usize,
+    focus_seed: Option<U256>,
+) -> Option<InvariantCampaignSeed> {
+    let focus_index = invariant_focus_worker_index(plan.worker_id, worker_count)?;
+    let targeted_contracts =
+        focused_targeted_contracts(&campaign_seed.targeted_contracts, focus_index, focus_seed)?;
+
+    Some(InvariantCampaignSeed {
+        targeted_contracts,
+        targets_are_updatable: false,
+        ..campaign_seed.clone()
+    })
+}
+
+fn campaign_seed_and_corpus_seed_for_worker(
+    campaign_seed: &InvariantCampaignSeed,
+    corpus_seed: &WorkerCorpusSeed,
+    plan: InvariantWorkerPlan,
+    worker_count: usize,
+    include_cmp_seq: bool,
+    focus_seed: Option<U256>,
+) -> (InvariantCampaignSeed, WorkerCorpusSeed) {
+    let worker_corpus_seed =
+        corpus_seed.clone_for_worker(plan.worker_id as usize, worker_count, include_cmp_seq);
+    let Some(worker_campaign_seed) =
+        focused_campaign_seed_for_worker(campaign_seed, plan, worker_count, focus_seed)
+    else {
+        return (campaign_seed.clone(), worker_corpus_seed);
+    };
+
+    let mut worker_corpus_seed = worker_corpus_seed;
+    worker_corpus_seed.retain_replayable(&worker_campaign_seed.targeted_contracts);
+    (worker_campaign_seed, worker_corpus_seed)
+}
+
+fn focused_targeted_contracts(
+    targeted_contracts: &TargetedContracts,
+    focus_index: usize,
+    focus_seed: Option<U256>,
+) -> Option<TargetedContracts> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for (address, contract) in targeted_contracts.iter() {
+        // Build from the effective selector set so user target/exclude config stays authoritative.
+        for function in contract.abi_fuzzed_functions() {
+            if seen.insert((*address, function.selector())) {
+                candidates.push((*address, function.clone()));
+            }
+        }
+    }
+    if candidates.len() <= 1 {
+        return None;
+    }
+
+    let seed_offset = focus_seed
+        .map(|seed| (seed % U256::from(candidates.len())).to::<usize>())
+        .unwrap_or_default();
+    let candidate_index = (focus_index % candidates.len() + seed_offset) % candidates.len();
+    let (address, function) = candidates[candidate_index].clone();
+    let mut contract = targeted_contracts.get(&address)?.clone();
+    contract.targeted_functions = vec![function];
+
+    let mut focused = TargetedContracts::new();
+    focused.insert(address, contract);
+    Some(focused)
 }
 
 fn invariant_worker_seed(seed: U256, worker_id: u32) -> U256 {
@@ -243,6 +409,20 @@ fn invariant_worker_runner(
     } else {
         TestRunner::new_with_rng(runner.config().clone(), runner.new_rng())
     }
+}
+
+fn invariant_focus_seed(
+    runner: &mut TestRunner,
+    configured_seed: Option<U256>,
+    worker_count: usize,
+) -> Option<U256> {
+    if invariant_focus_worker_count(worker_count) == 0 {
+        return None;
+    }
+    configured_seed.or_else(|| {
+        let mut rng = runner.new_rng();
+        Some(U256::from_be_bytes(rng.random::<[u8; 32]>()))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +478,32 @@ impl InvariantFailureMetrics {
         });
         let _ = sh_eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
     }
+
+    /// Records a handler assertion and emits a structured JSON `"failure"` event.
+    fn record_handler_failure(&mut self, target: Address, selector: Selector, reason: &str) {
+        self.broken_handlers += 1;
+
+        let timestamp =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let event = build_handler_failure_event(timestamp, target, selector, reason);
+        let _ = sh_eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
+    }
+}
+
+fn build_handler_failure_event(
+    timestamp_secs: u64,
+    target: Address,
+    selector: Selector,
+    reason: &str,
+) -> Value {
+    json!({
+        "timestamp": timestamp_secs,
+        "event": "failure",
+        "failure_type": "handler_assertion",
+        "target": target,
+        "selector": selector,
+        "reason": reason,
+    })
 }
 
 /// Bridges newly-recorded invariant breaks from `failures.errors` into the pulse
@@ -324,6 +530,8 @@ struct InvariantProgressContext<'a> {
     elapsed: Duration,
     worker_id: u32,
     worker_count: usize,
+    /// Time since this worker last saw a new edge, or `None` if it has not seen one yet.
+    time_since_new_edge: Option<Duration>,
 }
 
 /// Builds the machine-readable invariant progress payload emitted during a
@@ -355,6 +563,10 @@ fn build_invariant_progress_json<M: Serialize>(
         "worker": {
             "id": context.worker_id,
             "count": context.worker_count,
+            // `null` until this worker sees its first edge.
+            "secs_since_new_edge": context
+                .time_since_new_edge
+                .map(|d| d.as_secs_f64()),
         },
     });
 
@@ -381,6 +593,9 @@ struct InvariantTestData {
     line_coverage: Option<HitMaps>,
     // Metrics for each fuzzed selector.
     metrics: Map<String, InvariantMetrics>,
+    // Cache from fuzzed (target, selector) to its metric key. Only resolved keys are cached and
+    // they are invalidated when targets change (see `invalidate_metric_key_cache`).
+    metric_key_cache: Map<(Address, Selector), String>,
 
     // Proptest runner to query for random values.
     // The strategy only comes with the first `input`. We fill the rest of the `inputs`
@@ -420,6 +635,7 @@ impl InvariantTest {
             gas_report_traces: vec![],
             line_coverage: None,
             metrics: Map::default(),
+            metric_key_cache: Map::default(),
             branch_runner,
             optimization_best_value: None,
             optimization_best_sequence: vec![],
@@ -451,22 +667,58 @@ impl InvariantTest {
     /// Always increments number of calls; discarded runs (through assume cheatcodes) are tracked
     /// separated from reverts.
     fn record_metrics(&mut self, tx_details: &BasicTxDetails, reverted: bool, discarded: bool) {
-        if let Some(metric_key) = self.targeted_contracts.targets().fuzzed_metric_key(tx_details) {
-            let test_metrics = &mut self.test_data.metrics;
-            let invariant_metrics = test_metrics.entry(metric_key).or_default();
-            invariant_metrics.calls += 1;
-            if discarded {
-                invariant_metrics.discards += 1;
-            } else if reverted {
-                invariant_metrics.reverts += 1;
+        let Some(selector) = tx_details
+            .call_details
+            .calldata
+            .get(..4)
+            .and_then(|selector| <[u8; 4]>::try_from(selector).ok())
+            .map(Selector::from)
+        else {
+            return;
+        };
+        let cache_key = (tx_details.call_details.target, selector);
+
+        if let Some(metric_key) = self.test_data.metric_key_cache.get(&cache_key) {
+            if let Some(invariant_metrics) = self.test_data.metrics.get_mut(metric_key) {
+                invariant_metrics.record_call(reverted, discarded);
+            } else {
+                self.test_data
+                    .metrics
+                    .entry(metric_key.to_owned())
+                    .or_default()
+                    .record_call(reverted, discarded);
             }
+            return;
         }
+
+        // Not cached: resolve from the current target set. Unresolved keys aren't cached so a tx
+        // whose target isn't known yet is re-resolved once that target is added.
+        let Some(metric_key) = self
+            .targeted_contracts
+            .targets()
+            .fuzzed_metric_key_for_selector(tx_details.call_details.target, selector)
+        else {
+            return;
+        };
+        self.test_data.metric_key_cache.insert(cache_key, metric_key.clone());
+        self.test_data.metrics.entry(metric_key).or_default().record_call(reverted, discarded);
+    }
+
+    /// Drops cached metric keys for the given addresses, keeping the cache coherent when targets
+    /// are added or removed (an address can be reused for a different artifact across runs).
+    fn invalidate_metric_key_cache(&mut self, addresses: &[Address]) {
+        if addresses.is_empty() {
+            return;
+        }
+        self.test_data.metric_key_cache.retain(|(addr, _), _| !addresses.contains(addr));
     }
 
     /// End invariant test run by collecting results, cleaning collected artifacts and reverting
     /// created fuzz state.
     fn end_run<FEN: FoundryEvmNetwork>(&mut self, run: InvariantTestRun<FEN>, gas_samples: usize) {
-        // We clear all the targeted contracts created during this run.
+        // Clear contracts created during this run, dropping their cached metric keys so a reused
+        // address can't resolve to a stale contract in a later run.
+        self.invalidate_metric_key_cache(&run.created_contracts);
         self.targeted_contracts.clear_created_contracts(run.created_contracts);
 
         if self.test_data.gas_report_traces.len() < gas_samples {
@@ -510,6 +762,10 @@ struct InvariantTestRun<FEN: FoundryEvmNetwork> {
     rejects: u32,
     // Whether new coverage was discovered during this run.
     new_coverage: bool,
+    // Line coverage staged until the run is accepted.
+    line_coverage: Option<HitMaps>,
+    // Whether this run's inputs should become the reported last run.
+    save_last_run_inputs: bool,
     // For optimization mode: the best value found during this run (if any).
     optimization_value: Option<I256>,
     // For optimization mode: the length of the input prefix that produced the best value.
@@ -529,8 +785,10 @@ struct InvariantCampaignSeed {
 impl<FEN: FoundryEvmNetwork> InvariantTestRun<FEN> {
     /// Instantiates an invariant test run.
     fn new(first_input: BasicTxDetails, executor: Executor<FEN>, depth: usize) -> Self {
+        let mut inputs = Vec::with_capacity(depth.saturating_add(1));
+        inputs.push(first_input);
         Self {
-            inputs: vec![first_input],
+            inputs,
             cmp_seq: Vec::with_capacity(depth),
             executor,
             fuzz_runs: Vec::with_capacity(depth),
@@ -539,6 +797,8 @@ impl<FEN: FoundryEvmNetwork> InvariantTestRun<FEN> {
             depth: 0,
             rejects: 0,
             new_coverage: false,
+            line_coverage: None,
+            save_last_run_inputs: false,
             optimization_value: None,
             optimization_prefix_len: 0,
         }
@@ -670,12 +930,19 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             campaign_seed.targeted_contracts.clone(),
             campaign_seed.targets_are_updatable,
         );
+        let mut corpus_replay_executor = self.executor.clone();
+        corpus_replay_executor.inspector_mut().collect_evm_cmp_log(
+            invariant_worker_collects_evm_cmp_log(&self.config, 0, actual_worker_count),
+        );
+        let dynamic = self.dynamic_target_ctx();
         let corpus_seed = WorkerCorpusSeed::load_from_disk(
             &self.config.corpus,
-            Some(&self.executor),
-            None,
-            Some(&replay_targets),
-            Some(self.dynamic_target_ctx()),
+            Some(&corpus_replay_executor),
+            ReplayTarget {
+                stateless: None,
+                fuzzed_contracts: Some(&replay_targets),
+                dynamic: Some(&dynamic),
+            },
         )?;
         let corpus_persistence = if actual_worker_count > 1 {
             InvariantCorpusPersistence::Deferred
@@ -687,6 +954,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         let setup_contracts = self.setup_contracts;
         let project_contracts = self.project_contracts;
         let base_executor = self.executor.clone();
+        let focus_seed = invariant_focus_seed(&mut runner, self.fuzz_seed, actual_worker_count);
         let campaign_state =
             Arc::new(InvariantCampaignState::new(early_exit.clone(), self.config.timeout));
 
@@ -701,15 +969,29 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         worker_plan.worker_id,
                         actual_worker_count,
                     );
-                    (worker_plan, worker_runner, gas_report_samples)
+                    let collect_cmp_log = invariant_worker_collects_evm_cmp_log(
+                        &config,
+                        worker_plan.worker_id,
+                        actual_worker_count,
+                    );
+                    (worker_plan, worker_runner, gas_report_samples, collect_cmp_log)
                 })
                 .collect::<Vec<_>>();
             worker_jobs
                 .into_par_iter()
-                .map(|(worker_plan, worker_runner, gas_report_samples)| {
+                .map(|(worker_plan, worker_runner, gas_report_samples, collect_cmp_log)| {
                     let _guard =
                         info_span!("invariant_worker", id = worker_plan.worker_id).entered();
                     let timer = Instant::now();
+                    let (worker_campaign_seed, worker_corpus_seed) =
+                        campaign_seed_and_corpus_seed_for_worker(
+                            &campaign_seed,
+                            &corpus_seed,
+                            worker_plan,
+                            actual_worker_count,
+                            collect_cmp_log,
+                            focus_seed,
+                        );
                     let output = Self::run_invariant_worker(
                         base_executor.clone(),
                         worker_runner,
@@ -722,9 +1004,8 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         fuzz_state.fork(),
                         progress,
                         &campaign_state,
-                        campaign_seed.clone(),
-                        corpus_seed
-                            .clone_for_worker(worker_plan.worker_id as usize, actual_worker_count),
+                        worker_campaign_seed,
+                        worker_corpus_seed,
                         corpus_persistence,
                         actual_worker_count,
                         gas_report_samples,
@@ -738,6 +1019,20 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             let runner =
                 invariant_worker_runner(&mut runner, worker_plan.worker_id, self.fuzz_seed);
             let gas_report_samples = config.gas_report_samples as usize;
+            let collect_cmp_log = invariant_worker_collects_evm_cmp_log(
+                &config,
+                worker_plan.worker_id,
+                actual_worker_count,
+            );
+            let (worker_campaign_seed, worker_corpus_seed) =
+                campaign_seed_and_corpus_seed_for_worker(
+                    &campaign_seed,
+                    &corpus_seed,
+                    worker_plan,
+                    actual_worker_count,
+                    collect_cmp_log,
+                    focus_seed,
+                );
             vec![Self::run_invariant_worker(
                 base_executor,
                 runner,
@@ -750,8 +1045,8 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 fuzz_state,
                 progress,
                 &campaign_state,
-                campaign_seed,
-                corpus_seed.clone(),
+                worker_campaign_seed,
+                worker_corpus_seed,
                 corpus_persistence,
                 actual_worker_count,
                 gas_report_samples,
@@ -774,7 +1069,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 corpus_entries,
                 &self.executor,
                 ReplayTarget {
-                    fuzzed_function: None,
+                    stateless: None,
                     fuzzed_contracts: Some(&replay_targets),
                     dynamic: Some(&dynamic_target_ctx),
                 },
@@ -809,10 +1104,13 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         // Note: invariant function signatures (no inputs) are validated upstream in the
         // suite runner so parameterized `invariant_*` functions are rejected with a per-test
         // failure entry before any campaign runs.
+        let config = invariant_worker_config(config, plan.worker_id, worker_count);
+        executor.inspector_mut().set_execution_cancellation(campaign_state.cancellation().clone());
 
         let (mut invariant_test, mut corpus_manager) = Self::prepare_worker(
             &mut executor,
             plan,
+            worker_count,
             &invariant_contract,
             fuzz_fixtures,
             fuzz_state,
@@ -832,7 +1130,11 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         'stop: while should_continue_invariant_worker(campaign_state, runs, plan) {
             // Per-run failure count snapshot used to gate `afterInvariant` below.
             let failures_before_run = invariant_test.test_data.failures.invariant_count();
+            let failures_checkpoint = invariant_test.test_data.failures.clone();
+            let failures_revision = failures_checkpoint.revision();
             let mut stop_after_run = false;
+            let mut run_cancelled = false;
+            let mut observed_call_entries = Vec::<(Vec<ObservedCall>, BasicTxDetails)>::new();
 
             let initial_seq = corpus_manager.new_inputs(
                 &mut invariant_test.test_data.branch_runner,
@@ -840,12 +1142,15 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 &invariant_test.targeted_contracts,
             )?;
 
+            let run_depth =
+                invariant_run_depth(&config, &mut invariant_test.test_data.branch_runner);
+
             // Create current invariant run data.
             let mut current_run = InvariantTestRun::new(
                 initial_seq[0].clone(),
                 // Before each run, we must reset the backend state.
                 executor.clone(),
-                config.depth as usize,
+                run_depth as usize,
             );
 
             // We stop the run immediately if we have reverted, and `fail_on_revert` is set.
@@ -854,14 +1159,15 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 return Err(eyre!("call reverted"));
             }
 
-            while current_run.depth < config.depth {
+            while current_run.depth < run_depth {
                 // Check if the timeout has been reached.
                 if campaign_state.should_stop() {
                     // Since we never record a revert here the test is still considered
                     // successful even though it timed out. We *want*
                     // this behavior for now, so that's ok, but
                     // future developers should be aware of this.
-                    break 'stop;
+                    run_cancelled = true;
+                    break;
                 }
 
                 // Snapshot `(target, selector)` so `can_continue` can borrow `&mut current_run`
@@ -886,8 +1192,12 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     &mut current_run.executor,
                     current_run.inputs.last().expect("checked above"),
                 )?;
+                if call_result.execution_cancelled {
+                    run_cancelled = true;
+                    break;
+                }
                 if let Some(fuzzer) = current_run.executor.inspector_mut().fuzzer.as_mut() {
-                    invariant_test.fuzz_state.collect_values(fuzzer.drain_collected_values());
+                    invariant_test.fuzz_state.collect_fuzzer_values(fuzzer);
                 }
                 // Capture per-call EVM cmp operands for I2S corpus mutation. Kept parallel
                 // to `current_run.inputs`; populated unconditionally so dropped calls (magic
@@ -903,7 +1213,10 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 }
 
                 // Collect line coverage from last fuzzed call.
-                invariant_test.merge_line_coverage(call_result.line_coverage.clone());
+                HitMaps::merge_opt(
+                    &mut current_run.line_coverage,
+                    call_result.line_coverage.take(),
+                );
                 // Snapshot the edge fingerprint before `merge_edge_coverage` zeroes the
                 // buffer. Gate on `assertion_failure` to skip keccak on plain reverts.
                 let assertion_failure =
@@ -914,8 +1227,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     None
                 };
                 // Collect edge coverage and set the flag in the current run.
-                if corpus_manager.merge_edge_coverage(&mut call_result) {
+                let new_call_coverage = corpus_manager.merge_edge_coverage(&mut call_result);
+                if new_call_coverage {
                     current_run.new_coverage = true;
+                }
+                let observed_calls = std::mem::take(&mut call_result.observed_calls);
+                if new_call_coverage && !observed_calls.is_empty() {
+                    observed_call_entries.push((
+                        observed_calls,
+                        current_run.inputs.last().expect("checked above").clone(),
+                    ));
                 }
 
                 if discarded {
@@ -953,13 +1274,14 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                             &mut state_changeset,
                             current_run.inputs.last().expect("checked above"),
                             &call_result,
-                            config.depth,
+                            run_depth,
                             mapping_slots,
                         );
                     }
 
                     // Collect created contracts and add to fuzz targets only if targeted contracts
                     // are updatable.
+                    let created_before = current_run.created_contracts.len();
                     if let Err(error) =
                         &invariant_test.targeted_contracts.collect_created_contracts(
                             &state_changeset,
@@ -971,17 +1293,19 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     {
                         warn!(target: "forge::test", "{error}");
                     }
+                    // Drop cached metric keys for newly added targets (reused address).
+                    invariant_test.invalidate_metric_key_cache(
+                        &current_run.created_contracts[created_before..],
+                    );
                     current_run
                         .fuzz_runs
                         .push(FuzzCase { gas: call_result.gas_used, stipend: call_result.stipend });
-                    campaign_state.record_call(call_result.gas_used);
-
                     // Determine if test can continue or should exit.
                     // Check invariants based on check_interval to improve deep run performance.
                     // - check_interval=0: only assert on the last call
                     // - check_interval=1 (default): assert after every call
                     // - check_interval=N: assert every N calls AND always on the last call
-                    let is_last_call = current_run.depth == config.depth - 1;
+                    let is_last_call = current_run.depth == run_depth - 1;
                     // In optimization mode, always evaluate the invariant to track
                     // the best value at every prefix — check_interval only gates
                     // boolean invariant assertions.
@@ -995,8 +1319,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                                 || is_last_call
                         };
 
-                    let errors_before_check = invariant_test.test_data.failures.invariant_count();
-                    let (continues, broken) = if should_check_invariant {
+                    let (continues, _) = if should_check_invariant {
                         let outcome = can_continue(
                             &invariant_contract,
                             &mut invariant_test,
@@ -1006,10 +1329,12 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                             &state_changeset,
                             handler_target,
                             handler_selector,
+                            assertion_failure,
                             pre_merge_edges_hash,
                         )
                         .map_err(|e| eyre!(e.to_string()))?;
-                        (outcome.continues, outcome.broken)
+                        run_cancelled = outcome.cancelled;
+                        (outcome.continues, None)
                     } else {
                         // Skip invariant check but still track reverts
                         if call_result.reverted {
@@ -1066,25 +1391,20 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         }
                     };
 
+                    // A predicate or optimization call can be interrupted after the handler
+                    // completed. Do not accept the partial run as a successful one.
+                    if run_cancelled {
+                        break;
+                    }
+
                     // Keep `cmp_seq` parallel to `inputs`: only push when the input survived the
                     // pop branch above.
                     if current_run.cmp_seq.len() < current_run.inputs.len() {
                         current_run.cmp_seq.push(call_cmp_values);
                     }
 
-                    if !continues || current_run.depth == config.depth - 1 {
-                        invariant_test.set_last_run_inputs(&current_run.inputs);
-                    }
-                    // Bridge newly-recorded predicate breaks into `failure_metrics` even when
-                    // `continues == true` in multi-predicate campaigns.
-                    if invariant_test.test_data.failures.invariant_count() > errors_before_check
-                        || broken.is_some()
-                    {
-                        record_new_invariant_failures(
-                            campaign_state,
-                            &invariant_contract,
-                            &invariant_test.test_data.failures,
-                        );
+                    if !continues || current_run.depth == run_depth - 1 {
+                        current_run.save_last_run_inputs = true;
                     }
                     if !continues {
                         if invariant_contract.invariant_fns.len() > 1 && !config.fail_on_revert {
@@ -1105,9 +1425,80 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 )?);
             }
 
-            // Extend corpus with current run data.
-            // Materialize the optimization best prefix once at run end (avoids
-            // cloning inputs on every new in-run max).
+            // Call `afterInvariant` only if declared and the current run produced no new
+            // failure. Multi-predicate campaigns keep running after earlier failures, but the
+            // hook must still execute on subsequent runs.
+            if !run_cancelled
+                && invariant_contract.call_after_invariant
+                && invariant_test.test_data.failures.invariant_count() == failures_before_run
+            {
+                let (broken, hook_cancelled) = assert_after_invariant(
+                    &invariant_contract,
+                    &mut invariant_test,
+                    &current_run,
+                    &config,
+                )
+                .map_err(|_| eyre!("Failed to call afterInvariant"))?;
+                if hook_cancelled {
+                    run_cancelled = true;
+                } else if broken.is_some() {
+                    current_run.save_last_run_inputs = true;
+                }
+            }
+
+            // The worker which requested a terminal stop for its own failure still owns a
+            // complete failing run. All other campaign stops discard the partial run before any
+            // corpus persistence or accounting.
+            if campaign_state.should_stop() && !stop_after_run {
+                run_cancelled = true;
+            }
+
+            if run_cancelled {
+                let completed_finding =
+                    invariant_test.test_data.failures.revision() != failures_revision;
+                if completed_finding {
+                    record_new_invariant_failures(
+                        campaign_state,
+                        &invariant_contract,
+                        &invariant_test.test_data.failures,
+                    );
+                    campaign_state.sync_handler_failures(&invariant_test.test_data.failures);
+                } else {
+                    invariant_test.test_data.failures.clone_from(&failures_checkpoint);
+                }
+                break 'stop;
+            }
+
+            if invariant_test.test_data.failures.invariant_count() > failures_before_run {
+                record_new_invariant_failures(
+                    campaign_state,
+                    &invariant_contract,
+                    &invariant_test.test_data.failures,
+                );
+            }
+            if invariant_test.test_data.failures.handler_count()
+                > failures_checkpoint.handler_count()
+            {
+                campaign_state.sync_handler_failures(&invariant_test.test_data.failures);
+            }
+
+            let insertion_mode = if corpus_persistence.is_deferred() {
+                CorpusInsertionMode::Deferred
+            } else {
+                CorpusInsertionMode::Live
+            };
+            for (observed_calls, parent_tx) in observed_call_entries {
+                if let Some(entry) = corpus_manager.hoist_observed_calls(
+                    &observed_calls,
+                    &parent_tx,
+                    &invariant_test.targeted_contracts,
+                    insertion_mode,
+                ) {
+                    corpus_entries.push(entry);
+                }
+            }
+
+            // Extend corpus only after the run and its optional hook have completed.
             let optimization = current_run.optimization_value.map(|v| {
                 let prefix = current_run.inputs[..current_run.optimization_prefix_len].to_vec();
                 (v, prefix)
@@ -1130,30 +1521,20 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 );
             }
 
-            // Call `afterInvariant` only if declared and the current run produced no new
-            // failure. Multi-predicate campaigns keep running after earlier failures, but the
-            // hook must still execute on subsequent runs.
-            if invariant_contract.call_after_invariant
-                && invariant_test.test_data.failures.invariant_count() == failures_before_run
-            {
-                let broken = assert_after_invariant(
-                    &invariant_contract,
-                    &mut invariant_test,
-                    &current_run,
-                    &config,
-                )
-                .map_err(|_| eyre!("Failed to call afterInvariant"))?;
-                if broken.is_some() {
-                    // Bridge breaks into pulse metrics, mirroring the in-run path above.
-                    record_new_invariant_failures(
-                        campaign_state,
-                        &invariant_contract,
-                        &invariant_test.test_data.failures,
-                    );
-                }
-            }
-
             // End current invariant test run.
+            if current_run.save_last_run_inputs {
+                invariant_test.set_last_run_inputs(&current_run.inputs);
+            }
+            if let Some(value) = current_run.optimization_value {
+                invariant_test.update_optimization_value(
+                    value,
+                    &current_run.inputs[..current_run.optimization_prefix_len],
+                );
+            }
+            invariant_test.merge_line_coverage(current_run.line_coverage.take());
+            for fuzz_run in &current_run.fuzz_runs {
+                campaign_state.record_call(fuzz_run.gas);
+            }
             current_run.drop_corpus_payloads();
             invariant_test.end_run(current_run, gas_report_samples);
             runs += 1;
@@ -1181,6 +1562,13 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                             msg.push_str(", ");
                         }
                         msg.push_str(&format!("{}", corpus_manager.metrics));
+                        match corpus_manager.time_since_new_edge() {
+                            Some(elapsed) => msg.push_str(&format!(
+                                "\n        - time since new edge: {:.1}s",
+                                elapsed.as_secs_f64()
+                            )),
+                            None => msg.push_str("\n        - time since new edge: never"),
+                        }
                     }
                     if broken > 0 {
                         if !msg.is_empty() {
@@ -1218,6 +1606,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         elapsed: campaign_state.elapsed(),
                         worker_id: plan.worker_id,
                         worker_count,
+                        time_since_new_edge: corpus_manager.time_since_new_edge(),
                     },
                     &corpus_manager.metrics,
                     &failure_metrics,
@@ -1233,6 +1622,8 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         trace!(?fuzz_fixtures);
         invariant_test.fuzz_state.log_stats();
 
+        // Campaign-local terminal stops and deadlines must not suppress post-campaign shrinking.
+        executor.inspector_mut().set_early_exit(campaign_state.early_exit().clone());
         Self::shrink_handler_failures(
             &config,
             &executor,
@@ -1294,18 +1685,20 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             let Some(failure) = error.as_handler_assertion_mut() else {
                 continue;
             };
-            shrink::reset_shrink_progress(
+            let shrink_progress = shrink::ShrinkProgress::new(
                 config,
                 progress,
                 &format!("handler {:#x}::{}", failure.reverter, failure.selector),
                 Some((idx + 1, total)),
+                None,
+                false,
             );
             match shrink::shrink_handler_sequence(
                 config,
                 &failure.call_sequence,
                 failure.edge_fingerprint,
                 executor,
-                progress,
+                &shrink_progress,
                 early_exit,
             ) {
                 Ok(shrunk) if !shrunk.is_empty() => {
@@ -1345,6 +1738,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
     fn prepare_worker(
         executor: &mut Executor<FEN>,
         plan: InvariantWorkerPlan,
+        worker_count: usize,
         invariant_contract: &InvariantContract<'_>,
         fuzz_fixtures: &FuzzFixtures,
         fuzz_state: EvmFuzzState,
@@ -1358,6 +1752,11 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             campaign_seed.targeted_contracts.clone(),
             campaign_seed.targets_are_updatable,
         );
+        executor.inspector_mut().collect_evm_cmp_log(invariant_worker_collects_evm_cmp_log(
+            config,
+            plan.worker_id,
+            worker_count,
+        ));
 
         // Creates the invariant strategy.
         let strategy = invariant_strat(
@@ -1380,13 +1779,10 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         // Set up fuzzer WITHOUT call_generator initially.
         // We defer call_override until after the initial invariant check to avoid
         // injecting random calls during setup which would break the invariant assertion.
-        executor.inspector_mut().set_fuzzer(Fuzzer {
-            call_generator: None,
-            collected_values: Vec::new(),
-            max_collected_values: config.dictionary.max_fuzz_dictionary_values,
-            mapping_slots,
-            collect: true,
-        });
+        executor.inspector_mut().set_fuzzer(
+            Fuzzer::new(config.dictionary.max_fuzz_dictionary_values, mapping_slots)
+                .with_call_recording(config.corpus.is_coverage_guided()),
+        );
 
         // Let's make sure the invariant is sound before actually starting the run:
         // We'll assert the invariant in its initial state, and if it fails, we'll
@@ -1406,11 +1802,25 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             &mut failures,
         )?;
         if let Some(fuzzer) = executor.inspector_mut().fuzzer.as_mut() {
-            fuzz_state.collect_values(fuzzer.drain_collected_values());
+            fuzz_state.collect_fuzzer_values(fuzzer);
+            let _ = fuzzer.take_observed_calls();
         }
-        // NOW enable call_override after the initial invariant check has passed.
-        // This allows `override_call_strat` to inject calls during actual fuzz runs
-        // for reentrancy vulnerability detection.
+        let mut worker = WorkerCorpus::from_seed(
+            plan.worker_id as usize,
+            config.corpus.clone(),
+            strategy.boxed(),
+            corpus_seed,
+        )?;
+
+        if let Err(err) =
+            worker.seed_from_test_traces(invariant_contract, &targeted_contracts, executor)
+        {
+            debug!(target: "corpus", %err, "failed to seed corpus from test traces");
+        }
+
+        // NOW enable call_override after the initial invariant check and corpus trace seeding have
+        // passed. This allows `override_call_strat` to inject calls during actual fuzz runs for
+        // reentrancy vulnerability detection.
         if config.call_override {
             let target_contract_ref = Arc::new(RwLock::new(Address::ZERO));
 
@@ -1436,6 +1846,8 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                     override_targets,
                     target_contract_ref.clone(),
                     fuzz_fixtures.clone(),
+                    config.dictionary.dictionary_weight,
+                    config.corpus.payable_value_weight,
                 ),
                 target_contract_ref,
             );
@@ -1444,13 +1856,6 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 fuzzer.call_generator = Some(call_generator);
             }
         }
-
-        let worker = WorkerCorpus::from_seed(
-            plan.worker_id as usize,
-            config.corpus.clone(),
-            strategy.boxed(),
-            corpus_seed,
-        );
 
         let mut invariant_test =
             InvariantTest::new(fuzz_state, targeted_contracts, failures, runner.clone());
@@ -1623,6 +2028,9 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
         if contracts.is_empty() {
             eyre::bail!("No contracts to fuzz.");
         }
+        if contracts.fuzzed_functions().next().is_none() {
+            eyre::bail!("No functions to fuzz.");
+        }
 
         Ok((sender_filters, FuzzRunIdentifiedContracts::new(contracts, selected.is_empty())))
     }
@@ -1666,6 +2074,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                         .and_modify(|entry| {
                             // Extend the ABI's function list with the new functions.
                             entry.abi.functions.extend(abi.functions.clone());
+                            entry.rebuild_function_lookups();
                         })
                         // Otherwise insert it into the map.
                         .or_insert_with(|| {
@@ -1808,17 +2217,17 @@ fn collect_data<FEN: FoundryEvmNetwork>(
     run_depth: u32,
     mapping_slots: Option<&AddressMap<foundry_common::mapping_slots::MappingSlots>>,
 ) {
-    // Verify it has no code.
-    let has_code = if let Some(Some(code)) =
-        state_changeset.get(&tx.sender).map(|account| account.info.code.as_ref())
-    {
-        !code.is_empty()
-    } else {
-        false
-    };
-
     // We keep the nonce changes to apply later.
-    let sender_changeset = if has_code { None } else { state_changeset.remove(&tx.sender) };
+    let sender_changeset = match state_changeset.entry(tx.sender) {
+        AddressMapEntry::Occupied(entry) => entry
+            .get()
+            .info
+            .code
+            .as_ref()
+            .is_none_or(|code| code.is_empty())
+            .then(|| entry.remove()),
+        AddressMapEntry::Vacant(_) => None,
+    };
 
     // Collect values from fuzzed call result and add them to fuzz dictionary.
     invariant_test.fuzz_state.collect_values_from_call(
@@ -1876,9 +2285,14 @@ pub(crate) fn call_invariant_function<FEN: FoundryEvmNetwork>(
     Ok((call_result, success))
 }
 
-/// Executes a fuzz call and returns the result.
+/// Executes an invariant replay fuzz call and returns the result.
+///
+/// This applies invariant replay semantics: warp/roll deltas are applied before the call and the
+/// requested value is clamped to the sender balance. It is intended for invariant sequence replay,
+/// shrinking, and artifact validation rather than as a general raw-call helper.
+///
 /// Applies any block timestamp (warp) and block number (roll) adjustments before the call.
-pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
+pub fn execute_tx<FEN: FoundryEvmNetwork>(
     executor: &mut Executor<FEN>,
     tx: &BasicTxDetails,
 ) -> Result<RawCallResult<FEN>> {
@@ -1886,16 +2300,25 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
     let roll = tx.roll.unwrap_or_default();
 
     if warp > 0 || roll > 0 {
+        let needs_cheatcode_block = executor
+            .inspector()
+            .cheatcodes
+            .as_ref()
+            .is_some_and(|cheatcodes| cheatcodes.block.is_none());
+
         // Apply pre-call block adjustments to the executor's env.
-        let ts = executor.evm_env().block_env.timestamp();
-        let num = executor.evm_env().block_env.number();
-        executor.evm_env_mut().block_env.set_timestamp(ts + warp);
-        executor.evm_env_mut().block_env.set_number(num + roll);
+        let block_env = {
+            let block_env = &mut executor.evm_env_mut().block_env;
+            let ts = block_env.timestamp();
+            let num = block_env.number();
+            block_env.set_timestamp(ts + warp);
+            block_env.set_number(num + roll);
+            needs_cheatcode_block.then(|| block_env.clone())
+        };
 
         // Also update the inspector's cheatcodes.block if set.
         // The inspector's block may override the env during interpreter initialization,
         // so we need to add our warp/roll on top of any existing cheatcode-set values.
-        let block_env = executor.evm_env().block_env.clone();
         if let Some(cheatcodes) = executor.inspector_mut().cheatcodes.as_mut() {
             if let Some(block) = cheatcodes.block.as_mut() {
                 let bts = block.timestamp();
@@ -1903,26 +2326,65 @@ pub(crate) fn execute_tx<FEN: FoundryEvmNetwork>(
                 block.set_timestamp(bts + warp);
                 block.set_number(bnum + roll);
             } else {
-                cheatcodes.block = Some(block_env);
+                cheatcodes.block = Some(block_env.unwrap());
             }
         }
     }
 
     // Bound requested value by sender's available balance so payable paths still get
     // exercised when the requested value exceeds balance, instead of collapsing to zero.
-    let requested_value = tx.call_details.value.unwrap_or(U256::ZERO);
-    let sender_balance = executor.get_balance(tx.sender)?;
-    let value = requested_value.min(sender_balance);
+    let value = match tx.call_details.value {
+        Some(requested_value) if !requested_value.is_zero() => {
+            requested_value.min(executor.get_balance(tx.sender)?)
+        }
+        _ => U256::ZERO,
+    };
     executor
         .call_raw(tx.sender, tx.call_details.target, tx.call_details.calldata.clone(), value)
         .map_err(|e| eyre!(format!("Could not make raw evm call: {e}")))
 }
 
+/// Executes an invariant replay call on a validation executor and registers created targets.
+///
+/// This mirrors sequence replay's non-reverted commit behavior while allowing callers to update
+/// updatable target sets before validating later calls in the same artifact.
+pub fn execute_tx_and_register_created<FEN: FoundryEvmNetwork>(
+    executor: &mut Executor<FEN>,
+    tx: &BasicTxDetails,
+    targeted_contracts: &FuzzRunIdentifiedContracts,
+    dynamic_target_ctx: &DynamicTargetCtx<'_>,
+    created_contracts: &mut Vec<Address>,
+) -> Result<()> {
+    let mut call_result = execute_tx(executor, tx)?;
+    if !call_result.reverted {
+        targeted_contracts.collect_created_contracts(
+            &call_result.state_changeset,
+            dynamic_target_ctx.project_contracts,
+            dynamic_target_ctx.setup_contracts,
+            dynamic_target_ctx.artifact_filters,
+            created_contracts,
+        )?;
+        executor.commit(&mut call_result);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executors::ExecutorBuilder;
+    use foundry_config::FuzzDictionaryConfig;
+    use foundry_evm_core::{
+        backend::Backend,
+        evm::{EthEvmNetwork, EvmEnvFor, TxEnvFor},
+    };
     use proptest::{prelude::any, strategy::ValueTree, test_runner::Config};
+    use revm::{
+        bytecode::Bytecode,
+        database::{CacheDB, EmptyDB},
+    };
     use serde_json::json;
+    use std::{sync::mpsc, thread};
 
     fn first_generated_u64(runner: &mut TestRunner) -> u64 {
         any::<u64>().new_tree(runner).unwrap().current()
@@ -1976,6 +2438,31 @@ mod tests {
     }
 
     #[test]
+    fn invariant_focus_seed_preserves_configured_seed() {
+        let configured_seed = U256::from(0x1234);
+        let mut parent = test_runner();
+
+        assert_eq!(
+            invariant_focus_seed(&mut parent, Some(configured_seed), 2),
+            Some(configured_seed)
+        );
+        assert_eq!(invariant_focus_seed(&mut parent, Some(configured_seed), 1), None);
+    }
+
+    #[test]
+    fn invariant_focus_seed_uses_parent_rng_when_unconfigured() {
+        let mut parent = seeded_test_runner(U256::from(1));
+        let mut matching_parent = seeded_test_runner(U256::from(1));
+        let mut different_parent = seeded_test_runner(U256::from(2));
+
+        let focus_seed = invariant_focus_seed(&mut parent, None, 2).unwrap();
+
+        assert_eq!(focus_seed, invariant_focus_seed(&mut matching_parent, None, 2).unwrap());
+        assert_ne!(focus_seed, invariant_focus_seed(&mut different_parent, None, 2).unwrap());
+        assert_eq!(invariant_focus_seed(&mut parent, None, 1), None);
+    }
+
+    #[test]
     fn invariant_progress_json_includes_throughput_fields() {
         let throughput = InvariantThroughputMetrics { total_txs: 2, total_gas: 50 };
 
@@ -1988,6 +2475,7 @@ mod tests {
                 elapsed: Duration::from_secs(10),
                 worker_id: 1,
                 worker_count: 4,
+                time_since_new_edge: Some(Duration::from_secs(3)),
             },
             &json!({ "corpus_count": 7 }),
             &InvariantFailureMetrics::default(),
@@ -2038,6 +2526,125 @@ mod tests {
             2
         );
         assert_eq!(max_invariant_workers_for_campaign(256, 100_000), 5);
+    }
+
+    #[test]
+    fn invariant_run_depth_random_min_depth_zero_never_returns_zero() {
+        let mut runner = test_runner();
+        let config = InvariantConfig {
+            depth: 8,
+            min_depth: 0,
+            depth_mode: InvariantDepthMode::Random,
+            ..Default::default()
+        };
+
+        for _ in 0..128 {
+            assert!((1..=8).contains(&invariant_run_depth(&config, &mut runner)));
+        }
+    }
+
+    #[test]
+    fn invariant_run_depth_fixed_zero_preserves_zero() {
+        let mut runner = test_runner();
+        let config = InvariantConfig {
+            depth: 0,
+            depth_mode: InvariantDepthMode::Fixed,
+            ..Default::default()
+        };
+
+        assert_eq!(invariant_run_depth(&config, &mut runner), 0);
+    }
+
+    #[test]
+    fn invariant_worker_config_keeps_single_worker_default() {
+        let config = InvariantConfig::default();
+
+        assert_eq!(
+            invariant_worker_config(config, 0, 1).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+    }
+
+    #[test]
+    fn invariant_worker_config_uses_one_exploratory_worker_with_default_config() {
+        let config = InvariantConfig::default();
+
+        assert_eq!(
+            invariant_worker_config(config.clone(), 0, 4).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+        assert_eq!(
+            invariant_worker_config(config.clone(), 1, 4).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+        assert_eq!(
+            invariant_worker_config(config.clone(), 2, 4).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+        assert_eq!(
+            invariant_worker_config(config, 3, 4).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::ENSEMBLE_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+    }
+
+    #[test]
+    fn invariant_worker_config_keeps_two_worker_campaign_on_default() {
+        let config = InvariantConfig::default();
+
+        assert_eq!(
+            invariant_worker_config(config.clone(), 0, 2).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+        assert_eq!(
+            invariant_worker_config(config, 1, 2).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+    }
+
+    #[test]
+    fn invariant_worker_config_uses_last_worker_for_three_worker_campaign() {
+        let config = InvariantConfig::default();
+
+        assert_eq!(
+            invariant_worker_config(config.clone(), 0, 3).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+        assert_eq!(
+            invariant_worker_config(config.clone(), 1, 3).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+        assert_eq!(
+            invariant_worker_config(config, 2, 3).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::ENSEMBLE_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
+    }
+
+    #[test]
+    fn invariant_worker_config_preserves_explicit_corpus_random_sequence_weight() {
+        let config = InvariantConfig {
+            corpus: FuzzCorpusConfig {
+                corpus_random_sequence_weight: 25,
+                ..FuzzCorpusConfig::default()
+            },
+            corpus_random_sequence_weight_configured: true,
+            ..InvariantConfig::default()
+        };
+
+        assert_eq!(
+            invariant_worker_config(config.clone(), 1, 4).corpus.corpus_random_sequence_weight,
+            25
+        );
+        assert_eq!(invariant_worker_config(config, 0, 1).corpus.corpus_random_sequence_weight, 25);
+
+        let config = InvariantConfig {
+            corpus_random_sequence_weight_configured: true,
+            ..InvariantConfig::default()
+        };
+
+        assert_eq!(
+            invariant_worker_config(config, 1, 4).corpus.corpus_random_sequence_weight,
+            FuzzCorpusConfig::DEFAULT_CORPUS_RANDOM_SEQUENCE_WEIGHT
+        );
     }
 
     #[test]
@@ -2104,6 +2711,328 @@ mod tests {
         assert_eq!(invariant_worker_count_with_threads(&config, 8, 2), 4);
     }
 
+    fn function(signature: &str) -> Function {
+        Function::parse(signature).unwrap()
+    }
+
+    fn targeted_contract(identifier: &str, functions: Vec<Function>) -> TargetedContract {
+        let mut abi = alloy_json_abi::JsonAbi::new();
+        for function in functions {
+            abi.functions.entry(function.name.clone()).or_default().push(function);
+        }
+        TargetedContract::new(identifier.to_string(), abi)
+    }
+
+    #[test]
+    fn campaign_terminal_stop_interrupts_handler_without_accepting_run() {
+        const GAS_LIMIT: u64 = 1 << 24;
+        let invariant_address = Address::repeat_byte(0x11);
+        let handler_address = Address::repeat_byte(0x22);
+        let backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        let mut executor = ExecutorBuilder::default().gas_limit(GAS_LIMIT).build(
+            EvmEnvFor::<EthEvmNetwork>::default(),
+            TxEnvFor::<EthEvmNetwork>::default(),
+            backend,
+        );
+        // Return ABI-encoded `true` for the invariant predicate.
+        executor
+            .set_code(
+                invariant_address,
+                Bytecode::new_raw(Bytes::from_static(&[
+                    0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+                ])),
+            )
+            .unwrap();
+        // JUMPDEST; PUSH1 0; JUMP loops until the campaign stop reaches the inspector.
+        executor
+            .set_code(
+                handler_address,
+                Bytecode::new_raw(Bytes::from_static(&[0x5b, 0x60, 0x00, 0x56])),
+            )
+            .unwrap();
+
+        let (handler_entered_tx, handler_entered_rx) = mpsc::channel();
+        let (handler_release_tx, handler_release_rx) = mpsc::channel();
+        executor.inspector_mut().set_early_exit_test_gate(
+            handler_entered_tx,
+            handler_release_rx,
+            0,
+        );
+
+        let invariant = function("invariant_ok() view returns (bool)");
+        let mut invariant_abi = alloy_json_abi::JsonAbi::new();
+        invariant_abi.functions.entry(invariant.name.clone()).or_default().push(invariant.clone());
+        let invariant_contract = InvariantContract::new(
+            invariant_address,
+            "InvariantTest",
+            vec![(&invariant, false)],
+            0,
+            false,
+            &invariant_abi,
+        );
+
+        let handler = function("loopForever()");
+        let mut handler_contract = targeted_contract("Handler", vec![handler.clone()]);
+        handler_contract.targeted_functions = vec![handler];
+        let mut targeted_contracts = TargetedContracts::new();
+        targeted_contracts.insert(handler_address, handler_contract);
+        let campaign_seed = InvariantCampaignSeed {
+            artifact_filters: ArtifactFilters::default(),
+            sender_filters: SenderFilters::new(vec![CALLER], Vec::new()),
+            targeted_contracts,
+            targets_are_updatable: false,
+            initial_handler_failures: Map::default(),
+        };
+
+        let config =
+            InvariantConfig { runs: 1, depth: 1, show_metrics: false, ..Default::default() };
+        let campaign_state = InvariantCampaignState::new(EarlyExit::new(false), None);
+        let fuzz_state = EvmFuzzState::new(
+            &[],
+            &CacheDB::<EmptyDB>::default(),
+            FuzzDictionaryConfig::default(),
+            None,
+        );
+        let setup_contracts = ContractsByAddress::default();
+        let project_contracts = ContractsByArtifact::default();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let (handler_entered, result) = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let result = InvariantExecutor::<EthEvmNetwork>::run_invariant_worker(
+                    executor,
+                    test_runner(),
+                    config,
+                    &setup_contracts,
+                    &project_contracts,
+                    InvariantWorkerPlan { worker_id: 0, first_global_run: 0, runs: 1 },
+                    invariant_contract,
+                    &FuzzFixtures::default(),
+                    fuzz_state,
+                    None,
+                    &campaign_state,
+                    campaign_seed,
+                    WorkerCorpusSeed::default(),
+                    InvariantCorpusPersistence::Live,
+                    1,
+                    1,
+                );
+                let _ = result_tx.send(result);
+            });
+
+            let handler_entered = handler_entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+            campaign_state.request_terminal_stop();
+            let _ = handler_release_tx.send(());
+
+            let result = result_rx.recv_timeout(Duration::from_secs(1));
+            handle.join().unwrap();
+            (handler_entered, result)
+        });
+        assert!(handler_entered, "invariant handler did not begin EVM execution");
+        let output = result.expect("invariant campaign did not observe early exit").unwrap();
+        assert_eq!(output.result.runs, 0);
+        assert_eq!(output.result.calls, 0);
+        assert_eq!(campaign_state.total_runs(), 0);
+        assert_eq!(campaign_state.throughput_totals(), (0, 0));
+        assert!(output.result.errors.is_empty());
+        assert!(output.result.handler_errors.is_empty());
+        assert!(output.result.last_run_inputs.is_empty());
+        assert!(output.result.line_coverage.is_none());
+        assert!(output.result.metrics.is_empty());
+        assert!(output.result.optimization_best_value.is_none());
+        assert!(output.corpus_entries.is_empty());
+    }
+
+    #[test]
+    fn invariant_focus_workers_stay_before_exploratory_tail_worker() {
+        assert_eq!(invariant_focus_worker_count(1), 0);
+        assert_eq!(invariant_focus_worker_count(2), 1);
+        assert_eq!(invariant_focus_worker_count(4), 1);
+        assert_eq!(invariant_focus_worker_count(8), 1);
+        assert_eq!(invariant_focus_worker_count(16), 2);
+
+        assert_eq!(invariant_focus_worker_index(0, 1), None);
+        assert_eq!(invariant_focus_worker_index(1, 2), Some(0));
+        assert_eq!(invariant_focus_worker_index(0, 4), None);
+        assert_eq!(invariant_focus_worker_index(2, 4), Some(0));
+        assert_eq!(invariant_focus_worker_index(3, 4), None);
+        assert_eq!(invariant_focus_worker_index(13, 16), Some(0));
+        assert_eq!(invariant_focus_worker_index(14, 16), Some(1));
+        assert_eq!(invariant_focus_worker_index(15, 16), None);
+        assert_eq!(invariant_focus_worker_index(16, 16), None);
+    }
+
+    #[test]
+    fn invariant_focus_narrows_to_one_effective_selector() {
+        let target = Address::from([0x11; 20]);
+        let first = function("first(uint256)");
+        let second = function("second(uint256)");
+        let second_selector = second.selector();
+        let mut contract = targeted_contract("Target", vec![first.clone(), second.clone()]);
+        contract.targeted_functions = vec![first, second];
+
+        let mut targets = TargetedContracts::new();
+        targets.insert(target, contract);
+
+        let focused = focused_targeted_contracts(&targets, 1, None).unwrap();
+        let focused_functions = focused[&target].abi_fuzzed_functions().collect::<Vec<_>>();
+
+        assert_eq!(focused.len(), 1);
+        assert_eq!(focused_functions.len(), 1);
+        assert_eq!(focused_functions[0].selector(), second_selector);
+    }
+
+    #[test]
+    fn invariant_focus_seed_rotates_effective_selector() {
+        let target = Address::from([0x55; 20]);
+        let first = function("first(uint256)");
+        let second = function("second(uint256)");
+        let third = function("third(uint256)");
+        let third_selector = third.selector();
+        let mut contract =
+            targeted_contract("Target", vec![first.clone(), second.clone(), third.clone()]);
+        contract.targeted_functions = vec![first, second, third];
+
+        let mut targets = TargetedContracts::new();
+        targets.insert(target, contract);
+
+        let focused = focused_targeted_contracts(&targets, 0, Some(U256::from(2))).unwrap();
+        let focused_functions = focused[&target].abi_fuzzed_functions().collect::<Vec<_>>();
+
+        assert_eq!(focused_functions.len(), 1);
+        assert_eq!(focused_functions[0].selector(), third_selector);
+    }
+
+    #[test]
+    fn invariant_focus_freezes_dynamic_target_updates() {
+        let target = Address::from([0x44; 20]);
+        let first = function("first(uint256)");
+        let second = function("second(uint256)");
+        let mut contract = targeted_contract("Target", vec![first.clone(), second.clone()]);
+        contract.targeted_functions = vec![first, second];
+
+        let mut targeted_contracts = TargetedContracts::new();
+        targeted_contracts.insert(target, contract);
+        let campaign_seed = InvariantCampaignSeed {
+            artifact_filters: ArtifactFilters::default(),
+            sender_filters: SenderFilters::default(),
+            targeted_contracts,
+            targets_are_updatable: true,
+            initial_handler_failures: Map::default(),
+        };
+
+        let normal_worker = campaign_seed_for_worker(
+            &campaign_seed,
+            InvariantWorkerPlan { worker_id: 0, first_global_run: 0, runs: 1 },
+            2,
+        );
+        let focus_worker = campaign_seed_for_worker(
+            &campaign_seed,
+            InvariantWorkerPlan { worker_id: 1, first_global_run: 1, runs: 1 },
+            2,
+        );
+
+        assert!(normal_worker.targets_are_updatable);
+        assert!(!focus_worker.targets_are_updatable);
+    }
+
+    #[test]
+    fn invariant_focus_does_not_widen_target_selectors() {
+        let target = Address::from([0x22; 20]);
+        let allowed = function("allowed(uint256)");
+        let hidden = function("hidden(uint256)");
+        let mut contract = targeted_contract("Target", vec![allowed.clone(), hidden]);
+        contract.targeted_functions = vec![allowed];
+
+        let mut targets = TargetedContracts::new();
+        targets.insert(target, contract);
+
+        assert!(focused_targeted_contracts(&targets, 0, None).is_none());
+    }
+
+    #[test]
+    fn invariant_focus_skips_excluded_selectors() {
+        let target = Address::from([0x33; 20]);
+        let first = function("aaa(uint256)");
+        let second = function("bbb(uint256)");
+        let excluded = function("ccc(uint256)");
+        let excluded_selector = excluded.selector();
+        let mut contract = targeted_contract("Target", vec![first, second, excluded.clone()]);
+        contract.excluded_functions = vec![excluded];
+
+        let mut targets = TargetedContracts::new();
+        targets.insert(target, contract);
+
+        let focused = focused_targeted_contracts(&targets, 3, None).unwrap();
+        let focused_functions = focused[&target].abi_fuzzed_functions().collect::<Vec<_>>();
+
+        assert_eq!(focused_functions.len(), 1);
+        assert_ne!(focused_functions[0].selector(), excluded_selector);
+    }
+
+    #[test]
+    fn invariant_focus_skips_excluded_targeted_selectors() {
+        let target = Address::from([0x66; 20]);
+        let first = function("aaa(uint256)");
+        let second = function("bbb(uint256)");
+        let excluded = function("ccc(uint256)");
+        let excluded_selector = excluded.selector();
+        let mut contract =
+            targeted_contract("Target", vec![first.clone(), second.clone(), excluded.clone()]);
+        contract.targeted_functions = vec![first, second, excluded.clone()];
+        contract.excluded_functions = vec![excluded];
+
+        let mut targets = TargetedContracts::new();
+        targets.insert(target, contract);
+
+        let focused = focused_targeted_contracts(&targets, 2, None).unwrap();
+        let focused_functions = focused[&target].abi_fuzzed_functions().collect::<Vec<_>>();
+
+        assert_eq!(focused_functions.len(), 1);
+        assert_ne!(focused_functions[0].selector(), excluded_selector);
+    }
+
+    #[test]
+    fn invariant_worker_cmp_log_selection_uses_one_worker_per_campaign() {
+        use foundry_config::FuzzCorpusMutationWeights;
+
+        let mut config = InvariantConfig::default();
+        assert!(!invariant_worker_collects_evm_cmp_log(&config, 0, 1));
+
+        config.corpus.corpus_dir = Some("corpus".into());
+        assert!(invariant_worker_collects_evm_cmp_log(&config, 0, 1));
+        assert!(invariant_worker_collects_evm_cmp_log(&config, 0, 4));
+        assert!(!invariant_worker_collects_evm_cmp_log(&config, 1, 4));
+        assert!(!invariant_worker_collects_evm_cmp_log(&config, 3, 4));
+
+        config.corpus.mutation_weights = FuzzCorpusMutationWeights {
+            mutation_weight_splice: 1,
+            mutation_weight_repeat: 1,
+            mutation_weight_interleave: 1,
+            mutation_weight_prefix: 1,
+            mutation_weight_suffix: 1,
+            mutation_weight_abi: 1,
+            mutation_weight_cmp: 0,
+        };
+        assert!(!invariant_worker_collects_evm_cmp_log(&config, 0, 1));
+
+        // All-zero configured weights resolve to the default mutation distribution.
+        config.corpus.mutation_weights = FuzzCorpusMutationWeights {
+            mutation_weight_splice: 0,
+            mutation_weight_repeat: 0,
+            mutation_weight_interleave: 0,
+            mutation_weight_prefix: 0,
+            mutation_weight_suffix: 0,
+            mutation_weight_abi: 0,
+            mutation_weight_cmp: 0,
+        };
+        assert!(invariant_worker_collects_evm_cmp_log(&config, 0, 1));
+
+        config.corpus.sancov_edges = true;
+        assert!(!invariant_worker_collects_evm_cmp_log(&config, 0, 1));
+        assert!(!invariant_worker_collects_evm_cmp_log(&config, 0, 4));
+    }
+
     #[test]
     fn timed_invariant_workers_are_not_bounded_by_assigned_runs() {
         let plan = InvariantWorkerPlan { worker_id: 0, first_global_run: 0, runs: 1 };
@@ -2143,6 +3072,7 @@ mod tests {
                 elapsed: Duration::ZERO,
                 worker_id: 0,
                 worker_count: 1,
+                time_since_new_edge: None,
             },
             &json!({ "corpus_count": 1 }),
             &InvariantFailureMetrics::default(),
@@ -2151,6 +3081,29 @@ mod tests {
         assert_eq!(payload["tps"], json!(0.0));
         assert_eq!(payload["gps"], json!(0.0));
         assert!(payload.get("optimization_best").is_none());
+        // No edge seen yet -> `null`.
+        assert_eq!(payload["worker"]["secs_since_new_edge"], json!(null));
+    }
+
+    #[test]
+    fn invariant_progress_json_reports_secs_since_new_edge() {
+        let payload = build_invariant_progress_json(
+            InvariantProgressContext {
+                timestamp_secs: 1,
+                contract_name: "TestContract",
+                optimization_best: None,
+                throughput: InvariantThroughputMetrics::default(),
+                elapsed: Duration::from_secs(1),
+                worker_id: 2,
+                worker_count: 4,
+                time_since_new_edge: Some(Duration::from_millis(1500)),
+            },
+            &json!({ "corpus_count": 1 }),
+            &InvariantFailureMetrics::default(),
+        );
+
+        assert_eq!(payload["worker"]["id"], json!(2));
+        assert_eq!(payload["worker"]["secs_since_new_edge"], json!(1.5));
     }
 
     #[test]
@@ -2164,6 +3117,7 @@ mod tests {
                 elapsed: Duration::from_secs(3),
                 worker_id: 0,
                 worker_count: 1,
+                time_since_new_edge: None,
             },
             &json!({ "corpus_count": 1 }),
             &InvariantFailureMetrics::default(),
@@ -2190,6 +3144,7 @@ mod tests {
                 elapsed: Duration::from_secs(1),
                 worker_id: 0,
                 worker_count: 1,
+                time_since_new_edge: None,
             },
             &json!({ "corpus_count": 5 }),
             &failure_metrics,
@@ -2200,6 +3155,24 @@ mod tests {
         assert_eq!(payload["metrics"]["broken_invariants"], json!(2));
         assert_eq!(payload["metrics"]["broken_assertions"], json!(7));
         assert!(payload["metrics"].get("broken_handlers").is_none());
+    }
+
+    #[test]
+    fn handler_assertion_failure_event_includes_site_and_reason() {
+        let target = Address::repeat_byte(0x11);
+        let selector = Selector::from([0xde, 0xad, 0xbe, 0xef]);
+
+        assert_eq!(
+            build_handler_failure_event(123, target, selector, "assertion failed"),
+            json!({
+                "timestamp": 123,
+                "event": "failure",
+                "failure_type": "handler_assertion",
+                "target": target,
+                "selector": "0xdeadbeef",
+                "reason": "assertion failed",
+            })
+        );
     }
 
     #[test]
