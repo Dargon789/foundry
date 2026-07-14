@@ -6926,6 +6926,26 @@
     },
     {
       "func": {
+        "id": "isIsolateMode",
+        "description": "Returns true if isolated test execution is enabled.",
+        "declaration": "function isIsolateMode() external view returns (bool result);",
+        "visibility": "external",
+        "mutability": "view",
+        "signature": "isIsolateMode()",
+        "selector": "0x17a5dbab",
+        "selectorBytes": [
+          23,
+          165,
+          219,
+          171
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "isPersistent",
         "description": "Returns true if the account is marked as persistent.",
         "declaration": "function isPersistent(address account) external view returns (bool persistent);",
@@ -7342,6 +7362,26 @@
           179,
           106,
           61
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "mockCall_4",
+        "description": "Mocks a call to an address, returning specified data.\nCalldata can either be strict or a partial match, e.g. if you only\npass a Solidity selector to the expected calldata, then the entire Solidity\nfunction will be mocked.\nOverload to control whether code is injected into `callee`. The other overloads etch a\nsingle byte into an empty account to circumvent Solidity's `extcodesize` check, with the\nside effect that unmocked calls to it no longer revert; `injectCode = false` leaves the\naccount codeless, so unmocked calls to it revert in the caller. Mocked calls that return\ndata still succeed, as Solidity checks `returndatasize()` instead of `extcodesize()` when\nreturn data is expected, but mocked calls to functions without return values may still\nrevert in the caller due to the `extcodesize` check.",
+        "declaration": "function mockCall(address callee, bytes calldata data, bytes calldata returnData, bool injectCode) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "mockCall(address,bytes,bytes,bool)",
+        "selector": "0xb4bc5617",
+        "selectorBytes": [
+          180,
+          188,
+          86,
+          23
         ]
       },
       "group": "evm",

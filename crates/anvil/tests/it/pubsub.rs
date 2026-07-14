@@ -11,6 +11,7 @@ use alloy_rpc_types::{
 use alloy_serde::WithOtherFields;
 use alloy_sol_types::sol;
 use anvil::{NodeConfig, spawn};
+use anvil_core::types::{ReorgOptions, TransactionData};
 use foundry_primitives::FoundryTxReceipt;
 use futures::StreamExt;
 use std::time::Duration;
@@ -159,6 +160,73 @@ async fn test_sub_logs_impersonated() {
     assert_eq!(receipt.inner.inner.logs()[0], log);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sub_logs_reorg_removed() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let wallet = handle.dev_wallets().next().unwrap();
+    let provider =
+        connect_pubsub_with_wallet(&handle.ws_endpoint(), EthereumWallet::from(wallet.clone()))
+            .await;
+
+    let contract = EmitLogs::deploy(provider.clone(), "initial".to_string()).await.unwrap();
+
+    // subscribe to events from the contract
+    let filter = Filter::new().address(*contract.address());
+    let logs_sub = provider.subscribe_logs(&filter).await.unwrap();
+    let mut logs_sub = logs_sub.into_stream();
+
+    // emit events in two consecutive blocks
+    contract.setValue("first".to_string()).send().await.unwrap().get_receipt().await.unwrap();
+    contract.setValue("second".to_string()).send().await.unwrap().get_receipt().await.unwrap();
+
+    let first_log = logs_sub.next().await.unwrap();
+    let second_log = logs_sub.next().await.unwrap();
+    assert!(!first_log.removed);
+    assert!(!second_log.removed);
+
+    // reorg out both blocks and replace the first one with a block that emits another event
+    let data = contract.setValue("reorged".to_string()).calldata().clone();
+    let tx = TransactionRequest::default()
+        .from(wallet.address())
+        .to(*contract.address())
+        .with_input(data);
+    api.anvil_reorg(ReorgOptions {
+        depth: 2,
+        tx_block_pairs: vec![(TransactionData::JSON(tx), 0)],
+    })
+    .await
+    .unwrap();
+
+    // the logs of the reorged out blocks are delivered again, marked as removed
+    let mut expected = first_log.clone();
+    expected.removed = true;
+    assert_eq!(logs_sub.next().await.unwrap(), expected);
+
+    let mut expected = second_log.clone();
+    expected.removed = true;
+    assert_eq!(logs_sub.next().await.unwrap(), expected);
+
+    // followed by the logs of the new chain
+    let new_log = logs_sub.next().await.unwrap();
+    assert!(!new_log.removed);
+    assert_eq!(new_log.block_number, first_log.block_number);
+    assert_ne!(new_log.block_hash, first_log.block_hash);
+    let value_changed = new_log.log_decode::<EmitLogs::ValueChanged>().unwrap();
+    assert_eq!(value_changed.inner.newValue, "reorged");
+
+    // eth_getLogs only returns the logs of the new canonical chain
+    let canonical_logs = provider
+        .get_logs(&Filter::new().address(*contract.address()).from_block(0u64))
+        .await
+        .unwrap();
+    assert!(canonical_logs.iter().all(|log| !log.removed));
+    let tx_hashes =
+        canonical_logs.iter().map(|log| log.transaction_hash.unwrap()).collect::<Vec<_>>();
+    assert!(!tx_hashes.contains(&first_log.transaction_hash.unwrap()));
+    assert!(!tx_hashes.contains(&second_log.transaction_hash.unwrap()));
+    assert!(tx_hashes.contains(&new_log.transaction_hash.unwrap()));
+}
+
 // FIXME: Use legacy() in tx when implemented in alloy
 #[tokio::test(flavor = "multi_thread")]
 async fn test_filters_legacy() {
@@ -249,6 +317,23 @@ async fn test_subscriptions() {
         .collect::<Vec<_>>();
 
     assert_eq!(blocks, vec![1, 2, 3])
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sub_syncing_delivers_initial_status() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+
+    let provider = connect_pubsub(&handle.ws_endpoint()).await;
+    let sub_id = provider.raw_request("eth_subscribe".into(), ["syncing"]).await.unwrap();
+    let stream: Subscription<serde_json::Value> = provider.get_subscription(sub_id).await.unwrap();
+    let mut stream = stream.into_stream();
+
+    let initial = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("timed out waiting for initial sync status")
+        .expect("subscription ended unexpectedly");
+
+    assert_eq!(initial, serde_json::json!(false));
 }
 
 #[tokio::test(flavor = "multi_thread")]

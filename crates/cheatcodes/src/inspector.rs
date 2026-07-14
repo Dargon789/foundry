@@ -27,6 +27,7 @@ use alloy_primitives::{
     map::{AddressHashMap, HashMap, HashSet},
 };
 use alloy_rpc_types::AccessList;
+use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolInterface, SolValue};
 use foundry_common::{
     FoundryTransactionBuilder, SELECTOR_LEN, TransactionMaybeSigned,
@@ -402,11 +403,11 @@ pub struct ArbitraryStorage {
     /// Mapping of arbitrary storage addresses to generated values (slot, arbitrary value).
     /// (SLOADs return random value if storage slot wasn't accessed).
     /// Changed values are recorded and used to copy storage to different addresses.
-    pub values: HashMap<Address, HashMap<U256, U256>>,
+    values: HashMap<Address, HashMap<U256, U256>>,
     /// Mapping of address with storage copied to arbitrary storage address source.
-    pub copies: HashMap<Address, Address>,
+    copies: HashMap<Address, Address>,
     /// Address with storage slots that should be overwritten even if previously set.
-    pub overwrites: HashSet<Address>,
+    overwrites: HashSet<Address>,
 }
 
 impl ArbitraryStorage {
@@ -425,6 +426,47 @@ impl ArbitraryStorage {
         if self.values.contains_key(from) {
             self.copies.insert(*to, *from);
         }
+    }
+
+    /// Returns addresses explicitly marked with arbitrary storage.
+    fn targets(&self) -> impl Iterator<Item = Address> + '_ {
+        self.values.keys().copied()
+    }
+
+    /// Returns addresses explicitly marked with arbitrary storage and whether nonzero slots are
+    /// overwritten.
+    fn target_overwrite_modes(&self) -> impl Iterator<Item = (Address, bool)> + '_ {
+        self.values.keys().map(|address| (*address, self.overwrites.contains(address)))
+    }
+
+    /// Returns addresses that copy storage from arbitrary-storage targets.
+    fn copied_targets(&self) -> impl Iterator<Item = Address> + '_ {
+        self.copies.keys().copied()
+    }
+
+    /// Returns copied arbitrary-storage targets and their source address.
+    fn copied_target_sources(&self) -> impl Iterator<Item = (Address, Address)> + '_ {
+        self.copies.iter().map(|(target, source)| (*target, *source))
+    }
+
+    /// Caches a concrete value for a slot on an arbitrary-storage address or copied target.
+    fn cache_value(&mut self, address: Address, slot: U256, data: U256) {
+        if let Some(values) = self.values.get_mut(&address) {
+            values.insert(slot, data);
+            return;
+        }
+
+        let Some(source) = self.copies.get(&address).copied() else {
+            return;
+        };
+        if let Some(values) = self.values.get_mut(&source) {
+            values.insert(slot, data);
+        }
+    }
+
+    /// Returns a cached arbitrary value for a slot.
+    fn cached_value(&self, address: Address, slot: U256) -> Option<U256> {
+        self.values.get(&address).and_then(|values| values.get(&slot)).copied()
     }
 
     /// Saves arbitrary storage value for a given address:
@@ -635,6 +677,8 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     pub deprecated: HashMap<&'static str, Option<&'static str>>,
     /// Unlocked wallets used in scripts and testing of scripts.
     pub wallets: Option<Wallets>,
+    /// Parsed secp256k1 private-key signers for repeated `vm.addr` / `vm.sign` calls.
+    pub private_key_signers: HashMap<U256, PrivateKeySigner>,
     /// Signatures identifier for decoding events and functions
     signatures_identifier: OnceLock<Option<SignaturesIdentifier>>,
     /// Used to determine whether the broadcasted call has dynamic gas limit.
@@ -729,6 +773,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             arbitrary_storage: Default::default(),
             deprecated: Default::default(),
             wallets: Default::default(),
+            private_key_signers: Default::default(),
             signatures_identifier: Default::default(),
             dynamic_gas_limit: Default::default(),
             execution_evm_version: None,
@@ -1294,6 +1339,49 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
         self.arbitrary_storage.get_or_insert_with(ArbitraryStorage::default)
     }
 
+    /// Returns addresses explicitly marked with arbitrary storage.
+    pub fn arbitrary_storage_targets(&self) -> impl Iterator<Item = Address> + '_ {
+        self.arbitrary_storage.as_ref().into_iter().flat_map(ArbitraryStorage::targets)
+    }
+
+    /// Returns addresses explicitly marked with arbitrary storage and whether nonzero slots are
+    /// overwritten.
+    pub fn arbitrary_storage_target_overwrite_modes(
+        &self,
+    ) -> impl Iterator<Item = (Address, bool)> + '_ {
+        self.arbitrary_storage
+            .as_ref()
+            .into_iter()
+            .flat_map(ArbitraryStorage::target_overwrite_modes)
+    }
+
+    /// Returns addresses that copy storage from arbitrary-storage targets.
+    pub fn arbitrary_storage_copied_targets(&self) -> impl Iterator<Item = Address> + '_ {
+        self.arbitrary_storage.as_ref().into_iter().flat_map(ArbitraryStorage::copied_targets)
+    }
+
+    /// Returns copied arbitrary-storage targets and their source address.
+    pub fn arbitrary_storage_copied_target_sources(
+        &self,
+    ) -> impl Iterator<Item = (Address, Address)> + '_ {
+        self.arbitrary_storage
+            .as_ref()
+            .into_iter()
+            .flat_map(ArbitraryStorage::copied_target_sources)
+    }
+
+    /// Caches a concrete replay value for a slot on an arbitrary-storage address or copied target.
+    pub fn cache_arbitrary_storage_value(&mut self, address: Address, slot: U256, value: U256) {
+        if let Some(storage) = &mut self.arbitrary_storage {
+            storage.cache_value(address, slot, value);
+        }
+    }
+
+    /// Returns a cached arbitrary-storage replay value for a slot.
+    pub fn cached_arbitrary_storage_value(&self, address: Address, slot: U256) -> Option<U256> {
+        self.arbitrary_storage.as_ref().and_then(|storage| storage.cached_value(address, slot))
+    }
+
     /// Whether the given address has arbitrary storage.
     pub fn has_arbitrary_storage(&self, address: &Address) -> bool {
         match &self.arbitrary_storage {
@@ -1331,6 +1419,50 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
         }
     }
 
+    #[inline(always)]
+    pub fn has_step_hooks(&self) -> bool {
+        self.broadcast.is_some()
+            || self.gas_metering.paused
+            || self.gas_metering.reset
+            || self.recording_accesses
+            || self.recorded_account_diffs_stack.is_some()
+            || !self.allowed_mem_writes.is_empty()
+            || self.mapping_slots.is_some()
+            || self.gas_metering.recording
+            || self.has_active_env_overrides()
+    }
+
+    #[inline(always)]
+    pub fn has_step_end_hooks(&self) -> bool {
+        self.gas_metering.paused
+            || self.gas_metering.touched
+            || self.arbitrary_storage.is_some()
+            || self.has_active_env_overrides()
+    }
+
+    #[inline(always)]
+    pub fn has_log_hooks(&self) -> bool {
+        !self.expected_emits.is_empty() || self.recorded_logs.is_some()
+    }
+
+    #[inline(always)]
+    pub fn has_recording_accesses_only_step_hook(&self) -> bool {
+        self.recording_accesses
+            && self.broadcast.is_none()
+            && !self.gas_metering.paused
+            && !self.gas_metering.reset
+            && self.recorded_account_diffs_stack.is_none()
+            && self.allowed_mem_writes.is_empty()
+            && self.mapping_slots.is_none()
+            && !self.gas_metering.recording
+            && !self.has_active_env_overrides()
+    }
+
+    #[inline(always)]
+    fn has_active_env_overrides(&self) -> bool {
+        self.env_overrides.values().any(EnvOverrides::is_any_set)
+    }
+
     /// Returns struct definitions from the analysis, if available.
     pub fn struct_defs(&self) -> Option<&foundry_common::fmt::StructDefinitions> {
         self.analysis.as_ref().and_then(|analysis| analysis.struct_defs().ok())
@@ -1365,6 +1497,10 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>> for Cheatcode
 
     fn step(&mut self, interpreter: &mut Interpreter, ecx: &mut FoundryContextFor<'_, FEN>) {
         self.pc = interpreter.bytecode.pc();
+
+        if !self.has_step_hooks() {
+            return;
+        }
 
         if self.broadcast.is_some() {
             self.set_gas_limit_type(interpreter);
@@ -1440,6 +1576,10 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>> for Cheatcode
     }
 
     fn step_end(&mut self, interpreter: &mut Interpreter, ecx: &mut FoundryContextFor<'_, FEN>) {
+        if !self.has_step_end_hooks() {
+            return;
+        }
+
         if self.gas_metering.paused {
             self.meter_gas_end(interpreter);
         }
@@ -1827,7 +1967,16 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>> for Cheatcode
                 .find(|(expected, _)| !expected.found && expected.count > 0)
             {
                 outcome.result.result = InstructionResult::Revert;
-                let error_msg = expected.mismatch_error.as_deref().unwrap_or("log != expected log");
+                let mismatch_error = expected.mismatch_error.clone();
+                let expected_log = expected.log.clone();
+                let checks = expected.checks;
+                let anonymous = expected.anonymous;
+                let error_msg = mismatch_error
+                    .as_ref()
+                    .map(|mismatch| {
+                        mismatch.to_error_msg(self, checks, expected_log.as_ref(), anonymous)
+                    })
+                    .unwrap_or_else(|| "log != expected log".to_string());
                 outcome.result.output = error_msg.abi_encode().into();
                 return;
             }
@@ -2470,7 +2619,9 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             || self.should_overwrite_arbitrary_storage(&target_address, key)
         {
             if self.has_arbitrary_storage(&target_address) {
-                let arbitrary_value = self.rng().random();
+                let arbitrary_value = self
+                    .cached_arbitrary_storage_value(target_address, key)
+                    .unwrap_or_else(|| self.rng().random());
                 self.arbitrary_storage.as_mut().unwrap().save(
                     ecx,
                     target_address,
@@ -3078,5 +3229,93 @@ mod tests {
     fn flag_on_with_broadcast_depth_match_returns_true() {
         let mut cheats = cheats(true, Some(broadcast_at(1)));
         assert!(cheats.should_use_create2_factory(1, &create_inputs()));
+    }
+
+    #[test]
+    fn default_cheatcodes_have_no_opcode_hooks() {
+        let cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+        assert!(!cheats.has_step_hooks());
+        assert!(!cheats.has_step_end_hooks());
+        assert!(!cheats.has_log_hooks());
+    }
+
+    #[test]
+    fn active_cheatcode_state_enables_opcode_hooks() {
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+
+        cheats.recording_accesses = true;
+        assert!(cheats.has_step_hooks());
+        assert!(!cheats.has_step_end_hooks());
+        assert!(cheats.has_recording_accesses_only_step_hook());
+
+        cheats.recording_accesses = false;
+        cheats.gas_metering.touched = true;
+        assert!(!cheats.has_step_hooks());
+        assert!(cheats.has_step_end_hooks());
+        assert!(!cheats.has_recording_accesses_only_step_hook());
+    }
+
+    #[test]
+    fn mixed_step_hooks_disable_record_access_fast_path() {
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+        cheats.recording_accesses = true;
+
+        cheats.gas_metering.reset = true;
+        assert!(!cheats.has_recording_accesses_only_step_hook());
+
+        cheats.gas_metering.reset = false;
+        cheats.env_overrides.insert(None, EnvOverrides { basefee: Some(1), ..Default::default() });
+        assert!(!cheats.has_recording_accesses_only_step_hook());
+    }
+
+    #[test]
+    fn inactive_env_override_entries_do_not_enable_opcode_hooks() {
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+        cheats.env_overrides.insert(None, EnvOverrides::default());
+
+        assert!(!cheats.has_step_hooks());
+        assert!(!cheats.has_step_end_hooks());
+
+        cheats.env_overrides.get_mut(&None).unwrap().basefee = Some(1);
+        assert!(cheats.has_step_hooks());
+        assert!(cheats.has_step_end_hooks());
+    }
+
+    #[test]
+    fn active_log_state_enables_log_hooks() {
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::default());
+
+        cheats.recorded_logs = Some(Default::default());
+        assert!(cheats.has_log_hooks());
+
+        cheats.recorded_logs = None;
+        cheats.expected_emits.push_back((
+            expect::ExpectedEmit {
+                depth: 0,
+                log: None,
+                checks: [false; 5],
+                address: None,
+                anonymous: false,
+                found: false,
+                count: 1,
+                mismatch_error: None,
+            },
+            Default::default(),
+        ));
+        assert!(cheats.has_log_hooks());
+    }
+
+    #[test]
+    fn arbitrary_storage_cache_value_routes_copied_targets_to_source() {
+        let mut storage = ArbitraryStorage::default();
+        let source = Address::repeat_byte(0x11);
+        let copied = Address::repeat_byte(0x22);
+        let slot = U256::from(7);
+
+        storage.mark_arbitrary(&source, false);
+        storage.mark_copy(&source, &copied);
+        storage.cache_value(copied, slot, U256::ZERO);
+
+        assert_eq!(storage.cached_value(source, slot), Some(U256::ZERO));
     }
 }

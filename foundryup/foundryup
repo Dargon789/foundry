@@ -7,7 +7,7 @@ set -eo pipefail
 
 # NOTE: if you make modifications to this script, please increment the version number.
 # WARNING: the SemVer pattern: major.minor.patch must be followed as we use it to determine if the script is up to date.
-FOUNDRYUP_INSTALLER_VERSION="1.9.0"
+FOUNDRYUP_INSTALLER_VERSION="1.9.2"
 
 BASE_DIR=${XDG_CONFIG_HOME:-$HOME}
 FOUNDRY_DIR=${FOUNDRY_DIR:-"$BASE_DIR/.foundry"}
@@ -48,7 +48,7 @@ FOUNDRYUP_RETRY_DELAY=2
 FOUNDRYUP_RETRY_MAX_TIME=60
 FOUNDRYUP_NIGHTLY_CANDIDATE_LIMIT=5
 
-BINS=(forge cast anvil chisel)
+BINS=(forge cast anvil chisel solar)
 HASH_NAMES=()
 HASH_VALUES=()
 FOUNDRYUP_NIGHTLY_CANDIDATES=()
@@ -123,11 +123,15 @@ main() {
     # Enter local repo and build
     say "installing from $FOUNDRYUP_LOCAL_REPO"
     cd "$FOUNDRYUP_LOCAL_REPO"
+    clear_built_bins "$PWD/target/release"
     ensure cargo build --bins "${CARGO_BUILD_ARGS[@]}"
 
     for bin in "${BINS[@]}"; do
       # Remove prior installations if they exist
       rm -f "$FOUNDRY_BIN_DIR/$bin"
+      if is_optional_bin "$bin" && [ ! -f "$PWD/target/release/$bin" ]; then
+        continue
+      fi
       # Symlink from local repo binaries to bin dir
       ensure ln -s "$PWD/target/release/$bin" "$FOUNDRY_BIN_DIR/$bin"
     done
@@ -169,7 +173,7 @@ main() {
     # If `--force` is set, skip the SHA verification.
     if [ "$FOUNDRYUP_IGNORE_VERIFICATION" = false ]; then
       # Check if the version is already installed by downloading the attestation file.
-      say "checking if forge, cast, anvil, and chisel for $FOUNDRYUP_TAG version are already installed"
+      say "checking if forge, cast, anvil, chisel, and solar for $FOUNDRYUP_TAG version are already installed"
 
       # Create a temporary directory to store the attestation link and artifact.
       tmp_dir="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
@@ -234,7 +238,15 @@ main() {
 
           path="$version_dir/$bin"
 
-          if [ -z "$expected" ] || [ ! -x "$path" ]; then
+          if [ -z "$expected" ]; then
+            if is_missing_optional_bin "$bin" "$expected" "$path"; then
+              continue
+            fi
+            all_match=false
+            break
+          fi
+
+          if [ ! -x "$path" ]; then
             all_match=false
             break
           fi
@@ -260,23 +272,22 @@ main() {
     fi
 
     # Download and extract the binaries archive
-    say "downloading forge, cast, anvil, and chisel for $FOUNDRYUP_TAG version"
+    say "downloading forge, cast, anvil, chisel, and solar for $FOUNDRYUP_TAG version"
+    archive_tmp_dir="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
+    staged_dir="$archive_tmp_dir/extracted"
+    ensure mkdir -p "$staged_dir"
     if [ "$PLATFORM" = "win32" ]; then
-      tmp="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
-      tmp="$tmp/foundry.zip"
+      tmp="$archive_tmp_dir/foundry.zip"
       ensure download "$BIN_ARCHIVE_URL" "$tmp"
-      ensure unzip "$tmp" -d "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG"
-      rm -f "$tmp"
+      ensure unzip "$tmp" -d "$staged_dir"
     else
-      tmp="$(mktemp -d 2>/dev/null)" || err "failed to create temp dir"
-      tmp="$tmp/foundry.tar.gz"
+      tmp="$archive_tmp_dir/foundry.tar.gz"
       ensure download "$BIN_ARCHIVE_URL" "$tmp"
       # Make sure it's a valid tar archive.
       ensure tar tf "$tmp" 1> /dev/null
-      ensure mkdir -p "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG"
-      ensure tar -C "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG" -xvf "$tmp"
-      rm -f "$tmp"
+      ensure tar -C "$staged_dir" -xvf "$tmp"
     fi
+    validate_staged_bins "$staged_dir"
 
     # Optionally download the manuals
     if check_cmd tar; then
@@ -309,9 +320,12 @@ main() {
             fi
           done
 
-          path="$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG/$bin"
+          path="$staged_dir/$bin"
 
           if [ -z "$expected" ]; then
+            if is_missing_optional_bin "$bin" "$expected" "$path"; then
+              continue
+            fi
             say "no expected hash for $bin"
             failed=true
             continue
@@ -339,6 +353,9 @@ main() {
         fi
       fi
     fi
+
+    replace_version_bins "$staged_dir" "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_TAG"
+    cleanup_staged_bins "$archive_tmp_dir" "$staged_dir" "$tmp"
 
     # Use newly installed version.
     FOUNDRYUP_VERSION=$FOUNDRYUP_TAG
@@ -383,10 +400,14 @@ main() {
     say "installing version $FOUNDRYUP_VERSION"
 
     # Build the repo.
+    clear_built_bins "$PWD/target/release"
     ensure cargo build --bins "${CARGO_BUILD_ARGS[@]}"
     # Create foundry custom version directory.
     ensure mkdir -p "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_VERSION"
     for bin in "${BINS[@]}"; do
+      rm -f \
+        "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_VERSION/$bin" \
+        "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_VERSION/$bin.exe"
       for try_path in target/release/$bin target/release/$bin.exe; do
         if [ -f "$try_path" ]; then
           mv -f "$try_path" "$FOUNDRY_VERSIONS_DIR/$FOUNDRYUP_VERSION"
@@ -486,6 +507,9 @@ list() {
       say "${VERSION##*/}"
       for bin in "${BINS[@]}"; do
         bin_path="$VERSION/$bin"
+        if is_optional_bin "$bin" && [ ! -e "$bin_path" ]; then
+          continue
+        fi
         say "- $(ensure "$bin_path" -V)"
       done
       printf "\n"
@@ -493,6 +517,9 @@ list() {
   else
     for bin in "${BINS[@]}"; do
       bin_path="$FOUNDRY_BIN_DIR/$bin"
+      if is_optional_bin "$bin" && [ ! -e "$bin_path" ]; then
+        continue
+      fi
       say "- $(ensure "$bin_path" -V)"
     done
   fi
@@ -528,6 +555,9 @@ use() {
       # workspace and silently makes the next `--path` activation use the
       # downloaded release binary instead of a fresh local build.
       ensure rm -f "$bin_path"
+      if is_optional_bin "$bin" && [ ! -e "$FOUNDRY_VERSION_DIR/$bin" ]; then
+        continue
+      fi
       ensure cp "$FOUNDRY_VERSION_DIR/$bin" "$bin_path"
       # Print usage msg
       say "use - $(ensure "$bin_path" -V)"
@@ -586,6 +616,58 @@ need_cmd() {
 
 check_cmd() {
   command -v "$1" &>/dev/null
+}
+
+is_optional_bin() {
+  [ "$1" = "solar" ]
+}
+
+is_missing_optional_bin() {
+  is_optional_bin "$1" && [ -z "$2" ] && [ ! -e "$3" ]
+}
+
+clear_version_bins() {
+  ensure mkdir -p "$1"
+  for bin in "${BINS[@]}"; do
+    rm -f "$1/$bin" "$1/$bin.exe"
+  done
+}
+
+clear_built_bins() {
+  for bin in "${BINS[@]}"; do
+    rm -f "$1/$bin" "$1/$bin.exe"
+  done
+}
+
+validate_staged_bins() {
+  for bin in "${BINS[@]}"; do
+    path="$1/$bin"
+    if is_optional_bin "$bin" && [ ! -e "$path" ]; then
+      continue
+    fi
+    [ -x "$path" ] || err "binary $bin not found at $path"
+  done
+}
+
+replace_version_bins() {
+  staged_dir="$1"
+  version_dir="$2"
+  clear_version_bins "$version_dir"
+  for bin in "${BINS[@]}"; do
+    if [ -f "$staged_dir/$bin" ]; then
+      ensure cp "$staged_dir/$bin" "$version_dir/$bin"
+    elif ! is_optional_bin "$bin"; then
+      err "binary $bin not found at $staged_dir/$bin"
+    fi
+  done
+}
+
+cleanup_staged_bins() {
+  for bin in "${BINS[@]}"; do
+    rm -f "$2/$bin" "$2/$bin.exe"
+  done
+  rm -f "$3"
+  rmdir "$2" "$1" 2>/dev/null || true
 }
 
 detect_platform_arch() {
@@ -721,11 +803,8 @@ resolve_version_and_tag() {
     FOUNDRYUP_VERSION="$FOUNDRYUP_TAG"
   elif [[ "$FOUNDRYUP_VERSION" == "nightly" ]]; then
     # Nightlies are published as immutable `nightly-<sha>` releases. Resolve the
-    # most recent one from GitHub's public releases Atom feed, which lists
-    # releases newest-first, works unauthenticated, and is not subject to the
-    # `api.github.com` REST rate limit (60 req/hr per IP). Shared CI IPs exhaust
-    # that limit and fail with HTTP 403. Falls back to the API only when the
-    # feed cannot be parsed.
+    # most recent one from GitHub's public releases Atom feed, which works
+    # unauthenticated and is not subject to the `api.github.com` REST rate limit.
     say "fetching latest nightly release tag from ${FOUNDRYUP_REPO}..."
     FOUNDRYUP_NIGHTLY_CANDIDATES=()
     while IFS= read -r nightly_candidate; do
@@ -733,19 +812,7 @@ resolve_version_and_tag() {
     done < <(resolve_nightly_tags_via_feed "$FOUNDRYUP_REPO")
     FOUNDRYUP_TAG="${FOUNDRYUP_NIGHTLY_CANDIDATES[0]:-}"
     if [ -z "$FOUNDRYUP_TAG" ]; then
-      # The GitHub API does not guarantee that releases are returned in
-      # chronological order, so we collect all matching nightlies along with
-      # their `published_at` timestamps and sort them ourselves.
-      FOUNDRYUP_TAG=$(fetch "https://api.github.com/repos/${FOUNDRYUP_REPO}/releases" | awk '
-        /"tag_name"[[:space:]]*:/ { gsub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, ""); gsub(/".*/, ""); tag=$0 }
-        /"published_at"[[:space:]]*:[[:space:]]*"/ {
-          pub=$0
-          gsub(/.*"published_at"[[:space:]]*:[[:space:]]*"/, "", pub)
-          gsub(/".*/, "", pub)
-          if (tag ~ /^nightly-/) print pub "\t" tag
-          tag=""
-        }
-      ' | sort -r | awk -F '\t' 'NR==1 { print $2 }') || err "failed to fetch release tags from GitHub API"
+      FOUNDRYUP_TAG=$(resolve_nightly_tag_via_api "$FOUNDRYUP_REPO") || err "failed to fetch release tags from GitHub API"
     fi
     if [ -z "$FOUNDRYUP_TAG" ]; then
       err "could not find a nightly release tag for ${FOUNDRYUP_REPO}"
@@ -763,6 +830,23 @@ resolve_version_and_tag() {
   else
     FOUNDRYUP_TAG="${FOUNDRYUP_VERSION}"
   fi
+}
+
+resolve_nightly_tag_via_api() {
+  local _repo="$1"
+  # The GitHub API does not guarantee that releases are returned in
+  # chronological order, so collect matching nightlies with their published_at
+  # timestamps and sort them explicitly.
+  fetch "https://api.github.com/repos/${_repo}/releases" | awk '
+    /"tag_name"[[:space:]]*:/ { gsub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, ""); gsub(/".*/, ""); tag=$0 }
+    /"published_at"[[:space:]]*:[[:space:]]*"/ {
+      pub=$0
+      gsub(/.*"published_at"[[:space:]]*:[[:space:]]*"/, "", pub)
+      gsub(/".*/, "", pub)
+      if (tag ~ /^nightly-/) print pub "\t" tag
+      tag=""
+    }
+  ' | sort -r | awk -F '\t' 'NR==1 { print $2 }'
 }
 
 # Resolves the latest release tag for repo $1 by following the `releases/latest`
@@ -796,11 +880,11 @@ resolve_latest_tag_via_redirect() {
 }
 
 # Resolves recent nightly tags for repo $1 from GitHub's public releases
-# Atom feed (`releases.atom`), which lists releases newest-first, works
-# unauthenticated, and is not subject to the api.github.com REST rate limit.
+# Atom feed (`releases.atom`), which works unauthenticated and is not subject to
+# the api.github.com REST rate limit.
 # Prints up to `FOUNDRYUP_NIGHTLY_CANDIDATE_LIMIT` unique `nightly-<sha>` tags,
-# newest-first, or nothing if the feed cannot be resolved so the caller can fall
-# back to the API.
+# newest-first by entry `<updated>` timestamp, or nothing if the feed cannot be
+# resolved.
 resolve_nightly_tags_via_feed() {
   local _repo="$1"
   local _url="https://github.com/${_repo}/releases.atom"
@@ -818,12 +902,29 @@ resolve_nightly_tags_via_feed() {
       --retry-on-http-error=403,408,429,500,502,503,504 \
       -qO- "$_url" 2>/dev/null) || return 0
   fi
-  # The feed is newest-first. Return a small unique candidate set so callers can
-  # skip draft or still-uploading immutable nightly releases without hitting the
-  # GitHub REST API on the happy path.
+  # Return a small unique candidate set so callers can skip draft or
+  # still-uploading immutable nightly releases. Restrict matching to each Atom
+  # entry's release link; changelog compare links in the content can also contain
+  # nightly tags and are not release candidates.
   printf '%s\n' "$_feed" \
-    | grep -oE 'nightly-[0-9a-f]{40}' \
-    | awk '!seen[$0]++ { print; count++ } count >= limit { exit }' limit="$FOUNDRYUP_NIGHTLY_CANDIDATE_LIMIT"
+    | awk '
+      /<entry>/ { updated=""; tag="" }
+      /<updated>/ {
+        updated=$0
+        gsub(/.*<updated>/, "", updated)
+        gsub(/<\/updated>.*/, "", updated)
+      }
+      /href="[^"]*\/releases\/tag\/nightly-[0-9a-f]{40}"/ {
+        tag=$0
+        gsub(/.*\/releases\/tag\//, "", tag)
+        gsub(/".*/, "", tag)
+      }
+      /<\/entry>/ && updated != "" && tag ~ /^nightly-[0-9a-f]{40}$/ {
+        print updated "\t" tag
+      }
+    ' \
+    | sort -r \
+    | awk -F '\t' '!seen[$2]++ { print $2; count++ } count >= limit { exit }' limit="$FOUNDRYUP_NIGHTLY_CANDIDATE_LIMIT"
 }
 
 # Backwards-compatible helper for tests/callers that only need the newest

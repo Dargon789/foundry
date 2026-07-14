@@ -251,10 +251,11 @@ impl Display for AccountStateDiffs {
 }
 
 impl Cheatcode for addrCall {
-    fn apply<FEN: FoundryEvmNetwork>(&self, _state: &mut Cheatcodes<FEN>) -> Result {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { privateKey } = self;
-        let wallet = super::crypto::parse_wallet(privateKey)?;
-        Ok(wallet.address().abi_encode())
+        super::crypto::with_private_key_signer(state, privateKey, |wallet| {
+            Ok(wallet.address().abi_encode())
+        })
     }
 }
 
@@ -287,7 +288,10 @@ impl Cheatcode for loadCall {
             if ccx.state.has_arbitrary_storage(&target) {
                 // If storage slot is untouched and load from a target with arbitrary storage,
                 // then set random value for current slot.
-                let rand_value = ccx.state.rng().random();
+                let rand_value = ccx
+                    .state
+                    .cached_arbitrary_storage_value(target, slot.into())
+                    .unwrap_or_else(|| ccx.state.rng().random());
                 ccx.state.arbitrary_storage.as_mut().unwrap().save(
                     ccx.ecx,
                     target,
@@ -713,6 +717,16 @@ impl Cheatcode for etchCall {
         ccx.ecx.journal_mut().load_account(*target)?;
         let bytecode = Bytecode::new_raw_checked(newRuntimeBytecode.clone())
             .map_err(|e| fmt_err!("failed to create bytecode: {e}"))?;
+        if *target == HISTORY_STORAGE_ADDRESS
+            && bytecode.hash_slow() != keccak256(&HISTORY_STORAGE_CODE)
+        {
+            let account =
+                ccx.ecx.journal_mut().evm_state_mut().get_mut(target).expect("account is loaded");
+            if account.info.code_hash == keccak256(&HISTORY_STORAGE_CODE) {
+                account.storage.clear();
+                account.mark_created();
+            }
+        }
         ccx.ecx.journal_mut().set_code(*target, bytecode);
         Ok(Default::default())
     }
@@ -835,6 +849,13 @@ impl Cheatcode for coolSlotCall {
         let Self { target, slot } = *self;
         set_cold_slot(ccx, target, slot.into(), true);
         Ok(Default::default())
+    }
+}
+
+impl Cheatcode for isIsolateModeCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let Self {} = self;
+        Ok(state.config.isolate.abi_encode())
     }
 }
 

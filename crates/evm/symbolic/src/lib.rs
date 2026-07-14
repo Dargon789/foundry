@@ -6,7 +6,7 @@ use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt};
 use alloy_json_abi::Function;
 use alloy_primitives::{
     Address, B256, Bytes, I256, U256, hex, keccak256,
-    map::{DefaultHashBuilder, HashMap, HashSet, IndexSet},
+    map::{HashMap, HashSet, IndexSet},
 };
 use alloy_signer::SignerSync;
 use alloy_signer_local::{
@@ -16,9 +16,7 @@ use alloy_signer_local::{
 use alloy_sol_types::SolCall;
 use base64::prelude::*;
 use foundry_cheatcodes_spec::{SymbolicVm, Vm};
-use foundry_config::{
-    SymbolicConfig, SymbolicExplorationOrder, SymbolicStorageLayout, split_quoted_args,
-};
+use foundry_config::{SymbolicConfig, SymbolicExplorationOrder, SymbolicStorageLayout};
 use foundry_evm::{
     constants::{CHEATCODE_ADDRESS, DEFAULT_CREATE2_DEPLOYER, HARDHAT_CONSOLE_ADDRESS},
     core::{backend::DatabaseExt, evm::FoundryEvmNetwork},
@@ -37,13 +35,12 @@ use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
     fmt::{self, Write as _},
-    io::{Read, Write},
-    num::NonZeroU32,
+    io::Write,
     ops::{ControlFlow, Deref, DerefMut},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -61,7 +58,7 @@ mod abi;
 mod executor;
 mod runtime;
 
-pub use runtime::{PortfolioDiagnostics, SymbolicError, SymbolicRunInput};
+pub use runtime::{PortfolioDiagnostics, SymbolicBranchTarget, SymbolicError, SymbolicRunInput};
 
 /// Returns whether `solver` is one of Foundry's semantic symbolic solver names.
 pub fn symbolic_solver_is_builtin(solver: &str) -> bool {
@@ -273,7 +270,12 @@ fn symbolic_create_bytes_selectors() -> &'static [(usize, [u8; 4]); 32] {
 #[derive(Clone, Debug)]
 pub enum SymbolicRunResult {
     /// All explored paths completed without a feasible failure.
-    Safe(SymbolicStats),
+    Safe {
+        /// Execution counters collected during the run.
+        stats: SymbolicStats,
+        /// One concrete successful input, when requested by the caller.
+        success_input: Option<SymbolicConcreteInput>,
+    },
     /// A feasible failure was found.
     Counterexample {
         /// ABI-typed argument values extracted from the solver model.
@@ -292,6 +294,15 @@ pub enum SymbolicRunResult {
         /// Execution counters collected before execution stopped.
         stats: SymbolicStats,
     },
+}
+
+/// One concrete symbolic input materialized from a solver model.
+#[derive(Clone, Debug)]
+pub struct SymbolicConcreteInput {
+    /// ABI-typed argument values extracted from the solver model.
+    pub args: Vec<DynSolValue>,
+    /// ABI-encoded calldata for replay.
+    pub calldata: Bytes,
 }
 
 /// A concrete invariant target selected from Foundry's invariant discovery.
@@ -321,12 +332,27 @@ pub struct SymbolicInvariantRunInput<'a, FEN: FoundryEvmNetwork> {
     pub targets: Vec<SymbolicInvariantTarget>,
     /// Concrete sender set discovered by Foundry invariant targeting.
     pub senders: Vec<Address>,
+    /// Sender addresses excluded by Foundry invariant targeting.
+    pub excluded_senders: Vec<Address>,
     /// Maximum number of sequence calls to execute.
     pub depth: usize,
+    /// Concrete invariant check interval. `0` means only check at sequence end.
+    pub check_interval: u32,
     /// Whether ordinary target-call reverts should be reported as failures.
     pub fail_on_revert: bool,
     /// Whether symbolic `vm.ffi` calls are allowed to execute subprocesses.
     pub ffi_enabled: bool,
+}
+
+/// One concrete storage value required to replay a symbolic invariant candidate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolicStorageAssignment {
+    /// Account whose storage slot should be initialized.
+    pub address: Address,
+    /// Concrete storage slot.
+    pub slot: U256,
+    /// Concrete value extracted from the solver model.
+    pub value: U256,
 }
 
 /// Outcome of bounded symbolic invariant execution.
@@ -336,8 +362,12 @@ pub enum SymbolicInvariantRunResult {
     Safe(SymbolicStats),
     /// A feasible invariant or handler failure was found.
     Counterexample {
+        /// Which part of the invariant run produced the failure.
+        kind: SymbolicInvariantCounterexampleKind,
         /// Concrete sequence extracted from the solver model.
         sequence: Vec<SymbolicInvariantStep>,
+        /// Concrete setup-storage values needed for replay.
+        storage: Vec<SymbolicStorageAssignment>,
         /// Execution counters collected before the counterexample was returned.
         stats: SymbolicStats,
     },
@@ -350,6 +380,15 @@ pub enum SymbolicInvariantRunResult {
         /// Execution counters collected before execution stopped.
         stats: SymbolicStats,
     },
+}
+
+/// Part of a symbolic invariant run that produced a replayable counterexample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymbolicInvariantCounterexampleKind {
+    /// An `invariant_*` or `afterInvariant` check failed.
+    Predicate,
+    /// A fuzzed target/handler call failed with an assertion.
+    Handler,
 }
 
 /// One concrete step in a symbolic invariant counterexample sequence.
@@ -434,8 +473,10 @@ pub struct SymbolicStats {
 /// or an incomplete result.
 pub struct SymbolicExecutor {
     config: SymbolicConfig,
+    cx: runtime::SymCx,
     solver: Box<dyn runtime::SymbolicSolver>,
     deferred_incomplete: Option<DeferredIncomplete>,
+    deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -36,6 +36,11 @@ check_eq() {
 say() { :; }
 warn() { :; }
 
+check_eq "managed binaries include solar" \
+  "forge cast anvil chisel solar" "${BINS[*]}"
+check_eq "solar is optional for legacy releases" \
+  "0" "$(is_optional_bin solar; echo $?)"
+
 # --- resolve_latest_tag_via_redirect --------------------------------------
 
 curl() { printf 'https://github.com/foundry-rs/foundry/releases/tag/v1.7.1'; }
@@ -58,11 +63,21 @@ check_eq "redirect with non-version tag returns empty" \
 
 NIGHTLY_SHA="bc3b7f1e90bb7a30903d7d1ae2c532e4fba5679d"
 OLDER_SHA="55210f8c412eac24e9318341efab1e27c5b03822"
-# Minimal Atom feed: newest nightly first, then an older one and a stable tag.
+# Minimal Atom feed: older entry first, then the newest nightly by updated
+# timestamp and a stable tag.
 FEED="<feed>
-  <entry><link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$NIGHTLY_SHA\"/></entry>
-  <entry><link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$OLDER_SHA\"/></entry>
-  <entry><link href=\"https://github.com/foundry-rs/foundry/releases/tag/v1.7.1\"/></entry>
+  <entry>
+    <updated>2026-01-01T00:00:00Z</updated>
+    <link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$OLDER_SHA\"/>
+  </entry>
+  <entry>
+    <updated>2026-01-02T00:00:00Z</updated>
+    <link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$NIGHTLY_SHA\"/>
+  </entry>
+  <entry>
+    <updated>2026-01-03T00:00:00Z</updated>
+    <link href=\"https://github.com/foundry-rs/foundry/releases/tag/v1.7.1\"/>
+  </entry>
 </feed>"
 
 curl() { printf '%s' "$FEED"; }
@@ -72,13 +87,20 @@ check_eq "nightly feed returns bounded unique candidates" \
   $'nightly-bc3b7f1e90bb7a30903d7d1ae2c532e4fba5679d\nnightly-55210f8c412eac24e9318341efab1e27c5b03822' \
   "$(FOUNDRYUP_NIGHTLY_CANDIDATE_LIMIT=5 resolve_nightly_tags_via_feed foundry-rs/foundry)"
 
-FEED_WITH_DUPLICATES="<feed>
-  <entry><link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$NIGHTLY_SHA\"/></entry>
-  <entry><content>compare nightly-$OLDER_SHA...nightly-$NIGHTLY_SHA</content></entry>
-  <entry><link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$OLDER_SHA\"/></entry>
+FEED_WITH_COMPARE_LINKS="<feed>
+  <entry>
+    <updated>2026-01-01T00:00:00Z</updated>
+    <link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$OLDER_SHA\"/>
+    <content>compare nightly-$NIGHTLY_SHA...nightly-$OLDER_SHA</content>
+  </entry>
+  <entry>
+    <updated>2026-01-02T00:00:00Z</updated>
+    <link href=\"https://github.com/foundry-rs/foundry/releases/tag/nightly-$NIGHTLY_SHA\"/>
+    <content>compare nightly-$OLDER_SHA...nightly-$NIGHTLY_SHA</content>
+  </entry>
 </feed>"
-curl() { printf '%s' "$FEED_WITH_DUPLICATES"; }
-check_eq "nightly feed deduplicates candidates in order" \
+curl() { printf '%s' "$FEED_WITH_COMPARE_LINKS"; }
+check_eq "nightly feed ignores compare links and sorts by updated" \
   $'nightly-bc3b7f1e90bb7a30903d7d1ae2c532e4fba5679d\nnightly-55210f8c412eac24e9318341efab1e27c5b03822' \
   "$(FOUNDRYUP_NIGHTLY_CANDIDATE_LIMIT=5 resolve_nightly_tags_via_feed foundry-rs/foundry)"
 
@@ -97,6 +119,47 @@ trap 'rm -f "$api_marker" "$install_marker"; rm -rf "$sidecar_home" "$selector_t
 mkdir -p "$selector_tmp/archive"
 touch "$selector_tmp/archive/forge"
 tar -czf "$selector_tmp/foundry.tar.gz" -C "$selector_tmp/archive" forge
+
+optional_path="$selector_tmp/solar"
+check_eq "missing optional binary without hash is allowed" \
+  "0" "$(is_missing_optional_bin solar "" "$optional_path"; echo $?)"
+touch "$optional_path"
+check_eq "present optional binary without hash is rejected" \
+  "1" "$(is_missing_optional_bin solar "" "$optional_path"; echo $?)"
+
+version_tmp="$selector_tmp/version"
+mkdir -p "$version_tmp"
+touch "$version_tmp/solar" "$version_tmp/solar.exe" "$version_tmp/unrelated"
+clear_version_bins "$version_tmp"
+check_eq "version replacement clears stale optional binaries" \
+  "0" "$([ ! -e "$version_tmp/solar" ] && [ ! -e "$version_tmp/solar.exe" ]; echo $?)"
+check_eq "version replacement preserves unrelated files" \
+  "0" "$([ -e "$version_tmp/unrelated" ]; echo $?)"
+
+built_tmp="$selector_tmp/built"
+mkdir -p "$built_tmp"
+touch "$built_tmp/solar" "$built_tmp/solar.exe" "$built_tmp/unrelated"
+clear_built_bins "$built_tmp"
+check_eq "source builds clear stale optional artifacts" \
+  "0" "$([ ! -e "$built_tmp/solar" ] && [ ! -e "$built_tmp/solar.exe" ]; echo $?)"
+check_eq "source builds preserve unrelated artifacts" \
+  "0" "$([ -e "$built_tmp/unrelated" ]; echo $?)"
+
+staged_tmp="$selector_tmp/staged"
+installed_tmp="$selector_tmp/installed"
+mkdir -p "$staged_tmp" "$installed_tmp"
+for bin in forge cast anvil chisel; do
+  touch "$staged_tmp/$bin"
+  chmod +x "$staged_tmp/$bin"
+done
+touch "$installed_tmp/solar"
+validate_staged_bins "$staged_tmp"
+replace_version_bins "$staged_tmp" "$installed_tmp"
+check_eq "staged legacy release replaces required binaries" \
+  "0" "$([ -x "$installed_tmp/forge" ] && [ -x "$installed_tmp/chisel" ]; echo $?)"
+check_eq "staged legacy release clears stale solar" \
+  "0" "$([ ! -e "$installed_tmp/solar" ]; echo $?)"
+
 download() {
   case "$1" in
     *"nightly-$OLDER_SHA"*) cp "$selector_tmp/foundry.tar.gz" "$2" ;;
@@ -112,7 +175,7 @@ check_eq "nightly selector skips invalid archive candidate" \
   "nightly-$OLDER_SHA" "$(select_installable_nightly_tag)"
 unset -f download
 
-# --- resolve_version_and_tag (redirect + API fallback) --------------------
+# --- resolve_version_and_tag (redirect + feed nightly) --------------------
 
 API_JSON='{"tag_name": "v9.9.9", "name": "v9.9.9"}'
 # Minimal `releases` listing used for the nightly API fallback path. The awk
@@ -120,8 +183,12 @@ API_JSON='{"tag_name": "v9.9.9", "name": "v9.9.9"}'
 # so `tag_name` and `published_at` must be on separate lines.
 NIGHTLY_API_JSON='[
   {
-    "tag_name": "nightly-deadbeef",
+    "tag_name": "nightly-olderfeedfirst000000000000000000000000",
     "published_at": "2026-01-01T00:00:00Z"
+  },
+  {
+    "tag_name": "nightly-deadbeef00000000000000000000000000000000",
+    "published_at": "2026-01-02T00:00:00Z"
   }
 ]'
 
@@ -148,15 +215,15 @@ check_eq "latest calls API when redirect fails" "1" "$(wc -l < "$api_marker" | t
 curl() { printf '%s' "$FEED"; }
 FOUNDRYUP_VERSION="nightly"
 resolve_version_and_tag
-check_eq "nightly resolves to nightly-<sha> via feed" "nightly-$NIGHTLY_SHA" "$FOUNDRYUP_TAG"
-check_eq "nightly does not call API when feed works" "0" "$(wc -l < "$api_marker" | tr -d ' ')"
+check_eq "nightly resolves to newest feed tag" "nightly-$NIGHTLY_SHA" "$FOUNDRYUP_TAG"
+check_eq "nightly does not call API" "0" "$(wc -l < "$api_marker" | tr -d ' ')"
 
 : > "$api_marker"
 curl() { return 1; }
 fetch() { echo called >> "$api_marker"; printf '%s' "$NIGHTLY_API_JSON"; }
 FOUNDRYUP_VERSION="nightly"
 resolve_version_and_tag
-check_eq "nightly falls back to API tag" "nightly-deadbeef" "$FOUNDRYUP_TAG"
+check_eq "nightly falls back to API tag when feed fails" "nightly-deadbeef00000000000000000000000000000000" "$FOUNDRYUP_TAG"
 check_eq "nightly calls API when feed fails" "1" "$(wc -l < "$api_marker" | tr -d ' ')"
 
 # --- rust foundryup migration shim ----------------------------------------
