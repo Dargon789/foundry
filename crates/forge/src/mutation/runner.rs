@@ -171,6 +171,7 @@ pub fn run_mutations_parallel_with_progress(
     original_source: Arc<String>,
     config: Arc<Config>,
     evm_opts: EvmOpts,
+    create2_deployer_available: bool,
     num_workers: usize,
     progress: Option<MutationProgress>,
     silent: bool,
@@ -222,6 +223,14 @@ pub fn run_mutations_parallel_with_progress(
 
     workspace::ensure_safe_relative_path(&source_relative, "source", &source_abs)?;
 
+    // `ProjectPathsConfig` canonicalizes its root. Create mutant workspaces beneath the canonical
+    // temp root as well so explicit compiler inputs, project-local remappings, and the project
+    // root all use the same path spelling (notably `/private/var` rather than `/var` on macOS).
+    let temp_root = std::env::temp_dir();
+    let temp_root = dunce::canonicalize(&temp_root).map_err(|err| {
+        eyre::eyre!("failed to canonicalize mutation temp root {}: {err}", temp_root.display())
+    })?;
+
     // Configure rayon thread pool
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_workers)
@@ -252,7 +261,9 @@ pub fn run_mutations_parallel_with_progress(
                     &original_source,
                     &config,
                     &evm_opts,
+                    create2_deployer_available,
                     &shared_state,
+                    &temp_root,
                     &filter_args,
                     &rerun_failures,
                     &selected_sources_relative,
@@ -330,7 +341,9 @@ fn test_single_mutant_isolated(
     original_source: &Arc<String>,
     config: &Arc<Config>,
     evm_opts: &EvmOpts,
+    create2_deployer_available: bool,
     shared_state: &Arc<SharedMutationState>,
+    temp_root: &Path,
     filter_args: &Arc<FilterArgs>,
     rerun_failures: &Arc<Option<Vec<RerunFailure>>>,
     selected_sources_relative: &Arc<Vec<PathBuf>>,
@@ -362,10 +375,11 @@ fn test_single_mutant_isolated(
     }
 
     // Create isolated workspace using TempDir for automatic cleanup on drop
-    let temp_dir = match TempDir::with_prefix("forge_mutation_") {
+    let temp_dir = match TempDir::with_prefix_in("forge_mutation_", temp_root) {
         Ok(dir) => dir,
         Err(e) => {
-            let _ = sh_eprintln!("Failed to create temp directory: {}", e);
+            let _ =
+                sh_eprintln!("Failed to create temp directory in {}: {}", temp_root.display(), e);
             return MutantTestResult { mutant, result: MutationResult::Invalid };
         }
     };
@@ -406,6 +420,7 @@ fn test_single_mutant_isolated(
         Some(budget) => run_compile_and_test_with_timeout(
             temp_config,
             evm_opts,
+            create2_deployer_available,
             budget,
             temp_dir,
             shared_state,
@@ -418,6 +433,7 @@ fn test_single_mutant_isolated(
             let res = match compile_and_test(
                 &temp_config,
                 evm_opts,
+                create2_deployer_available,
                 filter_args,
                 rerun_failures.as_ref().as_deref(),
                 selected_sources_relative,
@@ -458,6 +474,7 @@ fn test_single_mutant_isolated(
 fn run_compile_and_test_with_timeout(
     config: Arc<Config>,
     evm_opts: &EvmOpts,
+    create2_deployer_available: bool,
     budget: Duration,
     temp_dir: TempDir,
     shared_state: &Arc<SharedMutationState>,
@@ -484,6 +501,7 @@ fn run_compile_and_test_with_timeout(
                 compile_and_test(
                     &cfg,
                     &opts,
+                    create2_deployer_available,
                     &filter_for_worker,
                     rerun_for_worker.as_ref().as_deref(),
                     &selected_sources_for_worker,
@@ -599,6 +617,7 @@ fn temp_config_for_mutation(config: &Config, temp_path: &Path) -> Config {
 fn compile_and_test(
     config: &Arc<Config>,
     evm_opts: &EvmOpts,
+    create2_deployer_available: bool,
     filter_args: &FilterArgs,
     rerun_failures: Option<&[RerunFailure]>,
     selected_sources_relative: &[PathBuf],
@@ -608,6 +627,7 @@ fn compile_and_test(
         compile_and_test_inner::<TempoEvmNetwork>(
             config,
             evm_opts,
+            create2_deployer_available,
             filter_args,
             rerun_failures,
             selected_sources_relative,
@@ -619,6 +639,7 @@ fn compile_and_test(
             return compile_and_test_inner::<OpEvmNetwork>(
                 config,
                 evm_opts,
+                create2_deployer_available,
                 filter_args,
                 rerun_failures,
                 selected_sources_relative,
@@ -628,6 +649,7 @@ fn compile_and_test(
         compile_and_test_inner::<EthEvmNetwork>(
             config,
             evm_opts,
+            create2_deployer_available,
             filter_args,
             rerun_failures,
             selected_sources_relative,
@@ -639,6 +661,7 @@ fn compile_and_test(
 fn compile_and_test_inner<FEN: FoundryEvmNetwork>(
     config: &Arc<Config>,
     evm_opts: &EvmOpts,
+    create2_deployer_available: bool,
     filter_args: &FilterArgs,
     rerun_failures: Option<&[RerunFailure]>,
     selected_sources_relative: &[PathBuf],
@@ -691,6 +714,7 @@ fn compile_and_test_inner<FEN: FoundryEvmNetwork>(
             .with_fork(evm_opts.get_fork(config, evm_env.cfg_env.chain_id, fork_block))
             .enable_isolation(isolate)
             .fail_fast(true)
+            .with_create2_deployer_available(create2_deployer_available)
             .build::<FEN, MultiCompiler>(&compile_output, evm_env, tx_env, evm_opts.clone())?;
 
         runner.test_collect(&filter)
