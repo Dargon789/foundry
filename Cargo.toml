@@ -462,13 +462,13 @@ indicatif = "0.18"
 inturn = "0.2.0"
 itertools = "0.15"
 jsonpath_lib = "0.3"
-k256 = "0.13"
+k256 = "0.14"
 mesc = "0.3"
 memchr = "2.7"
 num-format = "0.4"
 parking_lot = "0.12"
 proptest = "1.9.0"
-rand = "0.9"
+rand = "0.10"
 rand_08 = { package = "rand", version = "0.8" }
 ratatui = { version = "0.30", default-features = false }
 rayon = "1"
@@ -486,7 +486,7 @@ soldeer-core = { version = "=0.11.0", features = ["serde"] }
 strum = "0.28"
 tempfile = "3.23"
 tokio = "1"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1"
 toml_edit = "0.25"
 tower = "0.5"
