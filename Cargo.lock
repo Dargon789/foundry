@@ -1297,8 +1297,8 @@ dependencies = [
  "op-alloy-rpc-types",
  "op-revm",
  "parking_lot",
+ "rand 0.10.2",
  "rand 0.8.8",
- "rand 0.9.5",
  "reqwest 0.13.4",
  "revm",
  "revm-inspectors",
@@ -1336,7 +1336,7 @@ dependencies = [
  "foundry-common",
  "foundry-evm",
  "foundry-primitives",
- "rand 0.9.5",
+ "rand 0.10.2",
  "revm",
  "serde",
  "serde_json",
@@ -3002,8 +3002,8 @@ dependencies = [
  "op-alloy-flz",
  "op-alloy-network",
  "path-slash",
+ "rand 0.10.2",
  "rand 0.8.8",
- "rand 0.9.5",
  "rayon",
  "regex",
  "reqwest 0.13.4",
@@ -5341,7 +5341,7 @@ dependencies = [
  "path-slash",
  "proptest",
  "quick-junit",
- "rand 0.9.5",
+ "rand 0.10.2",
  "rayon",
  "regex",
  "reqwest 0.13.4",
@@ -5626,7 +5626,7 @@ dependencies = [
  "p256 0.13.2",
  "parking_lot",
  "proptest",
- "rand 0.9.5",
+ "rand 0.10.2",
  "revm",
  "revm-inspectors",
  "semver 1.0.28",
@@ -5703,7 +5703,7 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "tracing-tracy",
+ "tracing-tracy 0.12.0",
  "yansi",
 ]
 
@@ -5824,7 +5824,7 @@ dependencies = [
  "foundry-compilers-artifacts",
  "foundry-compilers-core",
  "fs_extra",
- "itertools 0.13.0",
+ "itertools 0.15.0",
  "path-slash",
  "rand 0.10.2",
  "rayon",
@@ -5995,7 +5995,7 @@ dependencies = [
  "indicatif",
  "parking_lot",
  "proptest",
- "rand 0.9.5",
+ "rand 0.10.2",
  "rayon",
  "revm",
  "revm-inspectors",
@@ -6113,7 +6113,7 @@ dependencies = [
  "itertools 0.15.0",
  "parking_lot",
  "proptest",
- "rand 0.9.5",
+ "rand 0.10.2",
  "revm",
  "serde",
  "solar-compiler",
@@ -6310,7 +6310,7 @@ dependencies = [
  "foundry-config",
  "idna_adapter",
  "parking_lot",
- "rand 0.9.5",
+ "rand 0.10.2",
  "regex",
  "reqwest 0.13.4",
  "serde_json",
@@ -11959,7 +11959,7 @@ dependencies = [
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
- "tracing-tracy",
+ "tracing-tracy 0.11.4",
 ]
 
 [[package]]
@@ -13377,7 +13377,18 @@ checksum = "0eaa1852afa96e0fe9e44caa53dc0bd2d9d05e0f2611ce09f97f8677af56e4ba"
 dependencies = [
  "tracing-core",
  "tracing-subscriber",
- "tracy-client",
+ "tracy-client 0.18.5",
+]
+
+[[package]]
+name = "tracing-tracy"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b326790213b869d948a5d1ea56472ed5b20c7cefde07684ee35d6b7a980fef1"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracy-client 0.19.0",
 ]
 
 [[package]]
@@ -13389,7 +13400,19 @@ dependencies = [
  "loom",
  "once_cell",
  "rustc-demangle",
- "tracy-client-sys",
+ "tracy-client-sys 0.29.0",
+]
+
+[[package]]
+name = "tracy-client"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d93fd676d8946eaeaff4881d26d2240a8d106fcaccbd47cb9f1389e3561ba490"
+dependencies = [
+ "loom",
+ "once_cell",
+ "rustc-demangle",
+ "tracy-client-sys 0.30.0",
 ]
 
 [[package]]
@@ -13400,6 +13423,16 @@ checksum = "ab27f167b093214c68413a2e0bcd318f0591af475597405ff68138ba0a433379"
 dependencies = [
  "cc",
  "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "tracy-client-sys"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eef8a023d2b19f44e430da334f7dfb5e5db219bb83e2b4f56a09c1cb12abe915"
+dependencies = [
+ "cc",
+ "windows-targets 0.53.5",
 ]
 
 [[package]]
