@@ -156,6 +156,35 @@ async fn bsc_haber_p256_is_available_for_calls_and_mining() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn bsc_fork_execution_chain_override_preserves_p256() {
+    let (_origin_api, origin_handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(BSC_MAINNET_CHAIN_ID))
+            .with_hardfork(Some(EthereumHardfork::Cancun.into()))
+            .with_genesis_timestamp(Some(BSC_MAINNET_HABER_TIMESTAMP)),
+    )
+    .await;
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(1u64))
+            .with_no_storage_caching(true)
+            .with_eth_rpc_url(Some(origin_handle.http_endpoint())),
+    )
+    .await;
+    let provider = handle.http_provider();
+
+    assert_eq!(provider.get_chain_id().await.unwrap(), 1);
+    assert!(
+        api.config().unwrap().current.precompiles.values().any(|&address| address == P256_VERIFY)
+    );
+    let output = provider
+        .call(TransactionRequest::default().with_to(P256_VERIFY).with_input(P256_INPUT).into())
+        .await
+        .unwrap();
+    assert_eq!(output.as_ref(), B256::with_last_byte(1).as_slice());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bsc_default_timestamp_enables_p256_immediately() {
     let (api, handle) = spawn(
         NodeConfig::test()
@@ -208,7 +237,7 @@ async fn test_can_handle_large_timestamp() {
     let (api, _handle) = spawn(NodeConfig::test()).await;
     let num = 317071597274;
     api.evm_set_next_block_timestamp(num).unwrap();
-    api.mine_one().await;
+    api.mine_one().await.unwrap();
 
     let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
     assert_eq!(block.header.timestamp, num);
@@ -218,7 +247,7 @@ async fn test_can_handle_large_timestamp() {
 async fn test_shanghai_fields() {
     let (api, _handle) =
         spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Shanghai.into()))).await;
-    api.mine_one().await;
+    api.mine_one().await.unwrap();
 
     let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
     assert_eq!(block.header.withdrawals_root, Some(EMPTY_ROOT_HASH));
@@ -231,7 +260,7 @@ async fn test_shanghai_fields() {
 async fn test_cancun_fields() {
     let (api, _handle) =
         spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Cancun.into()))).await;
-    api.mine_one().await;
+    api.mine_one().await.unwrap();
 
     let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
     assert_eq!(block.header.withdrawals_root, Some(EMPTY_ROOT_HASH));
@@ -257,6 +286,28 @@ async fn test_can_use_default_genesis_block_number() {
     let provider = handle.http_provider();
 
     assert_eq!(0, provider.get_block(0.into()).await.unwrap().unwrap().header.number);
+}
+
+/// `earliest`, `safe` and `finalized` resolve within the chain when it starts at a non-zero
+/// genesis number.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_block_tags_respect_genesis_block_number() {
+    let genesis_number = 1000u64;
+    let (api, handle) =
+        spawn(NodeConfig::test().with_genesis_block_number(Some(genesis_number))).await;
+    let provider = handle.http_provider();
+    let account = handle.dev_accounts().next().unwrap();
+
+    api.anvil_mine(Some(U256::from(5)), None).await.unwrap();
+    assert_eq!(provider.get_block_number().await.unwrap(), genesis_number + 5);
+
+    let latest = provider.get_balance(account).await.unwrap();
+    for tag in [BlockNumberOrTag::Earliest, BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
+        let balance = provider.get_balance(account).block_id(tag.into()).await.unwrap();
+        assert_eq!(balance, latest, "{tag} should resolve to a block of this chain");
+        let block = provider.get_block(tag.into()).await.unwrap().unwrap();
+        assert_eq!(block.header.number, genesis_number, "{tag} should resolve to genesis");
+    }
 }
 
 /// Verify that genesis block number affects both RPC and EVM execution layer.

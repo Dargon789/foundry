@@ -1,5 +1,5 @@
 use alloy_json_abi::{Event, Function, JsonAbi};
-use alloy_primitives::{Address, B256, Selector, map::HashMap};
+use alloy_primitives::{Address, B256, Bytes, Selector, map::HashMap};
 use foundry_compilers::artifacts::StorageLayout;
 use itertools::Either;
 use serde::{Deserialize, Serialize};
@@ -20,17 +20,10 @@ pub use filters::{ArtifactFilters, SenderFilters};
 use foundry_common::{ContractsByAddress, ContractsByArtifact};
 use foundry_evm_core::utils::StateChangeset;
 
-type DynamicTargetCacheKey = (Address, B256);
 type DynamicTargetArtifactMatchCache =
-    Rc<RefCell<HashMap<DynamicTargetCacheKey, Option<CachedTargetContract>>>>;
+    Rc<RefCell<HashMap<(Address, B256), Option<CachedTargetContract>>>>;
 type FuzzedFunction = (Address, Function);
 type FunctionLookup = HashMap<Selector, Function>;
-
-/// Returns true if the function returns `int256`, indicating optimization mode.
-/// In optimization mode, the fuzzer maximizes the return value instead of checking invariants.
-pub fn is_optimization_invariant(func: &Function) -> bool {
-    func.outputs.len() == 1 && func.outputs[0].ty == "int256"
-}
 
 /// Contracts identified as targets during a fuzz run.
 ///
@@ -516,13 +509,15 @@ pub struct InvariantContract<'a> {
     pub call_after_invariant: bool,
     /// ABI of the test contract.
     pub abi: &'a JsonAbi,
+    /// ABI calldata for each invariant function.
+    pub invariant_calldata: Vec<Bytes>,
 }
 
 impl<'a> InvariantContract<'a> {
     /// Creates a new invariant contract.
     ///
     /// Caller must ensure `invariant_fns` is non-empty and `anchor_idx < invariant_fns.len()`.
-    pub const fn new(
+    pub fn new(
         address: Address,
         name: &'a str,
         invariant_fns: Vec<(&'a Function, bool)>,
@@ -530,12 +525,32 @@ impl<'a> InvariantContract<'a> {
         call_after_invariant: bool,
         abi: &'a JsonAbi,
     ) -> Self {
-        Self { address, name, invariant_fns, anchor_idx, call_after_invariant, abi }
+        let invariant_calldata =
+            invariant_fns.iter().map(|(func, _)| func.selector().to_vec().into()).collect();
+        Self {
+            address,
+            name,
+            invariant_fns,
+            anchor_idx,
+            call_after_invariant,
+            abi,
+            invariant_calldata,
+        }
     }
 
     /// Returns the stable campaign anchor.
     pub fn anchor(&self) -> &'a Function {
         self.invariant_fns[self.anchor_idx].0
+    }
+
+    /// Returns cached calldata for the invariant at `idx`.
+    pub fn invariant_calldata(&self, idx: usize) -> Bytes {
+        self.invariant_calldata[idx].clone()
+    }
+
+    /// Returns cached calldata for the stable campaign anchor.
+    pub fn anchor_calldata(&self) -> Bytes {
+        self.invariant_calldata(self.anchor_idx)
     }
 
     /// Returns true if this is an optimization mode invariant (returns int256).
@@ -657,11 +672,17 @@ impl fmt::Display for InvariantSettings {
     }
 }
 
+/// Returns true if the function returns `int256`, indicating optimization mode.
+/// In optimization mode, the fuzzer maximizes the return value instead of checking invariants.
+pub fn is_optimization_invariant(func: &Function) -> bool {
+    func.outputs.len() == 1 && func.outputs[0].ty == "int256"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::CallDetails;
-    use alloy_primitives::{Bytes, U256};
+    use alloy_primitives::U256;
     use foundry_compilers::{
         ArtifactId,
         artifacts::{
@@ -714,10 +735,6 @@ mod tests {
             build_id: "test".to_string(),
             profile: "test".to_string(),
         }
-    }
-
-    fn project_contracts_with_runtime_code(name: &str, code: Bytes) -> ContractsByArtifact {
-        project_contracts_with_runtime_code_and_abi(name, code, JsonAbi::new())
     }
 
     fn project_contracts_with_runtime_code_and_abi(
@@ -832,8 +849,11 @@ mod tests {
         let setup = Address::from([0x44; 20]);
         let untouched = Address::from([0x45; 20]);
         let runtime_code = Bytes::from_static(&[0x60, 0x00, 0x56]);
-        let project_contracts =
-            project_contracts_with_runtime_code("DynamicTarget", runtime_code.clone());
+        let project_contracts = project_contracts_with_runtime_code_and_abi(
+            "DynamicTarget",
+            runtime_code.clone(),
+            JsonAbi::new(),
+        );
         let mut targets = TargetedContracts::new();
         for address in [existing, setup, untouched] {
             targets.inner.insert(

@@ -4,7 +4,6 @@ use super::{
     error::{InvariantRunCtx, record_handler_assertion_bug},
 };
 use crate::executors::{Executor, RawCallResult};
-use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, B256, I256, Selector};
 use alloy_sol_types::{Panic, PanicKind, Revert, SolError, SolInterface};
@@ -54,6 +53,8 @@ pub struct InvariantFuzzTestResult {
     pub failed_corpus_replays: usize,
     /// Actual number of workers used for this logical campaign.
     pub workers: usize,
+    /// Common fork block for all recorded failures, if they agree on one.
+    pub fork_block_number: Option<u64>,
     /// For optimization mode (int256 return): the best (maximum) value achieved.
     /// None means standard invariant check mode.
     pub optimization_best_value: Option<I256>,
@@ -63,7 +64,7 @@ pub struct InvariantFuzzTestResult {
 
 impl InvariantFuzzTestResult {
     #[expect(clippy::too_many_arguments)]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         errors: HashMap<String, InvariantFuzzError>,
         handler_errors: HashMap<(Address, Selector), InvariantFuzzError>,
         runs: usize,
@@ -78,6 +79,15 @@ impl InvariantFuzzTestResult {
         optimization_best_value: Option<I256>,
         optimization_best_sequence: Vec<BasicTxDetails>,
     ) -> Self {
+        let mut failure_blocks = errors
+            .values()
+            .chain(handler_errors.values())
+            .map(InvariantFuzzError::fork_block_number);
+        let fork_block_number = failure_blocks
+            .next()
+            .flatten()
+            .filter(|first| failure_blocks.all(|block| block == Some(*first)));
+
         Self {
             errors,
             handler_errors,
@@ -90,6 +100,7 @@ impl InvariantFuzzTestResult {
             metrics,
             failed_corpus_replays,
             workers,
+            fork_block_number,
             optimization_best_value,
             optimization_best_sequence,
         }
@@ -143,12 +154,10 @@ fn is_revert_assertion_failure(data: &[u8]) -> bool {
 }
 
 fn is_cheatcode_assert_revert<FEN: FoundryEvmNetwork>(call_result: &RawCallResult<FEN>) -> bool {
-    fn decoded_cheatcode_message(data: &[u8]) -> Option<String> {
-        Vm::VmErrors::abi_decode(data).ok().map(|error| error.to_string())
-    }
-
     call_result.reverter == Some(CHEATCODE_ADDRESS)
-        && decoded_cheatcode_message(call_result.result.as_ref())
+        && Vm::VmErrors::abi_decode(call_result.result.as_ref())
+            .ok()
+            .map(|error| error.to_string())
             .is_some_and(|message| message.starts_with(ASSERTION_FAILED_PREFIX))
 }
 
@@ -164,7 +173,7 @@ fn logged_assertion_failure<FEN: FoundryEvmNetwork>(call_result: &RawCallResult<
 ///
 /// This covers Solidity `assert`, legacy invalid-opcode assertions, `vm.assert*` reverts, and the
 /// non-reverting `GLOBAL_FAIL_SLOT` path used when `assertions_revert = false`.
-pub(crate) fn did_fail_on_assert<FEN: FoundryEvmNetwork>(
+pub fn did_fail_on_assert<FEN: FoundryEvmNetwork>(
     call_result: &RawCallResult<FEN>,
     state_changeset: &StateChangeset,
 ) -> bool {
@@ -196,7 +205,7 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
         calldata,
     };
 
-    for (invariant, fail_on_revert) in &invariant_contract.invariant_fns {
+    for (idx, (invariant, fail_on_revert)) in invariant_contract.invariant_fns.iter().enumerate() {
         // We only care about invariants which we haven't broken yet.
         if invariant_failures.has_failure(invariant) {
             continue;
@@ -205,7 +214,7 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
         let (call_result, success) = call_invariant_function(
             executor,
             invariant_contract.address,
-            invariant.abi_encode_input(&[])?.into(),
+            invariant_contract.invariant_calldata(idx),
         )?;
         if call_result.execution_cancelled {
             return Ok((first_broken, true));
@@ -302,7 +311,7 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
             let (inv_result, success) = call_invariant_function(
                 &invariant_run.executor,
                 invariant_contract.address,
-                invariant_contract.anchor().abi_encode_input(&[])?.into(),
+                invariant_contract.anchor_calldata(),
             )?;
             if inv_result.execution_cancelled {
                 return Ok(ContinueOutcome { continues: true, cancelled: true });
@@ -415,9 +424,9 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
         }
 
         if reverted && !is_optimization && !invariant_config.has_delay() {
-            // If we don't fail test on revert then remove the reverted call from inputs.
-            // Delay-enabled campaigns keep reverted calls so shrinking can preserve their
-            // warp/roll contribution when building the final counterexample.
+            // If we don't fail the test on revert, remove the reverted call from inputs.
+            // Delay-enabled campaigns keep reverted calls so their warp/roll contribution can be
+            // replayed.
             invariant_run.inputs.pop();
         }
     }
@@ -467,6 +476,7 @@ pub(crate) fn assert_after_invariant<'a, FEN: FoundryEvmNetwork>(
 mod tests {
     use super::*;
     use crate::executors::{EarlyExit, ExecutorBuilder};
+    use alloy_dyn_abi::JsonAbiExt;
     use alloy_primitives::{Bytes, U256};
     use alloy_sol_types::SolCall;
     use foundry_cheatcodes::{CheatsConfig, Vm::expectRevert_0Call};
@@ -490,14 +500,8 @@ mod tests {
 
     #[test]
     fn cancellation_does_not_record_call_end_rewrite_as_invariant_failure() {
-        let cheats_config = Arc::new(CheatsConfig::new(
-            &Config::default(),
-            EvmOpts::default(),
-            None,
-            None,
-            None,
-            false,
-        ));
+        let cheats_config =
+            Arc::new(CheatsConfig::new(&Config::default(), EvmOpts::default(), None, None, false));
         let backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
         let mut executor = ExecutorBuilder::default()
             .inspectors(|stack| stack.cheatcodes(cheats_config))
@@ -506,6 +510,7 @@ mod tests {
                 EvmEnvFor::<EthEvmNetwork>::default(),
                 TxEnvFor::<EthEvmNetwork>::default(),
                 backend,
+                Default::default(),
             );
         let invariant_address = Address::repeat_byte(0x11);
         executor

@@ -1,6 +1,9 @@
-use alloy_json_abi::JsonAbi;
+use alloy_dyn_abi::{DynSolValue, Specifier};
+use alloy_json_abi::{Constructor, JsonAbi};
 use eyre::{Result, WrapErr};
-use foundry_common::{TestFunctionExt, fs, fs::json_files, selectors::SelectorKind, shell};
+use foundry_common::{
+    TestFunctionExt, fmt::parse_tokens, fs, fs::json_files, selectors::SelectorKind, shell,
+};
 use foundry_compilers::{
     Artifact, ArtifactId, ProjectCompileOutput, artifacts::CompactBytecode, utils::read_json_file,
 };
@@ -175,6 +178,18 @@ pub trait LoadConfig {
         load_config_from_provider(self.figment())
     }
 
+    /// Loads config and installs missing project dependencies.
+    fn load_config_with_dependencies(&self) -> Result<Config, ExtractConfigError> {
+        let mut config = self.load_config()?;
+        self.install_missing_dependencies(&mut config)?;
+        Ok(config)
+    }
+
+    /// Installs missing dependencies, reloading config only for automatic remapping discovery.
+    fn install_missing_dependencies(&self, config: &mut Config) -> Result<(), ExtractConfigError> {
+        crate::install::install_missing_dependencies(config, || self.load_config())
+    }
+
     /// Same as [`LoadConfig::load_config`] but does not emit warnings.
     fn load_config_no_warnings(&self) -> Result<Config, ExtractConfigError> {
         self.load_config_unsanitized_no_warnings().map(Config::sanitized)
@@ -250,6 +265,30 @@ pub fn read_constructor_args_file(constructor_args_path: PathBuf) -> Result<Vec<
         fs::read_to_string(constructor_args_path)?.split_whitespace().map(str::to_string).collect()
     };
     Ok(args)
+}
+
+/// Parses constructor arguments by matching them against the constructor's input parameters.
+pub fn parse_constructor_args(
+    constructor: &Constructor,
+    constructor_args: &[String],
+) -> Result<Vec<DynSolValue>> {
+    if constructor.inputs.len() != constructor_args.len() {
+        eyre::bail!(
+            "Constructor argument count mismatch: expected {} but got {}",
+            constructor.inputs.len(),
+            constructor_args.len()
+        );
+    }
+
+    let mut params = Vec::with_capacity(constructor.inputs.len());
+    for (input, arg) in constructor.inputs.iter().zip(constructor_args) {
+        let ty = input
+            .resolve()
+            .wrap_err_with(|| format!("Could not resolve constructor arg: input={input}"))?;
+        params.push((ty, arg));
+    }
+    let params = params.iter().map(|(ty, arg)| (ty, arg.as_str()));
+    parse_tokens(params).map_err(Into::into)
 }
 
 /// A slimmed down return from the executor used for returning minimal trace + gas metering info

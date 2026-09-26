@@ -1,8 +1,14 @@
 use alloy_json_abi::{Event, EventParam, InternalType, JsonAbi, Param};
 use clap::Parser;
-use comfy_table::{Cell, Table, modifiers::UTF8_ROUND_CORNERS, presets::ASCII_MARKDOWN};
+use comfy_table::{
+    Cell, Table,
+    presets::{ASCII_FULL, ASCII_MARKDOWN},
+};
 use eyre::{Result, eyre};
-use foundry_cli::opts::{BuildOpts, CompilerOpts};
+use foundry_cli::{
+    opts::{BuildOpts, CompilerOpts},
+    utils::LoadConfig,
+};
 use foundry_common::{
     compile::{PathOrContractInfo, ProjectCompiler},
     find_matching_contract_artifact, find_target_path, shell,
@@ -80,7 +86,8 @@ impl InspectArgs {
         };
 
         // Build the project
-        let mut project = modified_build_args.project()?;
+        let config = modified_build_args.load_config_with_dependencies()?;
+        let mut project = config.project()?;
         if !user_extra_output
             && !project.build_info
             && let Some(selection) = field.inspect_output_selection()
@@ -95,8 +102,12 @@ impl InspectArgs {
                 "linearization inspection is only supported for Solidity contracts (.sol targets)"
             );
         }
-        let compiler = ProjectCompiler::new().quiet(true);
-        let mut output = compiler.files([target_path.clone()]).compile(&project)?;
+        let compiler = ProjectCompiler::new()
+            .external_compilers(&config)
+            .external_artifacts(false)
+            .target_files([target_path.clone()])
+            .quiet(true);
+        let mut output = compiler.compile(&project)?;
 
         // Find the artifact
         let artifact = find_matching_contract_artifact(&mut output, &target_path, contract.name())?;
@@ -129,7 +140,14 @@ impl InspectArgs {
                 print_json(&artifact.gas_estimates)?;
             }
             ContractArtifactField::StorageLayout => {
-                print_storage_layout(artifact.storage_layout.as_ref(), wrap)?;
+                print_storage_layout(artifact.storage_layout.as_ref(), "storage layout", wrap)?;
+            }
+            ContractArtifactField::TransientStorageLayout => {
+                print_storage_layout(
+                    artifact.transient_storage_layout.as_ref(),
+                    "transient storage layout",
+                    wrap,
+                )?;
             }
             ContractArtifactField::DevDoc => {
                 print_json(&artifact.devdoc)?;
@@ -337,10 +355,11 @@ fn internal_ty(ty: &InternalType) -> String {
 
 pub fn print_storage_layout(
     storage_layout: Option<&StorageLayout>,
+    field: &str,
     should_wrap: bool,
 ) -> Result<()> {
     let Some(storage_layout) = storage_layout else {
-        return Err(missing_error("storage layout"));
+        return Err(missing_error(field));
     };
 
     if shell::is_json() {
@@ -428,9 +447,9 @@ fn print_table(
 ) -> Result<()> {
     let mut table = Table::new();
     if shell::is_markdown() {
-        table.load_preset(ASCII_MARKDOWN);
+        table.load_style(ASCII_MARKDOWN);
     } else {
-        table.apply_modifier(UTF8_ROUND_CORNERS);
+        table.load_style(ASCII_FULL.with_rounded_corners());
     }
     table.set_header(headers);
     if should_wrap {
@@ -558,6 +577,7 @@ pub enum ContractArtifactField {
     MethodIdentifiers,
     GasEstimates,
     StorageLayout,
+    TransientStorageLayout,
     DevDoc,
     Ir,
     IrOptimized,
@@ -645,6 +665,10 @@ impl_value_enum! {
                              | "gasestimates",
         StorageLayout     => "storageLayout" | "storage_layout" | "storage-layout"
                              | "storagelayout" | "storage",
+        TransientStorageLayout => "transientStorageLayout" | "transient_storage_layout"
+                             | "transient-storage-layout" | "transientstoragelayout"
+                             | "transientStorage" | "transient-storage" | "transient_storage"
+                             | "transientstorage" | "transient" | "tsl",
         DevDoc            => "devdoc" | "dev-doc" | "devDoc",
         Ir                => "ir" | "iR" | "IR",
         IrOptimized       => "irOptimized" | "ir-optimized" | "iroptimized" | "iro" | "iropt",
@@ -680,6 +704,7 @@ impl TryFrom<ContractArtifactField> for ContractOutputSelection {
             Caf::MethodIdentifiers => Ok(Self::Evm(EvmOutputSelection::MethodIdentifiers)),
             Caf::GasEstimates => Ok(Self::Evm(EvmOutputSelection::GasEstimates)),
             Caf::StorageLayout => Ok(Self::StorageLayout),
+            Caf::TransientStorageLayout => Ok(Self::TransientStorageLayout),
             Caf::DevDoc => Ok(Self::DevDoc),
             Caf::Ir => Ok(Self::Ir),
             Caf::IrOptimized => Ok(Self::IrOptimized),
@@ -713,6 +738,7 @@ impl PartialEq<ContractOutputSelection> for ContractArtifactField {
                 | (Self::MethodIdentifiers, Cos::Evm(Eos::MethodIdentifiers))
                 | (Self::GasEstimates, Cos::Evm(Eos::GasEstimates))
                 | (Self::StorageLayout, Cos::StorageLayout)
+                | (Self::TransientStorageLayout, Cos::TransientStorageLayout)
                 | (Self::DevDoc, Cos::DevDoc)
                 | (Self::Ir, Cos::Ir)
                 | (Self::IrOptimized, Cos::IrOptimized)

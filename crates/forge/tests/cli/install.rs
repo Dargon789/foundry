@@ -8,14 +8,15 @@ use foundry_test_utils::util::{
     ExtTester, FORGE_STD_REVISION, OutputExt, TestCommand, pretty_err, read_string,
 };
 use semver::Version;
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 fn lockfile_get(root: &Path, dep_path: &Path) -> Option<DepIdentifier> {
     let mut l = Lockfile::new(root);
@@ -89,6 +90,26 @@ Missing dependencies found. Installing now...
 "#]]);
 
     // assert lockfile
+    let forge_std = lockfile_get(prj.root(), &PathBuf::from("lib/forge-std")).unwrap();
+    assert_eq!(forge_std.rev(), FORGE_STD_REVISION);
+});
+
+// Checks missing dependencies are auto installed.
+forgetest_init!(can_install_missing_deps_lint, |prj, cmd| {
+    prj.initialize_default_contracts();
+    prj.clear();
+
+    // Wipe forge-std.
+    let forge_std_dir = prj.root().join("lib/forge-std");
+    pretty_err(&forge_std_dir, fs::remove_dir_all(&forge_std_dir));
+
+    cmd.arg("lint").assert_success().stdout_eq(str![""]).stderr_eq(str![[r#"
+Missing dependencies found. Installing now...
+[UPDATING_DEPENDENCIES]
+...
+"#]]);
+
+    // Assert lockfile.
     let forge_std = lockfile_get(prj.root(), &PathBuf::from("lib/forge-std")).unwrap();
     assert_eq!(forge_std.rev(), FORGE_STD_REVISION);
 });
@@ -477,6 +498,40 @@ forgetest!(can_install_empty, |prj, cmd| {
     cmd.assert_empty_stdout();
 });
 
+// <https://github.com/foundry-rs/foundry/issues/7205>
+forgetest!(install_from_nested_git_repo_uses_project_root, |prj, cmd| {
+    prj.update_config(|config| config.libs = vec![PathBuf::from("dependencies")]);
+    cmd.git_init();
+
+    let nested = prj.root().join("vendor/dependency");
+    fs::create_dir_all(&nested).unwrap();
+    Git::new(&nested).init().unwrap();
+
+    cmd.forge_fuse().current_dir(&nested).args(["install", "--no-git"]).assert_success();
+
+    assert!(prj.root().join("dependencies").is_dir());
+    assert!(!nested.join("lib").exists());
+});
+
+forgetest!(install_from_nested_foundry_project_uses_nested_root, |prj, cmd| {
+    prj.update_config(|config| config.libs = vec![PathBuf::from("outer-dependencies")]);
+    cmd.git_init();
+
+    let nested = prj.root().join("vendor/dependency");
+    fs::create_dir_all(&nested).unwrap();
+    Git::new(&nested).init().unwrap();
+    fs::write(
+        nested.join(Config::FILE_NAME),
+        "[profile.default]\nlibs = [\"nested-dependencies\"]\n",
+    )
+    .unwrap();
+
+    cmd.forge_fuse().current_dir(&nested).args(["install", "--no-git"]).assert_success();
+
+    assert!(nested.join("nested-dependencies").is_dir());
+    assert!(!prj.root().join("outer-dependencies").exists());
+});
+
 // test to check that package can be reinstalled after manually removing the directory
 forgetest!(can_reinstall_after_manual_remove, |prj, cmd| {
     cmd.git_init();
@@ -515,6 +570,55 @@ Installing forge-std in [..] (url: https://github.com/foundry-rs/forge-std, tag:
     install(&mut cmd);
     let forge_std_lock = lockfile_get(prj.root(), &PathBuf::from("lib/forge-std")).unwrap();
     assert!(matches!(forge_std_lock, DepIdentifier::Tag { .. }));
+});
+
+// https://github.com/foundry-rs/foundry/issues/4353
+forgetest!(can_reinit_submodules, |prj, cmd| {
+    cmd.git_init();
+
+    let source = tempfile::tempdir().unwrap();
+    let source_git = Git::new(source.path());
+    source_git.init().unwrap();
+    fs::write(source.path().join("source.txt"), "first revision\n").unwrap();
+    source_git.add(["source.txt"]).unwrap();
+    source_git.commit("first revision").unwrap();
+    let first_rev = source_git.head().unwrap();
+
+    fs::write(source.path().join("source.txt"), "second revision\n").unwrap();
+    source_git.add(["source.txt"]).unwrap();
+    source_git.commit("second revision").unwrap();
+    let second_rev = source_git.head().unwrap();
+
+    let output = Command::new("git")
+        .current_dir(prj.root())
+        .args(["-c", "protocol.file.allow=always", "submodule", "add", "--"])
+        .arg(source.path())
+        .arg("lib/dep")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let dependency = prj.root().join("lib/dep");
+    let dependency_git = Git::new(&dependency);
+    dependency_git.checkout(false, &first_rev).unwrap();
+    cmd.git_add();
+    cmd.git_commit("add dependency");
+
+    dependency_git.checkout(false, &second_rev).unwrap();
+    Git::new(prj.root()).add(["lib/dep"]).unwrap();
+    cmd.git_commit("advance dependency");
+
+    dependency_git.checkout(false, &first_rev).unwrap();
+    fs::write(dependency.join("source.txt"), "local edit\n").unwrap();
+
+    cmd.forge_fuse();
+    cmd.env("GIT_ALLOW_PROTOCOL", "file");
+    cmd.arg("reinit").assert_success();
+    assert_eq!(dependency_git.head().unwrap(), second_rev);
+    assert_eq!(
+        read_string(dependency.join("source.txt")).replace("\r\n", "\n"),
+        "second revision\n"
+    );
 });
 
 // test that we can repeatedly install the same dependency without changes

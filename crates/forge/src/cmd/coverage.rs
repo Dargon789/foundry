@@ -1,23 +1,36 @@
 use super::{
-    install,
-    test::{TestArgs, TestExecutionOptions},
+    test::{ProjectPathsAwareFilter, TestArgs, TestExecutionOptions},
     watch::WatchArgs,
 };
 use crate::coverage::{
     BytecodeReporter, ContractId, CoverageAttributionReporter, CoverageReport, CoverageReporter,
-    CoverageSummaryReporter, DebugReporter, ItemAnchor, LcovReporter, ResolvedHitMap,
+    CoverageSummaryReporter, DebugReporter, ItemAnchors, LcovReporter, ResolvedHitMap,
     ResolvedHitMaps,
     analysis::{SourceAnalysis, SourceFiles},
-    anchors::find_anchors,
+    anchors::{find_anchors, find_execution_anchors},
 };
-use alloy_primitives::{Address, Bytes, U256, map::HashMap};
+use alloy_json_abi::StateMutability;
+use alloy_primitives::{
+    Address, Bytes, U256, keccak256,
+    map::{HashMap, HashSet},
+};
 use clap::{Parser, ValueHint};
 use eyre::Result;
-use foundry_cli::utils::{LoadConfig, STATIC_FUZZ_SEED};
-use foundry_common::{compile::ProjectCompiler, errors::convert_solar_errors};
+use foundry_cli::utils::{FoundryPathExt, LoadConfig, STATIC_FUZZ_SEED};
+use foundry_common::{
+    TestFilter, compile::ProjectCompiler, errors::convert_solar_errors, version::SHORT_VERSION,
+};
 use foundry_compilers::{
-    Artifact, ArtifactId, Project, ProjectCompileOutput, ProjectPathsConfig, VYPER_EXTENSIONS,
-    artifacts::{CompactBytecode, CompactDeployedBytecode, sourcemap::SourceMap},
+    Artifact, ArtifactId, Graph, Project, ProjectCompileOutput, ProjectPathsConfig,
+    VYPER_EXTENSIONS,
+    artifacts::{CompactBytecode, CompactDeployedBytecode, Source, sourcemap::SourceMap},
+    cache::SOLIDITY_FILES_CACHE_FILENAME,
+    compilers::{
+        Language,
+        multi::{MultiCompilerLanguage, MultiCompilerParser},
+    },
+    error::SolcError,
+    utils::source_files_iter,
 };
 use foundry_config::{
     Config, CoverageConfig, CoverageReportKind, InlineConfig, parse_lcov_version,
@@ -27,6 +40,8 @@ use globset::{Glob, GlobSetBuilder};
 use rayon::prelude::*;
 use semver::Version;
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -40,7 +55,12 @@ foundry_config::impl_figment_convert!(CoverageArgs, test);
 /// option in `foundry.toml`. CLI flags take precedence over config; the helper
 /// `resolve_with` merges them after the config is loaded.
 #[derive(Parser)]
-#[command(after_long_help = r#"Compatibility:
+#[command(after_long_help = r#"Source attribution:
+  Coverage follows compiler source maps. Inherited modifier code is reported under the
+  source where the modifier is declared. Dependency sources are excluded by default;
+  use `--include-libs` to include their coverage.
+
+Compatibility:
   `forge coverage` supports test filters and `--watch`, but not test-only output or
   execution modes such as `--json`, `--junit`, `--list`, `--debug`, flame profiles,
   symbolic artifact replay, showmap replay, brutalization, or mutation testing. Use
@@ -91,7 +111,7 @@ pub struct CoverageArgs {
     )]
     report_file: Option<PathBuf>,
 
-    /// Whether to include libraries in the coverage report.
+    /// Include dependency sources in the coverage report.
     #[arg(long)]
     include_libs: bool,
 
@@ -137,11 +157,7 @@ impl CoverageArgs {
         let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
 
         // install missing dependencies
-        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
-        {
-            // need to re-configure here to also catch additional remappings
-            config = self.load_config()?;
-        }
+        self.install_missing_dependencies(&mut config)?;
 
         // Default to a static fuzz seed so coverage reports are deterministic,
         // but allow the user to override it via `--fuzz-seed` or `[fuzz] seed` in config.
@@ -152,9 +168,10 @@ impl CoverageArgs {
         // Merge CLI args with `[profile.<name>.coverage]` config values. CLI
         // flags take precedence; unset CLI flags fall back to the config.
         self.resolve_with(&config.coverage);
+        let filter = self.test.filter(&config)?;
 
         let (paths, mut output) = {
-            let (project, output) = self.build(&config)?;
+            let (project, output) = self.build(&config, &filter)?;
             (project.paths, output)
         };
 
@@ -171,7 +188,7 @@ impl CoverageArgs {
         let report = self.prepare(&paths, &mut output)?;
 
         sh_println!("Running tests...")?;
-        self.collect(&paths.root, &output, report, config, evm_opts).await
+        self.collect(&paths.root, &output, report, config, evm_opts, filter).await
     }
 
     /// Merge `[profile.<name>.coverage]` config values into this struct. CLI
@@ -228,8 +245,45 @@ impl CoverageArgs {
     }
 
     /// Builds the project.
-    fn build(&self, config: &Config) -> Result<(Project, ProjectCompileOutput)> {
+    fn build(
+        &self,
+        config: &Config,
+        filter: &ProjectPathsAwareFilter,
+    ) -> Result<(Project, ProjectCompileOutput)> {
         let mut project = config.ephemeral_project()?;
+        // A contended or unavailable cache retains ephemeral compilation. Keep the lock until
+        // artifacts and build contexts have been loaded or published together.
+        let cache = (config.cache && !config.deny.warnings())
+            .then(|| config.coverage_cache_path())
+            .flatten()
+            .and_then(|path| {
+                fs::create_dir_all(path.parent()?).ok()?;
+                let lock = Config::lock_coverage_cache(&path).ok()?;
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        if fs::File::create_new(path.join(Config::COVERAGE_CACHE_MARKER)).is_err() {
+                            let _ = fs::remove_dir(&path);
+                            return None;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if !path.join(Config::COVERAGE_CACHE_MARKER).is_file() {
+                            return None;
+                        }
+                    }
+                    Err(_) => return None,
+                }
+                Some((path, lock))
+            });
+        let original_paths = project.paths.clone();
+        if let Some((path, _)) = &cache {
+            project.cached = true;
+            project.no_artifacts = false;
+            project.paths.cache = path.join(SOLIDITY_FILES_CACHE_FILENAME);
+            project.paths.artifacts = path.join("artifacts");
+            project.paths.build_infos = path.join("build-info");
+            project.paths.slash_paths();
+        }
 
         if self.ir_minimum {
             sh_warn!(
@@ -250,10 +304,132 @@ impl CoverageArgs {
 
         config.disable_optimizations(&mut project, self.ir_minimum);
 
-        let output = ProjectCompiler::new()
-            .dynamic_test_linking(config.dynamic_test_linking)
-            .compile(&project)?
-            .with_stripped_file_prefixes(project.root());
+        let files = (filter.args().path_pattern.is_some()
+            || filter.args().path_pattern_inverse.is_some())
+        .then(|| {
+            source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
+                .chain(
+                    source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS)
+                        // Preserve path-filter behavior for conventional test files while still
+                        // scanning non-test fixtures under the test root.
+                        .filter(|path| !path.is_sol_test() || filter.matches_path(path)),
+                )
+                // Coverage reports include scripts even though they are not test targets.
+                .chain(source_files_iter(&config.script, MultiCompilerLanguage::FILE_EXTENSIONS))
+                .collect::<BTreeSet<_>>()
+        });
+        let compile = |project: &Project| {
+            let mut compiler = ProjectCompiler::new()
+                .external_compilers(config)
+                .external_artifacts(false)
+                .dynamic_test_linking(config.dynamic_test_linking);
+            if let Some(files) = &files {
+                compiler = compiler.files(files.iter().cloned());
+            }
+            compiler.compile(project)
+        };
+        // Coverage needs complete build contexts, including sources without contract artifacts.
+        // Invalidate the owned cache as a whole on edits so source IDs, artifact names, and
+        // build-info files all belong to the same compilation.
+        let cached_output = (|| -> Result<Option<ProjectCompileOutput>> {
+            let Some((path, _)) = &cache else { return Ok(None) };
+            let mut sources = if let Some(files) = &files
+                && !files.is_empty()
+            {
+                Source::read_all(files)?
+            } else {
+                project.paths.read_input_files()?
+            };
+            if let Some(filter) = &project.sparse_output {
+                sources.retain(|path, _| filter.is_match(path));
+            }
+            let graph = Graph::<MultiCompilerParser>::resolve_sources(&project.paths, sources)?;
+            let resolved = graph.into_sources_by_version(&project)?;
+            let mut jobs = resolved
+                .sources
+                .iter()
+                .flat_map(|(language, jobs)| {
+                    jobs.iter().map(move |(version, sources, (profile, settings))| {
+                        let sources = sources
+                            .iter()
+                            .map(|(path, source)| {
+                                (path, source.content_hash(), source.kind.is_dirty())
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::to_value((language, version, profile, settings, sources))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            jobs.sort_unstable_by_key(serde_json::Value::to_string);
+            let primary_profiles = resolved.primary_profiles.iter().collect::<BTreeMap<_, _>>();
+            let mut identity = serde_json::to_value((
+                SHORT_VERSION,
+                &project.paths,
+                (&config.solc, &config.vyper, &config.extra_args),
+                (&config.extra_output, &config.extra_output_files),
+                config.dynamic_test_linking,
+                jobs,
+                primary_profiles,
+            ))?;
+            identity.sort_all_objects();
+            let fingerprint = keccak256(serde_json::to_vec(&identity)?).to_string();
+            let marker = path.join(Config::COVERAGE_CACHE_MARKER);
+            if fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
+                // Retain ownership even if compilation fails before the new fingerprint is saved.
+                fs::write(&marker, "")?;
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    if entry.file_name() == Config::COVERAGE_CACHE_MARKER {
+                        continue;
+                    }
+                    if entry.file_type()?.is_dir() {
+                        fs::remove_dir_all(entry.path())?;
+                    } else {
+                        fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+            let output = compile(&project)?;
+            // Compiler builds with no artifacts can be pruned from the cache. Coverage still
+            // reports their free functions, so recover their source IDs with a fresh compilation.
+            let mapped_sources = output
+                .builds()
+                .flat_map(|(_, build)| build.source_id_to_path.values().map(PathBuf::as_path))
+                .collect::<HashSet<_>>();
+            if output
+                .graph()
+                .files()
+                .any(|idx| !mapped_sources.contains(output.graph().node_path(idx)))
+            {
+                return Ok(None);
+            }
+            // Publication is optional once the compiler has returned a complete output.
+            if let Err(err) = fs::write(marker, fingerprint) {
+                debug!(%err, "failed to publish coverage cache fingerprint");
+            }
+            Ok(Some(output))
+        })();
+        let output = match cached_output {
+            Ok(Some(output)) => output,
+            Err(err)
+                if !err.chain().any(|cause| {
+                    cause.is::<std::io::Error>()
+                        || matches!(cause.downcast_ref(), Some(SolcError::Io(_)))
+                }) =>
+            {
+                return Err(err);
+            }
+            result => {
+                if let Err(err) = result {
+                    debug!(%err, "coverage cache unavailable; compiling without persistence");
+                }
+                project.cached = false;
+                project.no_artifacts = true;
+                project.paths = original_paths;
+                compile(&project)?
+            }
+        };
+        let output = output.with_stripped_file_prefixes(project.root());
 
         Ok((project, output))
     }
@@ -276,32 +452,32 @@ impl CoverageArgs {
         let output = &*output;
 
         // Collect source files.
-        let mut versioned_sources = HashMap::<Version, SourceFiles>::default();
-        for (path, source_file, version) in output.output().sources.sources_with_version() {
-            // Filter out vyper sources.
-            if path
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|ext| VYPER_EXTENSIONS.contains(&ext))
-            {
-                continue;
+        let mut sources_by_build = HashMap::<String, SourceFiles>::default();
+        for (build_id, build) in output.builds() {
+            for (source_id, path) in &build.source_id_to_path {
+                if output.graph().get_parsed_source(path).is_none()
+                    || path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|ext| VYPER_EXTENSIONS.contains(&ext))
+                {
+                    continue;
+                }
+                let path = path.strip_prefix(&project_paths.root).unwrap_or(path);
+                report.add_source(build_id.clone(), *source_id as usize, path.to_path_buf());
+
+                if (!self.include_libs && project_paths.has_library_ancestor(path))
+                    || (self.exclude_tests && project_paths.is_test(path))
+                {
+                    continue;
+                }
+
+                sources_by_build
+                    .entry(build_id.clone())
+                    .or_default()
+                    .sources
+                    .insert(*source_id, project_paths.root.join(path));
             }
-
-            report.add_source(version.clone(), source_file.id as usize, path.clone());
-
-            // Filter out libs dependencies and tests.
-            if (!self.include_libs && project_paths.has_library_ancestor(path))
-                || (self.exclude_tests && project_paths.is_test(path))
-            {
-                continue;
-            }
-
-            let path = project_paths.root.join(path);
-            versioned_sources
-                .entry(version.clone())
-                .or_default()
-                .sources
-                .insert(source_file.id, path);
         }
 
         // Get source maps and bytecodes.
@@ -309,17 +485,17 @@ impl CoverageArgs {
             .artifact_ids()
             .par_bridge() // This parses source maps, so we want to run it in parallel.
             .filter_map(|(id, artifact)| {
-                let source_id = report.get_source_id(id.version.clone(), id.source.clone())?;
+                let source_id = report.get_source_id(&id.build_id, &id.source)?;
                 ArtifactData::new(&id, source_id, artifact)
             })
             .collect();
 
         // Add coverage items.
-        for (version, sources) in &versioned_sources {
+        for (build_id, sources) in &sources_by_build {
             let source_analysis = SourceAnalysis::new(sources, output)?;
             let anchors = artifacts
                 .par_iter()
-                .filter(|artifact| artifact.contract_id.version == *version)
+                .filter(|artifact| artifact.contract_id.build_id == *build_id)
                 .map(|artifact| {
                     let creation_code_anchors = artifact.creation.find_anchors(&source_analysis);
                     let deployed_code_anchors = artifact.deployed.find_anchors(&source_analysis);
@@ -327,7 +503,23 @@ impl CoverageArgs {
                 })
                 .collect_vec_list();
             report.add_anchors(anchors.into_iter().flatten());
-            report.add_analysis(version.clone(), source_analysis);
+            for artifact in
+                artifacts.iter().filter(|artifact| artifact.contract_id.build_id == *build_id)
+            {
+                let execution_anchors = find_execution_anchors(
+                    artifact.contract_id.source_id as u32,
+                    &artifact.contract_id.contract_name,
+                    &source_analysis,
+                );
+                report.add_execution_anchors(
+                    artifact.contract_id.clone(),
+                    execution_anchors,
+                    artifact.function_selectors.iter().copied(),
+                    artifact.has_receive,
+                    artifact.fallback_payable,
+                );
+            }
+            report.add_analysis(build_id.clone(), source_analysis);
         }
 
         if self.reporters.iter().any(|reporter| reporter.needs_source_maps()) {
@@ -348,8 +540,8 @@ impl CoverageArgs {
         mut report: CoverageReport,
         config: Config,
         evm_opts: EvmOpts,
+        filter: ProjectPathsAwareFilter,
     ) -> Result<()> {
-        let filter = self.test.filter(&config)?;
         let inline_config = Arc::new(InlineConfig::new_parsed(output, &config)?);
         let outcome = self
             .test
@@ -393,13 +585,14 @@ impl CoverageArgs {
                         continue;
                     };
 
-                    let Some(source_id) = report
-                        .get_source_id(artifact_id.version.clone(), artifact_id.source.clone())
+                    let Some(source_id) =
+                        report.get_source_id(&artifact_id.build_id, &artifact_id.source)
                     else {
                         continue;
                     };
                     let contract_id = ContractId {
                         version: artifact_id.version.clone(),
+                        build_id: artifact_id.build_id.clone(),
                         source_id,
                         contract_name: artifact_id.name.as_str().into(),
                     };
@@ -499,13 +692,27 @@ pub struct ArtifactData {
     pub contract_id: ContractId,
     pub creation: BytecodeData,
     pub deployed: BytecodeData,
+    pub function_selectors: Vec<[u8; 4]>,
+    pub has_receive: bool,
+    pub fallback_payable: bool,
 }
 
 impl ArtifactData {
     pub fn new(id: &ArtifactId, source_id: usize, artifact: &impl Artifact) -> Option<Self> {
+        let abi = artifact.get_abi();
+        let function_selectors = abi
+            .as_ref()
+            .map(|abi| abi.functions().map(|function| function.selector().into()).collect())
+            .unwrap_or_default();
+        let has_receive = abi.as_ref().is_some_and(|abi| abi.receive.is_some());
+        let fallback_payable = abi
+            .as_ref()
+            .and_then(|abi| abi.fallback)
+            .is_some_and(|fallback| fallback.state_mutability == StateMutability::Payable);
         Some(Self {
             contract_id: ContractId {
                 version: id.version.clone(),
+                build_id: id.build_id.clone(),
                 source_id,
                 contract_name: id.name.as_str().into(),
             },
@@ -521,6 +728,9 @@ impl ArtifactData {
                     .get_deployed_bytecode()
                     .and_then(|bytecode| dummy_link_deployed_bytecode(bytecode.into_owned()))?,
             ),
+            function_selectors,
+            has_receive,
+            fallback_payable,
         })
     }
 }
@@ -544,7 +754,7 @@ impl BytecodeData {
         Self { source_map, bytecode, ic_pc_map }
     }
 
-    pub fn find_anchors(&self, source_analysis: &SourceAnalysis) -> Vec<ItemAnchor> {
+    pub fn find_anchors(&self, source_analysis: &SourceAnalysis) -> ItemAnchors {
         find_anchors(&self.bytecode, &self.source_map, &self.ic_pc_map, source_analysis)
     }
 }

@@ -9,6 +9,7 @@ use path_slash::PathExt;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -44,6 +45,13 @@ pub const STATIC_FUZZ_SEED: [u8; 32] = [
     0x01, 0x00, 0xfa, 0x69, 0xa5, 0xf1, 0x71, 0x0a, 0x95, 0xcd, 0xef, 0x94, 0x88, 0x9b, 0x02, 0x84,
     0x5d, 0x64, 0x0b, 0x19, 0xad, 0xf0, 0xe3, 0x57, 0xb8, 0xd4, 0xbe, 0x7d, 0x49, 0xee, 0x70, 0xe6,
 ];
+
+/// Applies an optional percentage multiplier to a gas estimate.
+pub fn apply_gas_estimate_multiplier(estimate: u64, multiplier: Option<u64>) -> Result<u64> {
+    let Some(multiplier) = multiplier else { return Ok(estimate) };
+    let adjusted = u128::from(estimate) * u128::from(multiplier) / 100;
+    adjusted.try_into().map_err(|_| eyre::eyre!("multiplied gas estimate exceeds u64"))
+}
 
 /// Regex used to parse `.gitmodules` file and capture the submodule path and branch.
 pub static SUBMODULE_BRANCH_REGEX: LazyLock<Regex> =
@@ -197,28 +205,29 @@ pub fn common_setup() {
     enable_paint();
 }
 
-/// Loads a dotenv file, from the cwd and the project root, ignoring potential failure.
-///
-/// We could use `warn!` here, but that would imply that the dotenv file can't configure
-/// the logging behavior of Foundry.
-///
-/// Similarly, we could just use `eprintln!`, but colors are off limits otherwise dotenv is implied
-/// to not be able to configure the colors. It would also mess up the JSON output.
+/// Loads dotenv files from the cwd and project root, ignoring parse failures.
 pub fn load_dotenv() {
-    let load = |p: &Path| {
-        dotenvy::from_path(p.join(".env")).ok();
-    };
-
     // we only want the .env file of the cwd and project root
     // `find_project_root` calls `current_dir` internally so both paths are either both `Ok` or
     // both `Err`
-    if let (Ok(cwd), Ok(prj_root)) = (std::env::current_dir(), find_project_root(None)) {
-        load(&prj_root);
-        if cwd != prj_root {
-            // prj root and cwd can be identical
-            load(&cwd);
+    let mut paths = Vec::new();
+    if let (Ok(cwd), Ok(project_root)) = (std::env::current_dir(), find_project_root(None)) {
+        let project_env = project_root.join(".env");
+        if project_env.is_file() {
+            paths.push(project_env);
         }
-    };
+        if cwd != project_root {
+            // prj root and cwd can be identical
+            let cwd_env = cwd.join(".env");
+            if cwd_env.is_file() {
+                paths.push(cwd_env);
+            }
+        }
+    }
+
+    for path in paths {
+        dotenvy::from_path(path).ok();
+    }
 }
 
 /// Sets the default [`yansi`] color output condition.
@@ -788,6 +797,98 @@ ignore them in the `.gitignore` file."
         self.cmd().args(["submodule", "status"]).get_stdout_lossy().map(|stdout| stdout.parse())?
     }
 
+    /// Returns submodules at or below `path`, with paths relative to this Git root.
+    pub fn submodules_in(&self, path: &Path) -> Result<Vec<SubmoduleCheckout>> {
+        self.submodules_in_worktree(path, self.root, Path::new(""))
+    }
+
+    /// Returns submodules at or below `path`, with paths relative to this Git root, using mappings
+    /// from the enclosing worktree.
+    pub fn submodules_in_worktree(
+        &self,
+        path: &Path,
+        worktree_root: &Path,
+        worktree_prefix: &Path,
+    ) -> Result<Vec<SubmoduleCheckout>> {
+        let pathspec = if path.as_os_str().is_empty() { Path::new(".") } else { path };
+        let output = self
+            .cmd()
+            .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
+            .arg(pathspec)
+            .exec()?;
+        let (_, mappings) = self.submodule_mappings_at(worktree_root)?;
+        let mut gitlinks = BTreeMap::new();
+        for entry in output.stdout.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+            let Some(separator) = entry.iter().position(|byte| *byte == b'\t') else {
+                return Err(eyre::eyre!("invalid index entry"));
+            };
+            let mut fields = std::str::from_utf8(&entry[..separator])?.split_ascii_whitespace();
+            let Some(mode) = fields.next() else {
+                return Err(eyre::eyre!("invalid index entry"));
+            };
+            let Some(rev) = fields.next() else {
+                return Err(eyre::eyre!("invalid index entry"));
+            };
+            let Some(stage) = fields.next() else {
+                return Err(eyre::eyre!("invalid index entry"));
+            };
+            if fields.next().is_some() {
+                return Err(eyre::eyre!("invalid index entry"));
+            }
+            if mode != "160000" {
+                continue;
+            }
+
+            let submodule_path = PathBuf::from(std::str::from_utf8(&entry[separator + 1..])?);
+            let worktree_path =
+                foundry_common::fs::normalize_path(&worktree_prefix.join(&submodule_path));
+            if !mappings.contains(&worktree_path) {
+                gitlinks.insert(
+                    submodule_path.clone(),
+                    SubmoduleCheckout {
+                        status: SubmoduleCheckoutStatus::MissingMapping,
+                        rev: rev.to_string(),
+                        path: submodule_path,
+                    },
+                );
+                continue;
+            }
+            if stage != "0" {
+                gitlinks.insert(
+                    submodule_path.clone(),
+                    SubmoduleCheckout {
+                        status: SubmoduleCheckoutStatus::Conflicted,
+                        rev: rev.to_string(),
+                        path: submodule_path,
+                    },
+                );
+                continue;
+            }
+
+            let status = self
+                .cmd()
+                .args(["--literal-pathspecs", "submodule", "status", "--"])
+                .arg(&submodule_path)
+                .get_stdout_lossy()?;
+            let (status, rev) = match status.as_bytes().first() {
+                Some(b'-') => (SubmoduleCheckoutStatus::Uninitialized, &status[1..]),
+                Some(b'+') => (SubmoduleCheckoutStatus::Modified, &status[1..]),
+                Some(b'U') => (SubmoduleCheckoutStatus::Conflicted, &status[1..]),
+                Some(_) => (SubmoduleCheckoutStatus::Current, status.as_str()),
+                None => return Err(eyre::eyre!("missing submodule status")),
+            };
+            let rev = rev
+                .split_ascii_whitespace()
+                .next()
+                .ok_or_else(|| eyre::eyre!("invalid submodule status"))?;
+            gitlinks.insert(
+                submodule_path.clone(),
+                SubmoduleCheckout { status, rev: rev.to_string(), path: submodule_path },
+            );
+        }
+        Ok(gitlinks.into_values().collect())
+    }
+
     pub fn submodule_sync(self) -> Result<()> {
         self.cmd().stderr(self.stderr()).args(["submodule", "sync"]).exec().map(drop)
     }
@@ -802,9 +903,18 @@ ignore them in the `.gitignore` file."
 
     /// Returns whether `.gitmodules` contains the default section name or an exact path mapping.
     pub fn has_submodule_mapping(self, path: &Path) -> Result<bool> {
-        let gitmodules = self.root.join(".gitmodules");
+        let (names, paths) = self.submodule_mappings()?;
+        Ok(names.contains(path) || paths.contains(path))
+    }
+
+    fn submodule_mappings(self) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
+        self.submodule_mappings_at(self.root)
+    }
+
+    fn submodule_mappings_at(self, root: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
+        let gitmodules = root.join(".gitmodules");
         if !gitmodules.exists() {
-            return Ok(false);
+            return Ok(Default::default());
         }
 
         let output = self
@@ -815,7 +925,8 @@ ignore them in the `.gitignore` file."
             .output()?;
         match output.status.code() {
             Some(0) => {
-                let expected_path = path.to_slash_lossy();
+                let mut names = BTreeSet::new();
+                let mut paths = BTreeSet::new();
                 for entry in
                     output.stdout.split(|byte| *byte == 0).filter(|entry| !entry.is_empty())
                 {
@@ -826,13 +937,14 @@ ignore them in the `.gitignore` file."
                     let value = std::str::from_utf8(&entry[separator + 1..])?;
                     let Some(key) = key.strip_prefix("submodule.") else { continue };
                     let Some((name, field)) = key.rsplit_once('.') else { continue };
-                    if name == expected_path || field == "path" && value == expected_path {
-                        return Ok(true);
+                    names.insert(PathBuf::from(name));
+                    if field == "path" {
+                        paths.insert(PathBuf::from(value));
                     }
                 }
-                Ok(false)
+                Ok((names, paths))
             }
-            Some(1) => Ok(false),
+            Some(1) => Ok(Default::default()),
             _ => Err(eyre::eyre!(
                 "failed to inspect .gitmodules: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -1004,6 +1116,43 @@ impl Submodule {
     }
 }
 
+/// A submodule checkout inspected without changing its worktree or index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmoduleCheckout {
+    status: SubmoduleCheckoutStatus,
+    rev: String,
+    path: PathBuf,
+}
+
+impl SubmoduleCheckout {
+    pub const fn status(&self) -> SubmoduleCheckoutStatus {
+        self.status
+    }
+
+    pub fn rev(&self) -> &str {
+        &self.rev
+    }
+
+    pub const fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+/// State of an inspected submodule checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmoduleCheckoutStatus {
+    /// The checkout matches the commit recorded by the superproject.
+    Current,
+    /// The submodule has not been initialized.
+    Uninitialized,
+    /// The checkout differs from the commit recorded by the superproject.
+    Modified,
+    /// The submodule has merge conflicts.
+    Conflicted,
+    /// The index contains a gitlink without a corresponding `.gitmodules` mapping.
+    MissingMapping,
+}
+
 impl FromStr for Submodule {
     type Err = eyre::Report;
 
@@ -1058,6 +1207,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn applies_gas_estimate_multiplier() {
+        assert_eq!(apply_gas_estimate_multiplier(21_000, None).unwrap(), 21_000);
+        assert_eq!(apply_gas_estimate_multiplier(21_000, Some(150)).unwrap(), 31_500);
+        assert_eq!(
+            apply_gas_estimate_multiplier(21_000, Some(1_000_000_000_000_000)).unwrap(),
+            210_000_000_000_000_000
+        );
+        assert!(apply_gas_estimate_multiplier(u64::MAX, Some(101)).is_err());
+    }
+
+    #[test]
     fn parse_submodule_status() {
         let s = "+8829465a08cac423dcf59852f21e448449c1a1a8 lib/openzeppelin-contracts (v4.8.0-791-g8829465a)";
         let sub = Submodule::from_str(s).unwrap();
@@ -1086,6 +1246,23 @@ mod tests {
         assert_eq!(subs[0].path(), Path::new("lib/forge-std"));
         assert_eq!(subs[1].rev(), "8829465a08cac423dcf59852f21e448449c1a1a8");
         assert_eq!(subs[1].path(), Path::new("lib/openzeppelin-contracts"));
+    }
+
+    #[test]
+    fn deserialize_submodule() {
+        let submodule: Submodule = serde_json::from_str(
+            r#"{"rev":"8829465a08cac423dcf59852f21e448449c1a1a8","path":"lib/dep"}"#,
+        )
+        .unwrap();
+        assert_eq!(submodule.rev(), "8829465a08cac423dcf59852f21e448449c1a1a8");
+        assert_eq!(submodule.path(), Path::new("lib/dep"));
+        assert_eq!(
+            serde_json::to_value(submodule).unwrap(),
+            serde_json::json!({
+                "rev": "8829465a08cac423dcf59852f21e448449c1a1a8",
+                "path": "lib/dep",
+            })
+        );
     }
 
     #[test]
@@ -1150,19 +1327,31 @@ mod tests {
         let mut cwd_file = File::create(cwd_env).unwrap();
         let mut prj_file = File::create(nested.join(".env")).unwrap();
 
-        cwd_file.write_all(b"TESTCWDKEY=cwd_val").unwrap();
+        cwd_file.write_all(b"TESTCWDKEY=cwd_val\nBROWSER=./project-browser").unwrap();
         cwd_file.sync_all().unwrap();
 
-        prj_file.write_all(b"TESTPRJKEY=prj_val").unwrap();
+        prj_file.write_all(b"TESTPRJKEY=prj_val\nBROWSER=./nested-browser").unwrap();
         prj_file.sync_all().unwrap();
 
+        let browser = env::var_os("BROWSER");
+        unsafe { env::remove_var("BROWSER") };
         let cwd = env::current_dir().unwrap();
-        env::set_current_dir(nested).unwrap();
+        env::set_current_dir(&nested).unwrap();
         load_dotenv();
         env::set_current_dir(cwd).unwrap();
 
+        let loaded_browser = env::var_os("BROWSER");
+        unsafe {
+            if let Some(browser) = browser {
+                env::set_var("BROWSER", browser);
+            } else {
+                env::remove_var("BROWSER");
+            }
+        }
+
         assert_eq!(env::var("TESTCWDKEY").unwrap(), "cwd_val");
         assert_eq!(env::var("TESTPRJKEY").unwrap(), "prj_val");
+        assert_eq!(loaded_browser.as_deref(), Some(OsStr::new("./project-browser")));
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use super::{install, watch::WatchArgs};
+use super::watch::WatchArgs;
+use crate::Lockfile;
 use clap::Parser;
 use eyre::Result;
 use forge_lint::{
@@ -26,14 +27,14 @@ use foundry_config::{
         error::Kind::InvalidType,
         value::{Dict, Map, Value},
     },
-    filter::expand_globs,
+    filter::{expand_globs, is_ignored_path},
 };
 use serde::Serialize;
 use solar::{
     interface::{Session, config::CompileOpts},
     sema::Compiler,
 };
-use std::path::PathBuf;
+use std::{fmt::Write, path::PathBuf};
 
 foundry_config::merge_impl_figment_convert!(BuildArgs, build);
 
@@ -89,29 +90,30 @@ pub struct BuildArgs {
 }
 
 impl BuildArgs {
-    pub async fn run(self) -> Result<ProjectCompileOutput> {
+    pub async fn run(self, locked: bool) -> Result<ProjectCompileOutput> {
         let mut config = self.load_config()?;
 
-        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
-        {
-            // need to re-configure here to also catch additional remappings
-            config = self.load_config()?;
+        if locked {
+            self.check_foundry_lock_consistency(&config)?;
         }
 
+        self.install_missing_dependencies(&mut config)?;
+
         self.check_soldeer_lock_consistency(&config).await;
-        self.check_foundry_lock_consistency(&config);
 
         let project = config.project()?;
 
         // Collect sources to compile if build subdirectories specified.
         let mut files = vec![];
+        let mut selected_paths = vec![];
         if let Some(paths) = &self.paths {
             for path in paths {
                 let joined = project.root().join(path);
                 let path = if joined.exists() { &joined } else { path };
+                selected_paths.push(path.clone());
                 files.extend(source_files_iter(path, MultiCompilerLanguage::FILE_EXTENSIONS));
             }
-            if files.is_empty() {
+            if files.is_empty() && config.external_compilers.is_empty() {
                 eyre::bail!("No source files found in specified build paths.");
             }
         }
@@ -119,17 +121,15 @@ impl BuildArgs {
         let format_json = shell::is_json();
 
         let mut output = ProjectCompiler::new()
+            .external_compilers(&config)
             .files(files)
+            .selected_paths(selected_paths)
             .dynamic_test_linking(config.dynamic_test_linking)
+            .print_compiler_settings(shell::verbosity() >= 2)
             .print_names(self.names)
             .print_sizes(self.sizes)
             .ignore_eip_3860(self.ignore_eip_3860)
-            .size_limits(
-                config
-                    .code_size_limit
-                    .map(ContractSizeLimits::with_runtime_limit)
-                    .unwrap_or_default(),
-            )
+            .size_limits(contract_size_limits(&config))
             .bail(!format_json)
             .compile(&project)?;
 
@@ -205,8 +205,7 @@ impl BuildArgs {
                     if let Some(files) = files {
                         return files.iter().any(|file| &curr_dir.join(file) == p);
                     }
-                    skip.is_match(p)
-                        && !(ignored.contains(p) || ignored.contains(&curr_dir.join(p)))
+                    skip.is_match(p) && !is_ignored_path(p, &ignored, &curr_dir)
                 })
                 .collect::<Vec<_>>();
 
@@ -221,8 +220,7 @@ impl BuildArgs {
 
             // NOTE(rusowsky): Once solar can drop unsupported versions, rather than creating a new
             // compiler, we should reuse the parser from the project output.
-            let mut opts = CompileOpts::default();
-            opts.unstable.typeck = true;
+            let opts = CompileOpts::default();
             let mut compiler =
                 Compiler::new(Session::builder().opts(opts).with_stderr_emitter().build());
 
@@ -301,62 +299,35 @@ impl BuildArgs {
         }
     }
 
-    /// Check foundry.lock file consistency with git submodules
-    fn check_foundry_lock_consistency(&self, config: &Config) {
-        use crate::lockfile::{DepIdentifier, FOUNDRY_LOCK, Lockfile};
-
-        let foundry_lock_path = config.root.join(FOUNDRY_LOCK);
-        if !foundry_lock_path.exists() {
-            return;
-        }
-
+    /// Checks foundry.lock file consistency with Git submodules.
+    fn check_foundry_lock_consistency(&self, config: &Config) -> Result<()> {
         let git = Git::new(&config.root);
-
         let mut lockfile = Lockfile::new(&config.root).with_git(&git);
-        if let Err(e) = lockfile.read() {
-            if !e.to_string().contains("Lockfile not found") {
-                sh_warn!("Failed to parse foundry.lock: {}", e).ok();
-            }
-            return;
+        let mismatches = lockfile.check()?;
+        if mismatches.is_empty() {
+            return Ok(());
         }
 
-        for (dep_path, dep_identifier) in lockfile.iter() {
-            let full_path = config.root.join(dep_path);
-
-            if !full_path.exists() {
-                sh_warn!("Dependency '{}' not found at expected path", dep_path.display()).ok();
-                continue;
-            }
-
-            let actual_rev = match git.get_rev("HEAD", &full_path) {
-                Ok(rev) => rev,
-                Err(_) => {
-                    sh_warn!("Failed to get git revision for dependency '{}'", dep_path.display())
-                        .ok();
-                    continue;
-                }
-            };
-
-            // Compare with the expected revision from lockfile
-            let expected_rev = match dep_identifier {
-                DepIdentifier::Branch { rev, .. }
-                | DepIdentifier::Tag { rev, .. }
-                | DepIdentifier::Rev { rev, .. } => rev.clone(),
-            };
-
-            if actual_rev != expected_rev {
-                sh_warn!(
-                    "Dependency '{}' revision mismatch: expected '{}', found '{}'",
-                    dep_path.display(),
-                    expected_rev,
-                    actual_rev
-                )
-                .ok();
-            }
+        let mut message = String::from("foundry.lock does not match installed dependencies:");
+        for mismatch in mismatches {
+            write!(message, "\n  {mismatch}")?;
         }
+        Err(eyre::eyre!(message))
     }
 }
 
+fn contract_size_limits(config: &Config) -> ContractSizeLimits {
+    config
+        .code_size_limit
+        .map(ContractSizeLimits::with_runtime_limit)
+        .or_else(|| {
+            config
+                .networks
+                .contract_size_limits()
+                .map(|limits| ContractSizeLimits::new(limits.runtime, limits.initcode))
+        })
+        .unwrap_or_else(|| ContractSizeLimits::for_spec_id(config.evm_spec_id()))
+}
 /// Notice shown on lint-on-build failure; printed separately so it survives single-line
 /// cause-chain rendering.
 const LINT_FAILURE_NOTICE: &str = "\

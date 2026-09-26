@@ -466,7 +466,7 @@ impl<'ast> State<'_, 'ast> {
                     let span = self.cursor.span(cmnt_span.lo());
                     self.inline_config.is_disabled(span)
                         // NOTE: necessary workaround to patch this edgecase due to lack of spans for the commas.
-                        && self.sm.span_to_snippet(span).is_ok_and(|snip| !snip.contains(','))
+                        && self.snippet(span).is_some_and(|snip| !snip.contains(','))
                 }) {
                     self.print_comments(
                         next_pos,
@@ -695,7 +695,7 @@ impl<'ast> State<'_, 'ast> {
             CommentConfig::skip_trailing_ws().mixed_no_break().mixed_prev_space(),
         );
         if !block_format.breaks() {
-            if !self.last_token_is_break() {
+            if !self.last_token_is_break() && !self.is_beginning_of_line() {
                 self.hardbreak();
             }
             self.s.offset(-self.ind);
@@ -765,11 +765,15 @@ impl<'ast> State<'_, 'ast> {
         let offset = if let BlockFormat::NoBraces(Some(off)) = block_format { off } else { 0 };
         self.print_comments(
             pos_hi,
-            self.cmnt_config().offset(offset).mixed_no_break().mixed_prev_space().mixed_post_nbsp(),
+            self.cmnt_config()
+                .offset(offset)
+                .mixed_no_break()
+                .mixed_prev_space()
+                .mixed_post_glued(),
         );
         self.print_comments(
             pos_hi,
-            CommentConfig::default().mixed_no_break().mixed_prev_space().mixed_post_nbsp(),
+            CommentConfig::default().mixed_no_break().mixed_prev_space().mixed_post_glued(),
         );
         if has_braces {
             self.word("}");

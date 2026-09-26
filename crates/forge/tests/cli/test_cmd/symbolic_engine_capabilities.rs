@@ -151,7 +151,7 @@ contract TxOriginBypass is Test {
 ...
 Failing tests:
 Encountered 1 failing test in test/TxOriginBypass.t.sol:TxOriginBypass
-[FAIL: panic: assertion failed (0x01); counterexample: [CALLDATA] [ARGS]] checkOnlyOwnerCanTrigger(address,address) ([METRICS])
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkOnlyOwnerCanTrigger(address,address) ([METRICS])
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 
@@ -196,7 +196,7 @@ contract EcrecoverBasic {
 ...
 Failing tests:
 Encountered 1 failing test in test/EcrecoverBasic.t.sol:EcrecoverBasic
-[FAIL: panic: assertion failed (0x01); counterexample: [CALLDATA] [ARGS]] checkEcrecoverNeverHitsZero(bytes32,uint8,bytes32,bytes32) ([METRICS])
+[FAIL: panic: assertion failed (0x01); counterexample: 		[SENDER] [SENDER] [CALLDATA] [ARGS]] checkEcrecoverNeverHitsZero(bytes32,uint8,bytes32,bytes32) ([METRICS])
 
 Encountered a total of 1 failing tests, 0 tests succeeded
 
@@ -250,6 +250,40 @@ contract SoladyMinMax {
 ...
 Ran 1 test for test/SoladyMinMax.t.sol:SoladyMinMax
 [PASS] checkMinMaxIdentities(uint256,uint256) ([METRICS])
+...
+"#]]);
+});
+
+// ---------------------------------------------------------------------------
+// EVM word-ring distributivity — nonlinear proof without overflow assumptions.
+// ---------------------------------------------------------------------------
+// Addition and multiplication form a ring modulo 2^256. This identity must hold even when any
+// intermediate operation wraps; proving it exercises exact nonlinear algebra rather than an
+// unbounded-integer approximation.
+forgetest_init!(word_ring_distributivity_passes, |prj, cmd| {
+    skip_unless_z3!("word_ring_distributivity_passes");
+
+    prj.add_test(
+        "WordRingDistributivity.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract WordRingDistributivity is Test {
+    function checkDistributivity(uint256 x, uint256 y, uint256 z) public pure {
+        unchecked {
+            assertEq((x + y) * z, x * z + y * z);
+        }
+    }
+}
+"#,
+    );
+
+    assert_symbolic(cmd.args(["test", "--symbolic", "--match-test", "checkDistributivity"]))
+        .success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/WordRingDistributivity.t.sol:WordRingDistributivity
+[PASS] checkDistributivity(uint256,uint256,uint256) ([METRICS])
 ...
 "#]]);
 });
@@ -545,6 +579,109 @@ contract ExpSmallBounded is Test {
 ...
 Ran 1 test for test/ExpSmallBounded.t.sol:ExpSmallBounded
 [PASS] checkExpSmall(uint8) ([METRICS])
+...
+"#]]);
+});
+
+// ---------------------------------------------------------------------------
+// Pranked CALL value transfers debit the effective caller.
+// ---------------------------------------------------------------------------
+forgetest_init!(pranked_value_transfer_roundtrip, |prj, cmd| {
+    skip_unless_z3!("pranked_value_transfer_roundtrip");
+
+    prj.add_test(
+        "PrankedValueTransfer.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract WrappedEther {
+    mapping(address => uint256) public balanceOf;
+
+    function deposit() external payable {
+        balanceOf[msg.sender] += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        balanceOf[msg.sender] -= amount;
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success);
+    }
+}
+
+contract PrankedValueTransfer is Test {
+    address constant ALICE = address(0xA11CE);
+    WrappedEther weth;
+
+    function setUp() public {
+        weth = new WrappedEther();
+    }
+
+    function checkDepositWithdrawRoundtrip(uint96 amount) public {
+        vm.deal(ALICE, amount);
+        uint256 preEthBalance = ALICE.balance;
+
+        vm.prank(ALICE);
+        weth.deposit{value: amount}();
+
+        vm.prank(ALICE);
+        weth.withdraw(amount);
+
+        assertEq(ALICE.balance, preEthBalance);
+    }
+}
+"#,
+    );
+
+    assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkDepositWithdrawRoundtrip",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/PrankedValueTransfer.t.sol:PrankedValueTransfer
+[PASS] checkDepositWithdrawRoundtrip(uint96) ([METRICS])
+...
+"#]]);
+});
+
+forgetest_init!(pranked_self_value_transfer, |prj, cmd| {
+    skip_unless_z3!("pranked_self_value_transfer");
+
+    prj.add_test(
+        "PrankedSelfValueTransfer.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract PrankedSelfValueTransfer is Test {
+    address constant ALICE = address(0xA11CE);
+
+    function checkSelfTransferPreservesBalance(uint96 amount) public {
+        vm.deal(ALICE, amount);
+
+        vm.prank(ALICE);
+        (bool ok,) = ALICE.call{value: amount}("");
+
+        assertTrue(ok);
+        assertEq(ALICE.balance, amount);
+    }
+}
+"#,
+    );
+
+    assert_symbolic(cmd.args([
+        "test",
+        "--symbolic",
+        "--match-test",
+        "checkSelfTransferPreservesBalance",
+    ]))
+    .success()
+    .stdout_eq(str![[r#"
+...
+Ran 1 test for test/PrankedSelfValueTransfer.t.sol:PrankedSelfValueTransfer
+[PASS] checkSelfTransferPreservesBalance(uint96) ([METRICS])
 ...
 "#]]);
 });

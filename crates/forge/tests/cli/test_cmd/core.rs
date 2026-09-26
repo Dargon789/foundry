@@ -217,8 +217,11 @@ test/ListTests.t.sol
 
 "#]]);
 
+    // Path-filtered listing should not compile unrelated sources.
+    prj.add_test("Broken.t.sol", "contract");
     cmd.forge_fuse()
         .args(["test", "--list", "--match-test", "test_alpha", "--json"])
+        .arg("test/ListTests.t.sol")
         .assert_success()
         .stdout_eq("{\"test/ListTests.t.sol\":{\"ListTests\":[\"test_alpha\"]}}\n");
 });
@@ -309,7 +312,7 @@ contract FlameBeforeTestSetupTest {
 "#,
     );
 
-    cmd.args(["test", "--match-test", "testProfile", "--flamegraph"]).assert_success();
+    cmd.args(["test", "--match-test", "testProfile", "--flamegraph", "--no-open"]).assert_success();
     let flamegraph = std::fs::read_to_string(
         prj.root().join("cache/flamegraph_FlameBeforeTestSetupTest_testProfile.svg"),
     )
@@ -317,7 +320,9 @@ contract FlameBeforeTestSetupTest {
     assert!(flamegraph.contains("FlameBeforeTestSetupTest.testProfile()"));
     assert!(!flamegraph.contains("FlameBeforeTestSetupTest.beforeOnly()"));
 
-    cmd.forge_fuse().args(["test", "--match-test", "testProfile", "--flamechart"]).assert_success();
+    cmd.forge_fuse()
+        .args(["test", "--match-test", "testProfile", "--flamechart", "--no-open"])
+        .assert_success();
     let flamechart = std::fs::read_to_string(
         prj.root().join("cache/flamechart_FlameBeforeTestSetupTest_testProfile.svg"),
     )

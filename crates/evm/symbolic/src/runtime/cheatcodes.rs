@@ -1,4 +1,5 @@
-use foundry_cheatcodes_spec::Vm::*;
+use alloy_sol_types::SolError;
+use foundry_cheatcodes_spec::Vm::{self, *};
 use foundry_common::wallet::private_key_from_u256;
 
 use super::*;
@@ -234,7 +235,9 @@ pub(crate) const fn foundry_cheatcode_min_input_size(selector: [u8; 4]) -> Optio
         | assertNotEq_25Call::SELECTOR
         | assertNotEq_26Call::SELECTOR
         | assertNotEq_27Call::SELECTOR
-        | randomUint_1Call::SELECTOR => Some(abi_static_input_size(2)),
+        | randomUint_1Call::SELECTOR
+        | registerSloadHookCall::SELECTOR
+        | registerSstoreHookCall::SELECTOR => Some(abi_static_input_size(2)),
         expectRevert_10Call::SELECTOR
         | deriveKey_1Call::SELECTOR
         | deriveKey_2Call::SELECTOR
@@ -247,7 +250,8 @@ pub(crate) const fn foundry_cheatcode_min_input_size(selector: [u8; 4]) -> Optio
         | assertEqDecimal_2Call::SELECTOR
         | computeCreate2Address_0Call::SELECTOR
         | bound_0Call::SELECTOR
-        | bound_1Call::SELECTOR => Some(abi_static_input_size(3)),
+        | bound_1Call::SELECTOR
+        | registerMappingSstoreHookCall::SELECTOR => Some(abi_static_input_size(3)),
         expectEmit_0Call::SELECTOR
         | deriveKey_3Call::SELECTOR
         | rememberKeys_1Call::SELECTOR
@@ -300,6 +304,12 @@ pub(crate) fn abi_concrete_value_return(cx: &mut SymCx, value: DynSolValue) -> S
         .into_iter()
         .map(|byte| SymExpr::constant(cx, U256::from(byte)))
         .collect();
+    SymReturnData::from_byte_exprs(cx, bytes)
+}
+
+pub(crate) fn error_string_return_data(cx: &mut SymCx, reason: &str) -> SymReturnData {
+    let bytes = Vm::CheatcodeError { message: reason.to_string() }.abi_encode();
+    let bytes = bytes.into_iter().map(|byte| SymExpr::constant(cx, U256::from(byte))).collect();
     SymReturnData::from_byte_exprs(cx, bytes)
 }
 
@@ -775,6 +785,14 @@ pub(crate) const fn array_assertion_element_type(
     }
 }
 
+pub(crate) fn is_full_word_array_assertion(selector: [u8; 4]) -> bool {
+    !selector_has_string_reason(selector)
+        && matches!(
+            array_assertion_element_type(selector),
+            Ok(DynSolType::Uint(256) | DynSolType::Int(256) | DynSolType::FixedBytes(32))
+        )
+}
+
 pub(crate) fn dyn_string(value: &DynSolValue) -> Result<String, SymbolicError> {
     match value {
         DynSolValue::String(value) => Ok(value.clone()),
@@ -1066,4 +1084,40 @@ pub(crate) fn artifact_code(path: &str, deployed: bool) -> Result<Vec<u8>, Symbo
         .and_then(serde_json::Value::as_str)
         .ok_or(SymbolicError::Unsupported("symbolic vm.getCode artifact"))?;
     hex::decode(object).map_err(|_| SymbolicError::Unsupported("symbolic vm.getCode artifact"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapping_hook_registrations_require_three_words() {
+        assert_eq!(
+            foundry_cheatcode_min_input_size(registerMappingSstoreHookCall::SELECTOR),
+            Some(abi_static_input_size(3))
+        );
+    }
+
+    #[test]
+    fn symbolic_full_word_array_assertions_exclude_normalized_types_and_reasons() {
+        for selector in [
+            assertEq_16Call::SELECTOR,
+            assertEq_18Call::SELECTOR,
+            assertEq_22Call::SELECTOR,
+            assertNotEq_16Call::SELECTOR,
+            assertNotEq_18Call::SELECTOR,
+            assertNotEq_22Call::SELECTOR,
+        ] {
+            assert!(is_full_word_array_assertion(selector));
+        }
+        for selector in [
+            assertEq_14Call::SELECTOR,
+            assertEq_17Call::SELECTOR,
+            assertEq_20Call::SELECTOR,
+            assertNotEq_15Call::SELECTOR,
+            assertNotEq_20Call::SELECTOR,
+        ] {
+            assert!(!is_full_word_array_assertion(selector));
+        }
+    }
 }

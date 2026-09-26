@@ -5,13 +5,15 @@
 
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Component, MAIN_SEPARATOR, Path, PathBuf},
 };
 
 use alloy_primitives::keccak256;
 use eyre::Result;
 use foundry_compilers::artifacts::remappings::{RelativeRemapping, Remapping};
-use foundry_config::{Config, fs_permissions::FsAccessKind};
+use foundry_config::{
+    Config, fs_permissions::FsAccessKind, providers::relative_remapping_preserving_context_boundary,
+};
 
 /// Check if a path is safe for use as a relative path within a workspace.
 /// Rejects absolute paths, parent directory components (..), and other unsafe patterns.
@@ -62,6 +64,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// This preserves CLI/env overrides and runtime normalization while rebasing
 /// project-local paths from the original root to `temp_path`.
 pub fn rebase_config_paths(config: &Config, temp_path: &Path) -> Config {
+    // Use the same root spelling as the compiler before materializing remappings. Temp paths
+    // can contain symlinks on macOS or short directory names on Windows.
+    let temp_root = normalize_existing_ancestor(temp_path);
+    let temp_path = temp_root.as_path();
     let mut temp_config = config.clone();
     temp_config.root = temp_path.to_path_buf();
     temp_config.src = rebase_project_path(&config.root, temp_path, &config.src);
@@ -202,13 +208,18 @@ fn rebase_remapping(
     temp_path: &Path,
     remapping: &RelativeRemapping,
 ) -> RelativeRemapping {
+    let context_has_boundary =
+        remapping.context.as_deref().is_some_and(|context| context.ends_with(['/', '\\']));
     let mut remapping: Remapping = remapping.clone().into();
     remapping.path =
         rebase_project_path(root, temp_path, Path::new(&remapping.path)).display().to_string();
     if let Some(context) = &mut remapping.context {
         *context = rebase_project_path(root, temp_path, Path::new(context)).display().to_string();
+        if context_has_boundary && !context.ends_with(['/', '\\']) {
+            context.push(MAIN_SEPARATOR);
+        }
     }
-    RelativeRemapping::new(remapping, temp_path)
+    relative_remapping_preserving_context_boundary(remapping, temp_path)
 }
 
 /// Verify that `candidate` resolves (after following symlinks) to a path that lives
@@ -758,10 +769,50 @@ mod tests {
     }
 
     #[test]
-    fn test_rebase_config_paths_rebases_materialized_project_paths() {
+    fn test_rebase_remapping_preserves_context_directory_boundary() {
+        let remapping = RelativeRemapping::from(Remapping {
+            context: Some(format!("lib{MAIN_SEPARATOR}outer{MAIN_SEPARATOR}")),
+            name: "inner/".to_string(),
+            path: format!("lib{MAIN_SEPARATOR}outer{MAIN_SEPARATOR}lib{MAIN_SEPARATOR}inner"),
+        });
+
+        let remapping = rebase_remapping(Path::new("project"), Path::new("workspace"), &remapping);
+        assert!(remapping.context.unwrap().ends_with(MAIN_SEPARATOR));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rebase_config_paths_canonicalizes_workspace_alias() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
         let workspace = temp.path().join("workspace");
+        let alias = temp.path().join("alias");
+        create_test_dir_structure(&root, &["src/Target.sol", "test/Target.t.sol"]);
+        fs::create_dir(&workspace).unwrap();
+        symlink_dir(&workspace, &alias).unwrap();
+
+        let config = Config {
+            root: root.clone(),
+            src: root.join("src"),
+            test: root.join("test"),
+            remappings: vec![Remapping::from_str("@src/=src/").unwrap().into()],
+            ..Default::default()
+        };
+        copy_project(&config, &alias).unwrap();
+        let config = rebase_config_paths(&config, &alias).sanitized();
+        let canonical_root = dunce::canonicalize(&workspace).unwrap();
+        assert_eq!(config.root, canonical_root);
+        assert_eq!(config.src, canonical_root.join("src"));
+        assert_eq!(config.test, canonical_root.join("test"));
+        let remapping = Remapping::from(config.remappings[0].clone());
+        assert_eq!(Path::new(&remapping.path), canonical_root.join("src"));
+    }
+
+    #[test]
+    fn test_rebase_config_paths_rebases_materialized_project_paths() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         let external = temp.path().join("external");
 
         let mut contracts = BTreeMap::new();
@@ -917,7 +968,7 @@ mod tests {
     fn test_copy_project_preserves_external_read_only_paths() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         let external = temp.path().join("shared-solidity");
         create_test_dir_structure(&root, &["src/Target.sol", "test/Target.t.sol"]);
         create_test_dir_structure(&external, &["Shared.sol"]);
@@ -949,7 +1000,7 @@ mod tests {
     fn test_copy_project_copies_project_local_corpus_and_frontier_paths() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         create_test_dir_structure(
             &root,
             &[
@@ -1008,7 +1059,7 @@ mod tests {
     fn test_copy_project_isolates_external_corpus_and_frontier_paths() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         let corpus = temp.path().join("shared-corpus");
         let frontier = temp.path().join("shared-frontier");
         create_test_dir_structure(&root, &["src/Target.sol", "test/Target.t.sol"]);
@@ -1045,7 +1096,7 @@ mod tests {
     fn test_copy_project_merges_overlapping_mutable_paths() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         create_test_dir_structure(
             &root,
             &[
@@ -1081,7 +1132,7 @@ mod tests {
     fn test_copy_project_isolates_external_failure_persist_dirs() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         let fuzz_failures = temp.path().join("shared-fuzz-failures");
         let invariant_failures = temp.path().join("shared-invariant-failures");
         create_test_dir_structure(&root, &["src/Target.sol", "test/Target.t.sol"]);
@@ -1127,7 +1178,7 @@ mod tests {
     fn test_copy_project_isolates_corpus_under_symlinked_lib_root() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         create_test_dir_structure(
             &root,
             &[
@@ -1168,7 +1219,7 @@ mod tests {
     fn test_rebase_config_paths_preserves_symlink_parent_semantics() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         let external = temp.path().join("external");
         create_test_dir_structure(&root, &["src/Target.sol", "test/Target.t.sol"]);
         create_test_dir_structure(
@@ -1217,7 +1268,7 @@ mod tests {
     fn test_copy_project_copies_project_local_remapping_targets() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         create_test_dir_structure(
             &root,
             &["src/Target.sol", "test/Target.t.sol", "packages/shared/src/Shared.sol"],
@@ -1247,7 +1298,7 @@ mod tests {
     fn test_copy_project_preserves_external_libs() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         let external = temp.path().join("shared-lib");
         create_test_dir_structure(&root, &["src/Target.sol", "test/Target.t.sol", "lib/Local.sol"]);
         create_test_dir_structure(&external, &["External.sol"]);
@@ -1273,7 +1324,7 @@ mod tests {
     fn test_rebase_config_paths_rebases_relative_fs_permissions() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
-        let workspace = temp.path().join("workspace");
+        let workspace = normalize_existing_ancestor(&temp.path().join("workspace"));
         fs::create_dir_all(root.join("writes")).unwrap();
         fs::create_dir_all(workspace.join("writes")).unwrap();
         fs::create_dir_all(workspace.join("logs/sub")).unwrap();

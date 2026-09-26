@@ -24,6 +24,9 @@ const COMPILATION_RESTRICTIONS_KEYS: &[&str] = &[
 const SETTINGS_OVERRIDES_KEYS: &[&str] =
     &["name", "via_ir", "evm_version", "optimizer", "optimizer_runs", "bytecode_hash"];
 
+/// Allowed keys for external compiler adapter entries.
+const EXTERNAL_COMPILER_KEYS: &[&str] = &["id", "command", "args", "roots", "settings"];
+
 /// Allowed keys for VyperConfig.
 /// Required because VyperConfig uses `skip_serializing_if = "Option::is_none"` on all fields,
 /// causing the default serialization to produce an empty dict.
@@ -55,6 +58,7 @@ const SYMBOLIC_KEYS: &[&str] = &[
     "use_fuzz_corpus",
     "corpus_seed_limit",
     "use_fuzz_frontiers",
+    "check_invariant_frontiers",
     "frontier_limit",
     "frontier_ids",
     "frontier_pcs",
@@ -86,17 +90,30 @@ const SYMBOLIC_KEYS: &[&str] = &[
 /// Allowed keys for TracingConfig.
 /// Required because empty labels and optional trace depth are skipped by default serialization,
 /// but they are still valid user-facing config keys.
-const TRACING_KEYS: &[&str] =
-    &["verbosity", "labels", "disable_labels", "compact_labels", "trace_depth", "decode_internal"];
+const TRACING_KEYS: &[&str] = &[
+    "verbosity",
+    "labels",
+    "disable_labels",
+    "compact_labels",
+    "trace_depth",
+    "decode_internal",
+    "external_identification_timeout",
+];
 
 /// Reserved keys that should not trigger unknown key warnings.
 const RESERVED_KEYS: &[&str] = &["extends"];
 
 /// Keys kept for backward compatibility that should not trigger unknown key warnings.
 ///
-/// `tempo` and `optimism` are legacy aliases for `network = "tempo"` / `network = "optimism"` —
-/// still accepted on input but no longer serialized in the default config.
-const BACKWARD_COMPATIBLE_KEYS: &[&str] = &["solc_version", "tempo", "optimism"];
+/// Network flags are legacy aliases for canonical `network = "..."` values. They remain accepted
+/// when the corresponding network support is compiled, but are no longer serialized.
+const BACKWARD_COMPATIBLE_KEYS: &[&str] = &[
+    "solc_version",
+    "tempo",
+    "optimism",
+    #[cfg(feature = "monad")]
+    "monad",
+];
 
 const LABELS_KEY: &str = "labels";
 const TRACING_LABELS_KEY: &str = "tracing.labels";
@@ -174,7 +191,8 @@ impl<P: Provider> WarningsProvider<P> {
         if let Ok(default_map) = figment::providers::Serialized::defaults(&Config::default()).data()
             && let Some(default_dict) = default_map.get(&Config::DEFAULT_PROFILE)
         {
-            let allowed_keys: BTreeSet<String> = default_dict.keys().cloned().collect();
+            let mut allowed_keys: BTreeSet<String> = default_dict.keys().cloned().collect();
+            allowed_keys.insert("external_compilers".to_string());
             for profile_map in profiles.clone() {
                 for (profile, value) in profile_map {
                     let Some(profile_dict) = value.as_dict() else {
@@ -367,6 +385,7 @@ impl<P: Provider> WarningsProvider<P> {
             "additional_compiler_profiles" => {
                 SETTINGS_OVERRIDES_KEYS.iter().map(|s| s.to_string()).collect()
             }
+            "external_compilers" => EXTERNAL_COMPILER_KEYS.iter().map(|s| s.to_string()).collect(),
             _ => BTreeSet::new(),
         }
     }

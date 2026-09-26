@@ -69,6 +69,196 @@ Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing te
 "#]]);
 });
 
+forgetest_init!(isolated_snapshot_enclosing_revert, |prj, cmd| {
+    prj.add_test(
+        "IsolatedSnapshotEnclosingRevert.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+/// forge-config: default.isolate = true
+contract IsolatedSnapshotEnclosingRevertTest is Test {
+    uint256 value;
+
+    function test_revert_after_isolated_restore() public {
+        uint256 snapshotId = vm.snapshotState();
+        value = 2;
+        vm.deal(address(0xBEEF), 5 ether);
+
+        require(this.restore(snapshotId));
+        revert("expected test revert");
+    }
+
+    function test_revert_after_isolated_restore_and_write() public {
+        uint256 snapshotId = vm.snapshotState();
+        value = 2;
+
+        this.restoreAndWrite(snapshotId);
+        assertEq(value, 4);
+        revert("expected post-restore revert");
+    }
+
+    function test_reverted_isolated_restore_does_not_escape() public {
+        value = 1;
+        uint256 snapshotId = vm.snapshotState();
+        value = 2;
+
+        vm.expectRevert("expected call revert");
+        this.restoreThenRevert(snapshotId);
+
+        assertEq(value, 2);
+    }
+
+    function test_caught_nested_restore_revert_does_not_escape() public {
+        value = 1;
+        uint256 snapshotId = vm.snapshotState();
+        value = 2;
+
+        this.catchRestoreRevert(snapshotId);
+
+        assertEq(value, 4);
+    }
+
+    function test_successful_restore_survives_reverted_sibling() public {
+        this.runRevertedSiblingCase();
+    }
+
+    function test_reverted_constructor_preserves_nonce() public {
+        this.runRevertedConstructorCase();
+    }
+
+    function test_execute_transaction_restore_does_not_escape_reverted_isolated_call() public {
+        value = 1;
+        bytes memory rawTx = signedTransaction(abi.encodeCall(this.snapshotAndRestore, ()));
+
+        vm.expectRevert("outer failed");
+        this.outerExecute(rawTx);
+
+        assertEq(value, 1);
+    }
+
+    function restore(uint256 snapshotId) external returns (bool) {
+        return vm.revertToState(snapshotId);
+    }
+
+    function restoreAndWrite(uint256 snapshotId) external {
+        require(vm.revertToState(snapshotId));
+        value = 4;
+    }
+
+    function restoreThenRevert(uint256 snapshotId) external {
+        value = 3;
+        require(vm.revertToState(snapshotId));
+        revert("expected call revert");
+    }
+
+    function catchRestoreRevert(uint256 snapshotId) external {
+        try this.restoreThenRevert(snapshotId) {} catch {}
+        assertEq(value, 2);
+        value = 4;
+    }
+
+    function runRevertedSiblingCase() external {
+        this.restoreLocally();
+        value = 4;
+
+        try this.unrelatedRevert() {} catch {}
+
+        assertEq(value, 4);
+    }
+
+    function restoreLocally() external {
+        value = 1;
+        uint256 snapshotId = vm.snapshotState();
+        value = 2;
+        require(vm.revertToState(snapshotId));
+    }
+
+    function unrelatedRevert() external pure {
+        revert("unrelated revert");
+    }
+
+    function runRevertedConstructorCase() external {
+        uint64 nonce = vm.getNonce(address(this));
+        try new RevertingSnapshotConstructor() {} catch {}
+        assertEq(vm.getNonce(address(this)), nonce + 1);
+
+        address expected = vm.computeCreateAddress(address(this), nonce + 1);
+        SuccessfulDeployment deployed = new SuccessfulDeployment();
+        assertEq(address(deployed), expected);
+    }
+
+    function outerExecute(bytes calldata rawTx) external {
+        value = 2;
+        vm.executeTransaction(rawTx);
+        revert("outer failed");
+    }
+
+    function snapshotAndRestore() external {
+        uint256 snapshotId = vm.snapshotState();
+        require(vm.revertToState(snapshotId));
+    }
+
+    function signedTransaction(bytes memory data) internal returns (bytes memory) {
+        uint256 privateKey = 1;
+        vm.chainId(1);
+        vm.deal(vm.addr(privateKey), 1 ether);
+
+        bytes[] memory unsigned = new bytes[](9);
+        unsigned[1] = hex"01";
+        unsigned[2] = hex"030d40";
+        unsigned[3] = abi.encodePacked(address(this));
+        unsigned[5] = data;
+        unsigned[6] = hex"01";
+
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, keccak256(vm.toRlp(unsigned)));
+        bytes[] memory signed = new bytes[](9);
+        for (uint256 i; i < 6; i++) {
+            signed[i] = unsigned[i];
+        }
+        signed[6] = abi.encodePacked(v + 10);
+        signed[7] = trimLeadingZeros(r);
+        signed[8] = trimLeadingZeros(s);
+        return vm.toRlp(signed);
+    }
+
+    function trimLeadingZeros(bytes32 value_) internal pure returns (bytes memory out) {
+        uint256 offset;
+        while (offset < 32 && value_[offset] == bytes1(0)) {
+            offset++;
+        }
+        out = new bytes(32 - offset);
+        for (uint256 i; i < out.length; i++) {
+            out[i] = value_[offset + i];
+        }
+    }
+}
+
+contract RevertingSnapshotConstructor is Test {
+    constructor() {
+        uint256 snapshotId = vm.snapshotState();
+        vm.deal(address(0xBEEF), 1 ether);
+        require(vm.revertToState(snapshotId));
+        revert("expected constructor revert");
+    }
+}
+
+contract SuccessfulDeployment {}
+"#,
+    );
+
+    cmd.arg("test").assert_failure().stdout_eq(str![[r#"
+...
+[PASS] test_caught_nested_restore_revert_does_not_escape() ([GAS])
+[PASS] test_execute_transaction_restore_does_not_escape_reverted_isolated_call() ([GAS])
+[FAIL: expected test revert] test_revert_after_isolated_restore() ([GAS])
+[FAIL: expected post-restore revert] test_revert_after_isolated_restore_and_write() ([GAS])
+[PASS] test_reverted_constructor_preserves_nonce() ([GAS])
+[PASS] test_reverted_isolated_restore_does_not_escape() ([GAS])
+[PASS] test_successful_restore_survives_reverted_sibling() ([GAS])
+...
+"#]]);
+});
+
 // https://github.com/foundry-rs/foundry/issues/3189
 forgetest_init!(issue_3189, |prj, cmd| {
     prj.add_test(
@@ -778,8 +968,8 @@ contract Contract {}
     // We expect a compilation error due to the missing import
     cmd.arg("build").assert_failure().stderr_eq(str![[r#"
 Error: Compiler run failed:
-Error (6275): Source "Missing.sol" not found: File not found. Searched the following locations: [..]
-ParserError: Source "Missing.sol" not found: File not found. Searched the following locations: [..]
+Error (6275): Source "Missing.sol" not found: File not found. Searched the following locations: "[..]".
+ParserError: Source "Missing.sol" not found: File not found. Searched the following locations: "[..]".
  [FILE]:4:1:
   |
 4 | import '../Missing.sol';
@@ -1099,6 +1289,56 @@ Ran 2 tests for test/TxGasPricePreOverride.t.sol:TxGasPricePreOverrideSnapshotTe
 Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
 
 Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
+
+"#]]);
+});
+
+// https://github.com/foundry-rs/foundry/issues/16197
+forgetest_init!(issue_16197, |prj, cmd| {
+    prj.add_test(
+        "Issue16197.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract Deployment {
+    function ping() external pure {
+        revert("deployment probe");
+    }
+}
+
+// Mirrors the shape of the issue: an inherited base `setUp` performs substantial setup work
+// whose internals catch a revert before the test's own `setUp` calls `vm.skip`.
+contract CommonBase is Test {
+    Deployment internal deployment;
+
+    function setUp() public virtual {
+        deployment = new Deployment();
+        (bool success,) = address(deployment).call(abi.encodeWithSignature("ping()"));
+        require(!success, "probe call should revert");
+    }
+}
+
+contract Issue16197Test is CommonBase {
+    function setUp() public override {
+        super.setUp();
+        vm.skip(true, "probe after super");
+    }
+
+    function test_probe_succeeds() public pure {}
+}
+    "#,
+    );
+
+    cmd.args(["test", "--mc", "Issue16197Test"]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/Issue16197.t.sol:Issue16197Test
+[SKIP: skipped: probe after super] setUp() ([GAS])
+Suite result: ok. 0 passed; 0 failed; 1 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 0 failed, 1 skipped (1 total tests)
 
 "#]]);
 });

@@ -1,18 +1,30 @@
 use crate::{
     linter::{EarlyLintPass, Lint, LintContext},
-    sol::{Severity, SolLint, info::MultiContractFile},
+    sol::{Severity, SolLint},
 };
-
+use foundry_config::lint::LintSpecificConfig;
 use solar::ast;
+use std::sync::Arc;
 
 declare_forge_lint!(
     MULTI_CONTRACT_FILE,
     Severity::Info,
     "multi-contract-file",
-    "prefer having only one contract, interface or library per file"
+    "file contains multiple contracts, interfaces or libraries"
 );
 
-impl<'ast> EarlyLintPass<'ast> for MultiContractFile {
+#[derive(Debug)]
+pub(super) struct MultiContractFilePass {
+    config: Arc<LintSpecificConfig>,
+}
+
+impl MultiContractFilePass {
+    pub(super) const fn new(config: Arc<LintSpecificConfig>) -> Self {
+        Self { config }
+    }
+}
+
+impl<'ast> EarlyLintPass<'ast> for MultiContractFilePass {
     fn check_full_source_unit(
         &mut self,
         ctx: &LintContext<'ast, '_>,
@@ -21,22 +33,19 @@ impl<'ast> EarlyLintPass<'ast> for MultiContractFile {
         if !ctx.is_lint_enabled(MULTI_CONTRACT_FILE.id()) {
             return;
         }
-
-        // Collect spans of all contract-like items, skipping those that are exempted
-        let relevant_spans: Vec<_> = unit
+        // Every non-exempted contract-like item is flagged when there is more than one.
+        let spans: Vec<_> = unit
             .items
             .iter()
             .filter_map(|item| match &item.kind {
-                ast::ItemKind::Contract(c) => {
-                    (!ctx.config.lint_specific.is_exempted(&c.kind)).then_some(c.name.span)
+                ast::ItemKind::Contract(c) if !self.config.is_exempted(&c.kind) => {
+                    Some(c.name.span)
                 }
                 _ => None,
             })
             .collect();
-
-        // Flag all if there's more than one
-        if relevant_spans.len() > 1 {
-            for span in relevant_spans {
+        if spans.len() > 1 {
+            for span in spans {
                 ctx.emit(&MULTI_CONTRACT_FILE, span);
             }
         }

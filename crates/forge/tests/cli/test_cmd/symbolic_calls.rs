@@ -4,6 +4,89 @@ use foundry_test_utils::{forgetest_init, util::OutputExt};
 
 use super::symbolic_helpers::z3_available;
 
+forgetest_init!(symbolic_call_contains_invalid_child_halt, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_call_contains_invalid_child_halt because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicInvalidChildCall.t.sol",
+        r#"
+contract InvalidChild {
+    fallback() external {
+        assembly ("memory-safe") {
+            invalid()
+        }
+    }
+}
+
+contract SymbolicInvalidChildCall {
+    uint256 marker;
+
+    function checkInvalidChildCall() public {
+        InvalidChild child = new InvalidChild();
+        marker = 17;
+        (bool success, bytes memory output) = address(child).call("");
+        assert(!success);
+        assert(output.length == 0);
+        assert(marker == 17);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--symbolic", "--match-test", "checkInvalidChildCall"]).assert_success();
+});
+
+forgetest_init!(symbolic_assume_no_revert_does_not_prune_invalid_child_halt, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_assume_no_revert_does_not_prune_invalid_child_halt because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicAssumeNoRevertInvalidChild.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract InvalidAssumeNoRevertChild {
+    fallback() external {
+        assembly ("memory-safe") {
+            invalid()
+        }
+    }
+}
+
+contract SymbolicAssumeNoRevertInvalidChild is Test {
+    function checkAssumeNoRevertInvalidChild() public {
+        InvalidAssumeNoRevertChild child = new InvalidAssumeNoRevertChild();
+        vm.assumeNoRevert();
+        (bool success,) = address(child).call("");
+        assertTrue(success);
+    }
+}
+"#,
+    );
+
+    let stdout = cmd
+        .args(["test", "--symbolic", "--match-test", "checkAssumeNoRevertInvalidChild"])
+        .assert_failure()
+        .get_output()
+        .stdout_lossy();
+
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[FAIL: assertion failed; counterexample:
+"#]],
+    );
+});
+
 forgetest_init!(symbolic_calldataload_accepts_symbolic_offset, |prj, cmd| {
     if !z3_available() {
         let _ = sh_eprintln!(
@@ -659,6 +742,90 @@ args=
     assert!(!stdout.contains("symbolic CALL target outside known contracts"), "{stdout}");
 });
 
+forgetest_init!(symbolic_call_target_explores_mock_mismatch, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_call_target_explores_mock_mismatch because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicTargetMockMismatch.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract RealToken {
+    function balanceOf(address) external pure returns (uint256) {
+        return 7;
+    }
+}
+
+contract FiveToken {
+    function balanceOf(address) external pure returns (uint256) {
+        return 5;
+    }
+}
+
+contract SymbolicTargetMockMismatch is Test {
+    RealToken real;
+    FiveToken five;
+
+    function setUp() public {
+        real = new RealToken();
+        five = new FiveToken();
+    }
+
+    // The mock only covers `balanceOf(user)`; for `user != this` the real code answers 7.
+    function checkMockedSymbolicTargetMayMiss(address callee, address user) public {
+        vm.assume(callee == address(real) || callee == address(five));
+        vm.mockCall(
+            address(real),
+            abi.encodeWithSelector(RealToken.balanceOf.selector, user),
+            abi.encode(uint256(5))
+        );
+        assert(RealToken(callee).balanceOf(address(this)) == 5);
+    }
+
+    function checkMockedSymbolicTargetAlwaysHits(address callee) public {
+        vm.assume(callee == address(real) || callee == address(five));
+        vm.mockCall(
+            address(real),
+            abi.encodeWithSelector(RealToken.balanceOf.selector, address(this)),
+            abi.encode(uint256(5))
+        );
+        assert(RealToken(callee).balanceOf(address(this)) == 5);
+    }
+}
+"#,
+    );
+
+    let stdout = cmd
+        .args(["test", "--symbolic", "--match-contract", "SymbolicTargetMockMismatch"])
+        .assert_failure()
+        .get_output()
+        .stdout_lossy();
+
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[FAIL: panic: assertion failed (0x01); counterexample:
+"#]],
+    );
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+checkMockedSymbolicTargetMayMiss(address,address)
+"#]],
+    );
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[PASS] checkMockedSymbolicTargetAlwaysHits(address)
+"#]],
+    );
+});
+
 forgetest_init!(symbolic_external_call_with_single_known_target_auto_expands, |prj, cmd| {
     if !z3_available() {
         let _ = sh_eprintln!(
@@ -760,7 +927,9 @@ forgetest_init!(symbolic_external_call_with_empty_unknown_target_is_modeled, |pr
     prj.add_test(
         "SymbolicUnboundedTarget.t.sol",
         r#"
-contract SymbolicUnboundedTarget {
+import "forge-std/Test.sol";
+
+contract SymbolicUnboundedTarget is Test {
     /// forge-config: default.symbolic.symbolic_call_targets = true
     function checkUnbounded(address target) public {
         if (uint160(target) <= 9 || target == address(this)) {
@@ -771,6 +940,17 @@ contract SymbolicUnboundedTarget {
             ok := call(gas(), target, 0, 0, 0, 0, 0)
         }
         require(ok);
+    }
+
+    /// forge-config: default.symbolic.symbolic_call_targets = true
+    function checkUnboundedInsufficientValue(address target) public {
+        vm.assume(uint160(target) > 9 && target != address(this));
+        vm.deal(address(this), 0);
+        bool ok;
+        assembly {
+            ok := call(gas(), target, 1, 0, 0, 0, 0)
+        }
+        assert(!ok);
     }
 }
 "#,
@@ -786,6 +966,12 @@ contract SymbolicUnboundedTarget {
         &stdout,
         foundry_test_utils::str![[r#"
 [PASS] checkUnbounded(address)
+"#]],
+    );
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[PASS] checkUnboundedInsufficientValue(address)
 "#]],
     );
     assert!(!stdout.contains("symbolic CALL target outside known contracts"), "{stdout}");
@@ -1135,6 +1321,65 @@ contract SymbolicStaticCall {
     );
 });
 
+forgetest_init!(symbolic_static_call_splits_symbolic_value, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_static_call_splits_symbolic_value because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicStaticCallValue.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract StaticValueSink {
+    receive() external payable {}
+}
+
+contract StaticValueHelper {
+    function callWithValue(address target, uint256 amount) external returns (bool ok) {
+        assembly {
+            ok := call(gas(), target, amount, 0, 0, 0, 0)
+        }
+    }
+}
+
+contract SymbolicStaticCallValue is Test {
+    StaticValueSink sink;
+    StaticValueHelper helper;
+
+    function setUp() public {
+        sink = new StaticValueSink();
+        helper = new StaticValueHelper();
+    }
+
+    function checkStaticCallValue(uint256 amount) public {
+        vm.assume(amount <= 1);
+        (bool ok,) = address(helper).staticcall(
+            abi.encodeCall(StaticValueHelper.callWithValue, (address(sink), amount))
+        );
+        assertEq(ok, amount == 0);
+    }
+}
+"#,
+    );
+
+    let stdout = cmd
+        .args(["test", "--symbolic", "--match-test", "checkStaticCallValue"])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[PASS] checkStaticCallValue(uint256)
+"#]],
+    );
+});
+
 forgetest_init!(symbolic_delegatecall_writes_caller_storage, |prj, cmd| {
     if !z3_available() {
         let _ = sh_eprintln!(
@@ -1382,8 +1627,30 @@ contract SymbolicCallcodeValue is Test {
     }
 
     function checkSymbolicCallcodeValue(uint256 amount) public {
-        vm.assume(amount <= 7);
+        vm.assume(amount <= 8);
         vm.deal(address(this), 7);
+
+        bytes memory input = abi.encodeWithSelector(SymbolicCallcodeValueTarget.echoValue.selector);
+        uint256 echoed;
+        bool ok;
+        address callTarget = address(target);
+        assembly {
+            ok := callcode(gas(), callTarget, amount, add(input, 0x20), mload(input), 0x80, 0x20)
+            echoed := mload(0x80)
+        }
+
+        assertEq(ok, amount <= 7);
+        if (ok) {
+            assertEq(echoed, amount);
+        }
+    }
+
+    function checkPrankedCallcodeValue(uint256 amount) public {
+        vm.assume(amount <= 1);
+        address caller = address(0xBEEF);
+        vm.deal(address(this), 0);
+        vm.deal(caller, 1);
+        vm.prank(caller);
 
         bytes memory input = abi.encodeWithSelector(SymbolicCallcodeValueTarget.echoValue.selector);
         uint256 echoed;
@@ -1396,13 +1663,63 @@ contract SymbolicCallcodeValue is Test {
 
         assert(ok);
         assertEq(echoed, amount);
+        assertEq(caller.balance, 1 - amount);
+        assertEq(address(this).balance, amount);
+    }
+
+    function checkPrankedCallcodeOverflow() public {
+        address caller = address(0xBEEF);
+        vm.deal(address(this), type(uint256).max);
+        vm.deal(caller, 1);
+        vm.prank(caller);
+
+        bool ok;
+        address callTarget = address(target);
+        assembly {
+            ok := callcode(gas(), callTarget, 1, 0, 0, 0, 0)
+        }
+
+        assert(!ok);
+        assertEq(caller.balance, 1);
+        assertEq(address(this).balance, type(uint256).max);
+    }
+
+    function checkMockedPrankedCallcodeValue() public {
+        address caller = address(0xBEEF);
+        bytes memory input = abi.encodeWithSelector(SymbolicCallcodeValueTarget.echoValue.selector);
+        vm.mockCall(address(target), 1, input, abi.encode(uint256(99)));
+        vm.deal(address(this), 0);
+        vm.deal(caller, 1);
+        vm.prank(caller);
+
+        uint256 echoed;
+        bool ok;
+        address callTarget = address(target);
+        assembly {
+            ok := callcode(gas(), callTarget, 1, add(input, 0x20), mload(input), 0x80, 0x20)
+            echoed := mload(0x80)
+        }
+
+        assert(ok);
+        assertEq(echoed, 99);
+        assertEq(caller.balance, 0);
+        assertEq(address(this).balance, 1);
+
+        vm.deal(caller, 0);
+        vm.prank(caller);
+        assembly {
+            ok := callcode(gas(), callTarget, 1, add(input, 0x20), mload(input), 0, 0)
+        }
+        assert(!ok);
+        assertEq(caller.balance, 0);
+        assertEq(address(this).balance, 1);
     }
 }
 "#,
     );
 
     let stdout = cmd
-        .args(["test", "--symbolic", "--match-test", "checkSymbolicCallcodeValue"])
+        .args(["test", "--symbolic", "--match-test", "check.*Callcode"])
         .assert_success()
         .get_output()
         .stdout_lossy();
@@ -1411,6 +1728,24 @@ contract SymbolicCallcodeValue is Test {
         &stdout,
         foundry_test_utils::str![[r#"
 [PASS] checkSymbolicCallcodeValue(uint256)
+"#]],
+    );
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[PASS] checkPrankedCallcodeValue(uint256)
+"#]],
+    );
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[PASS] checkPrankedCallcodeOverflow()
+"#]],
+    );
+    assert_relevant_lines(
+        &stdout,
+        foundry_test_utils::str![[r#"
+[PASS] checkMockedPrankedCallcodeValue()
 "#]],
     );
     assert!(!stdout.contains("symbolic CALLCODE value"), "{stdout}");

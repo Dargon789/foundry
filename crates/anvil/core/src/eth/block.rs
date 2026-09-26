@@ -1,15 +1,12 @@
 use super::transaction::TransactionInfo;
-#[cfg(test)]
-use alloy_consensus::Header;
+use crate::eth::transaction::MaybeImpersonatedTransaction;
 use alloy_consensus::{
-    BlockBody, EMPTY_OMMER_ROOT_HASH, TxEip4844Variant, Typed2718,
-    proofs::ordered_trie_root_with_encoder, transaction::RlpEcdsaEncodableTx,
+    BlockBody, EMPTY_OMMER_ROOT_HASH, Typed2718, proofs::ordered_trie_root_with_encoder,
+    transaction::RlpEcdsaEncodableTx,
 };
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::Network;
 use foundry_primitives::{FoundryHeader, FoundryTxEnvelope};
-
-use crate::eth::transaction::MaybeImpersonatedTransaction;
 
 /// Type alias for a block containing potentially impersonated transactions.
 pub type Block<T = FoundryTxEnvelope, H = FoundryHeader> =
@@ -40,20 +37,14 @@ impl EncodableBlockTransaction for FoundryTxEnvelope {
     }
 }
 
-/// Drops pooled sidecars so a transaction uses its canonical block-body representation.
-pub fn canonical_block_transaction(tx: FoundryTxEnvelope) -> FoundryTxEnvelope {
-    match tx {
-        FoundryTxEnvelope::Eip4844(tx) => {
-            FoundryTxEnvelope::Eip4844(tx.map(TxEip4844Variant::drop_sidecar))
-        }
-        tx => tx,
-    }
-}
-
 /// Returns a block whose transactions use canonical block-body representations.
 pub fn canonical_block(mut block: Block) -> Block {
-    block.body.transactions =
-        block.body.transactions.into_iter().map(|tx| tx.map(canonical_block_transaction)).collect();
+    block.body.transactions = block
+        .body
+        .transactions
+        .into_iter()
+        .map(|tx| tx.map(FoundryTxEnvelope::into_canonical))
+        .collect();
     block
 }
 
@@ -85,8 +76,8 @@ where
 #[cfg(test)]
 mod tests {
     use alloy_consensus::{
-        BlobTransactionSidecar, BlobTransactionSidecarVariant, BlockHeader, SignableTransaction,
-        TxEip4844, proofs::calculate_transaction_root,
+        BlobTransactionSidecar, BlobTransactionSidecarVariant, BlockHeader, Header,
+        SignableTransaction, TxEip4844, TxEip4844Variant, proofs::calculate_transaction_root,
     };
     use alloy_primitives::{
         Address, B64, B256, Bloom, Signature, U256, b256,

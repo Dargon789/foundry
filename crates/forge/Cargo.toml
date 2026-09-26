@@ -84,13 +84,15 @@ revm = { workspace = true, features = ["parse"] }
 semver.workspace = true
 serde_json.workspace = true
 similar = { version = "3", features = ["inline"] }
-solar.workspace = true
+solar = { workspace = true, features = ["clap"] }
+solar-lsp.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time", "signal"] }
+tokio = { workspace = true, features = ["time", "signal", "process"] }
 toml_edit.workspace = true
 watchexec = "8.0"
 watchexec-events = "6.0"
 watchexec-signals = "5.0"
+which.workspace = true
 clearscreen = "4.0"
 evm-disassembler.workspace = true
 path-slash.workspace = true
@@ -104,10 +106,16 @@ opener = "0.8"
 # soldeer
 soldeer-commands.workspace = true
 soldeer-core.workspace = true
-quick-junit = "0.6.0"
+quick-junit = "0.7.0"
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
+async-lsp.workspace = true
+tokio-util.workspace = true
+futures = { workspace = true, features = ["executor"] }
 alloy-hardforks.workspace = true
 anvil.workspace = true
 forge-script-sequence.workspace = true
@@ -122,8 +130,7 @@ tempfile.workspace = true
 alloy-signer-local.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
-# Keep this aligned with the Chisel PTY test dependency.
-rexpect = { git = "https://github.com/rust-cli/rexpect", rev = "2ed0b1898d7edaf6a85bedbae71a01cc578958fc" }
+rexpect.workspace = true
 
 [features]
 default = ["jemalloc", "asm-keccak", "optimism"]
@@ -134,6 +141,30 @@ tracy-allocator = ["foundry-cli/tracy-allocator"]
 aws-kms = ["foundry-wallets/aws-kms"]
 gcp-kms = ["foundry-wallets/gcp-kms"]
 turnkey = ["foundry-wallets/turnkey"]
+touch-id = ["foundry-wallets/touch-id"]
+monad = [
+    "anvil/monad",
+    "foundry-config/monad",
+    "foundry-evm/monad",
+    "foundry-evm-networks/monad",
+    "foundry-common/monad",
+    "foundry-cli/monad",
+    "forge-script/monad",
+    "forge-verify/monad",
+]
+base = [
+    "anvil/base",
+    "foundry-evm/base",
+    "foundry-evm-networks/base",
+    "foundry-evm-symbolic/base",
+    "foundry-common/base",
+    "foundry-config/base",
+    "foundry-cli/base",
+    "foundry-debugger/base",
+    "foundry-test-utils/base",
+    "forge-script/base",
+    "forge-verify/base",
+]
 optimism = [
     "foundry-evm/optimism",
     "foundry-evm-networks/optimism",

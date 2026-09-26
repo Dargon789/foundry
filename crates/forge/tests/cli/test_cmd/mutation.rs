@@ -70,11 +70,11 @@ MUTATION TESTING RESULTS
 ╭──────────┬───────────┬────────────╮
 │ Status   ┆ # Mutants ┆ % of Total │
 ╞══════════╪═══════════╪════════════╡
-│ Survived ┆ 1         ┆ 14.3%      │
+│ Survived ┆ 1         ┆ 20.0%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Killed   ┆ 4         ┆ 57.1%      │
+│ Killed   ┆ 4         ┆ 80.0%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Invalid  ┆ 2         ┆ 28.6%      │
+│ Invalid  ┆ 0         ┆ 0.0%       │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ Skipped  ┆ 0         ┆ 0.0%       │
 ╰──────────┴───────────┴────────────╯
@@ -101,65 +101,380 @@ Survived mutants
 ────────────────────────────────────────────────────────────
 4 mutants killed
 
-────────────────────────────────────────────────────────────
-2 mutants invalid
-
 ════════════════════════════════════════════════════════════
 
 "#]]);
 
     // Run mutation testing with --json - verify the output contains valid mutation JSON
     cmd.forge_fuse().args(["test", "--mutate", "src/Counter.sol", "--mutation-jobs", "1", "--json"]).assert_success().stdout_eq(str![[r#"
-{"summary":{"total":7,"killed":4,"survived":1,"invalid":2,"skipped":0,"timed_out":0,"mutation_score":80.0,"duration_secs":[..]},"survived_mutants":{"src/Counter.sol":[{"line":13,"column":9,"original":"number++","mutant":"++number"}]}}
+{"summary":{"total":5,"killed":4,"survived":1,"invalid":0,"skipped":0,"timed_out":0,"mutation_score":80.0,"duration_secs":[..]},"survived_mutants":{"src/Counter.sol":[{"line":13,"column":9,"original":"number++","mutant":"++number"}]}}
 
 "#]]);
 });
 
-forgetest_init!(mutation_testing_rejects_list_mode, |prj, cmd| {
+forgetest_init!(mutation_testing_retains_gas_distinct_bounds, |prj, cmd| {
     prj.add_source(
-        "Counter.sol",
+        "Boundary.sol",
         r#"
-// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-contract Counter {
-    uint256 public number;
-
-    function increment() public {
-        number++;
+contract Boundary {
+    function isZero(uint256 value) public pure returns (bool) {
+        return value == 0;
     }
 }
 "#,
     );
 
     prj.add_test(
-        "Counter.t.sol",
+        "Boundary.t.sol",
         r#"
-// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import "../src/Counter.sol";
+import "../src/Boundary.sol";
 
-contract CounterTest {
-    function test_Increment() public {
-        Counter counter = new Counter();
-        counter.increment();
-        assert(counter.number() == 1);
+contract BoundaryTest {
+    Boundary private boundary = new Boundary();
+
+    function testZero() public view {
+        assert(boundary.isZero(0));
+    }
+
+    function testNonzero() public view {
+        assert(!boundary.isZero(1));
     }
 }
 "#,
     );
 
-    let output = cmd.args(["test", "--mutate", "src/Counter.sol", "--list"]).assert_failure();
-    let stderr = output.get_output().stderr_lossy();
+    fs::write(
+        prj.root().join("foundry.toml"),
+        r#"
+[mutation]
+exclude_operators = [
+    "assembly",
+    "assignment",
+    "delete-expression",
+    "elim-delegate",
+    "require",
+    "unary-op",
+]
+"#,
+    )
+    .unwrap();
 
-    assert!(
-        stderr.contains("`--mutate` cannot be combined with: --list"),
-        "unexpected stderr:\n{stderr}"
-    );
+    cmd.args(["test", "--mutate", "src/Boundary.sol", "--mutation-jobs", "1", "--json"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+{"summary":{"total":5,"killed":4,"survived":1,"invalid":0,"skipped":0,"timed_out":0,"mutation_score":80.0,"duration_secs":[..]},"survived_mutants":{"src/Boundary.sol":[{"line":7,"column":16,"original":"value == 0","mutant":"value <= 0"}]}}
+
+"#]]);
 });
 
-forgetest_init!(mutation_testing_rejects_list_mode_before_compile, |prj, cmd| {
+forgetest_init!(mutation_testing_retains_storage_push_lvalue_mutants, |prj, cmd| {
+    prj.add_source(
+        "StoragePush.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+contract StoragePush {
+    int256[] private values;
+
+    function mutate() public returns (int256) {
+        return -values.push();
+    }
+
+    function value() public view returns (int256) {
+        return values[0];
+    }
+}
+"#,
+    );
+
+    prj.add_test(
+        "StoragePush.t.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+import "../src/StoragePush.sol";
+
+contract StoragePushTest {
+    function testMutate() public {
+        StoragePush target = new StoragePush();
+        assert(target.mutate() == 0);
+        assert(target.value() == 0);
+    }
+}
+"#,
+    );
+
+    fs::write(
+        prj.root().join("foundry.toml"),
+        r#"
+[mutation]
+exclude_operators = [
+    "assembly",
+    "assignment",
+    "binary-op",
+    "delete-expression",
+    "elim-delegate",
+    "require",
+]
+"#,
+    )
+    .unwrap();
+
+    let output = cmd
+        .args(["test", "--mutate", "src/StoragePush.sol", "--mutation-jobs", "1", "--json"])
+        .assert_success();
+    let summary = mutation_summary(&output.get_output().stdout_lossy());
+
+    assert_eq!(summary["total"], 5);
+    assert_eq!(summary["killed"], 5);
+    assert_eq!(summary["invalid"], 0);
+    assert_eq!(summary["skipped"], 0);
+});
+
+forgetest_init!(mutation_testing_filters_invalid_compound_assignments, |prj, cmd| {
+    prj.add_source(
+        "CompoundAssignments.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+contract CompoundAssignments {
+    uint256 public unsignedTotal;
+    int256 public signedTotal;
+
+    function update(uint256 unsignedAmount, int256 signedAmount) public {
+        unsignedTotal += unsignedAmount;
+        signedTotal += signedAmount;
+    }
+
+    function shift(int256 value, uint8 amount) public pure returns (int256) {
+        value <<= amount;
+        return value;
+    }
+
+    function shiftLeftLiteral(int256 value) public pure returns (int256) {
+        value <<= 2;
+        return value;
+    }
+
+    function shiftRightLiteral(int256 value) public pure returns (int256) {
+        value >>= 3;
+        return value;
+    }
+}
+"#,
+    );
+
+    prj.add_test(
+        "CompoundAssignments.t.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+import "../src/CompoundAssignments.sol";
+
+contract CompoundAssignmentsTest {
+    CompoundAssignments private target = new CompoundAssignments();
+
+    function testUpdate() public {
+        target.update(3, 4);
+        assert(target.unsignedTotal() == 3);
+        assert(target.signedTotal() == 4);
+    }
+
+    function testShift() public view {
+        assert(target.shift(1, 2) == 4);
+    }
+
+    function testShiftLiterals() public view {
+        assert(target.shiftLeftLiteral(32) == 128);
+        assert(target.shiftRightLiteral(32) == 4);
+    }
+}
+"#,
+    );
+
+    fs::write(
+        prj.root().join("foundry.toml"),
+        r#"
+[mutation]
+exclude_operators = [
+    "assembly",
+    "binary-op",
+    "delete-expression",
+    "elim-delegate",
+    "require",
+    "unary-op",
+]
+"#,
+    )
+    .unwrap();
+
+    let output = cmd
+        .args(["test", "--mutate", "src/CompoundAssignments.sol", "--mutation-jobs", "1", "--json"])
+        .assert_success();
+    let summary = mutation_summary(&output.get_output().stdout_lossy());
+
+    assert_eq!(summary["total"], 6);
+    assert_eq!(summary["killed"], 6);
+    assert_eq!(summary["survived"], 0);
+    assert_eq!(summary["invalid"], 0);
+    assert_eq!(summary["skipped"], 0);
+});
+
+forgetest_init!(mutation_testing_filters_invalid_fixed_bytes_unary_mutants, |prj, cmd| {
+    prj.add_source(
+        "TypedUnary.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+contract TypedUnary {
+    function complementWord(bytes32 word) public pure returns (bytes32) {
+        return ~word;
+    }
+
+    function complementNumber(uint256 number) public pure returns (uint256) {
+        return ~number;
+    }
+}
+"#,
+    );
+
+    prj.add_test(
+        "TypedUnary.t.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+import "../src/TypedUnary.sol";
+
+contract TypedUnaryTest {
+    TypedUnary private target = new TypedUnary();
+
+    function testComplementWord() public view {
+        assert(target.complementWord(bytes32(uint256(3))) == ~bytes32(uint256(3)));
+    }
+
+    function testComplementNumber() public view {
+        assert(target.complementNumber(3) == ~uint256(3));
+    }
+}
+"#,
+    );
+
+    fs::write(
+        prj.root().join("foundry.toml"),
+        r#"
+[mutation]
+exclude_operators = [
+    "assembly",
+    "assignment",
+    "binary-op",
+    "delete-expression",
+    "elim-delegate",
+    "require",
+]
+"#,
+    )
+    .unwrap();
+
+    let output = cmd
+        .args(["test", "--mutate", "src/TypedUnary.sol", "--mutation-jobs", "1", "--json"])
+        .assert_success();
+    let summary = mutation_summary(&output.get_output().stdout_lossy());
+
+    assert_eq!(summary["total"], 4);
+    assert_eq!(summary["killed"], 4);
+    assert_eq!(summary["survived"], 0);
+    assert_eq!(summary["invalid"], 0);
+    assert_eq!(summary["skipped"], 0);
+});
+
+forgetest_init!(mutation_testing_comparison_type_matrix, |prj, cmd| {
+    prj.add_source(
+        "Comparisons.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+contract Comparisons {
+    function numericEq(uint256 left, uint256 right) public pure returns (bool) {
+        return left == right;
+    }
+
+    function booleanEq(bool left, bool right) public pure returns (bool) {
+        return left == right;
+    }
+
+    function conjunction(bool left, bool right) public pure returns (bool) {
+        return left && right;
+    }
+}
+"#,
+    );
+
+    prj.add_test(
+        "Comparisons.t.sol",
+        r#"
+pragma solidity ^0.8.13;
+
+import "../src/Comparisons.sol";
+
+contract ComparisonsTest {
+    Comparisons private comparisons = new Comparisons();
+
+    function testNumericEq() public view {
+        assert(comparisons.numericEq(1, 1));
+        assert(!comparisons.numericEq(1, 2));
+        assert(!comparisons.numericEq(2, 1));
+    }
+
+    function testBooleanEq() public view {
+        assert(comparisons.booleanEq(false, false));
+        assert(!comparisons.booleanEq(false, true));
+        assert(!comparisons.booleanEq(true, false));
+        assert(comparisons.booleanEq(true, true));
+    }
+
+    function testConjunction() public view {
+        assert(!comparisons.conjunction(false, false));
+        assert(!comparisons.conjunction(false, true));
+        assert(!comparisons.conjunction(true, false));
+        assert(comparisons.conjunction(true, true));
+    }
+}
+"#,
+    );
+
+    fs::write(
+        prj.root().join("foundry.toml"),
+        r#"
+[mutation]
+exclude_operators = [
+    "assembly",
+    "assignment",
+    "delete-expression",
+    "elim-delegate",
+    "require",
+    "unary-op",
+]
+"#,
+    )
+    .unwrap();
+
+    let output = cmd
+        .args(["test", "--mutate", "src/Comparisons.sol", "--mutation-jobs", "1", "--json"])
+        .assert_success();
+    let summary = mutation_summary(&output.get_output().stdout_lossy());
+
+    assert_eq!(summary["total"], 11);
+    assert_eq!(summary["killed"], 11);
+    assert_eq!(summary["survived"], 0);
+    assert_eq!(summary["invalid"], 0);
+    assert_eq!(summary["mutation_score"], 100.0);
+});
+
+forgetest!(mutation_testing_rejects_list_mode_before_compile, |prj, cmd| {
     prj.add_source(
         "Broken.sol",
         r#"
@@ -174,17 +489,13 @@ contract Broken {
 "#,
     );
 
-    let output = cmd.args(["test", "--mutate", "src/Broken.sol", "--list"]).assert_failure();
-    let stderr = output.get_output().stderr_lossy();
+    cmd.args(["test", "--mutate", "src/Broken.sol", "--list"])
+        .assert_failure()
+        .stdout_eq("")
+        .stderr_eq(str![[r#"
+Error: `--mutate` cannot be combined with: --list. Re-run without those flags to use mutation testing.
 
-    assert!(
-        stderr.contains("`--mutate` cannot be combined with: --list"),
-        "unexpected stderr:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("Compiler run failed"),
-        "mutation/list conflict should be reported before compile errors:\n{stderr}"
-    );
+"#]]);
 });
 
 forgetest_init!(mutation_testing_rejects_all_skipped_baseline, |prj, cmd| {
@@ -606,11 +917,11 @@ MUTATION TESTING RESULTS
 ╭──────────┬───────────┬────────────╮
 │ Status   ┆ # Mutants ┆ % of Total │
 ╞══════════╪═══════════╪════════════╡
-│ Survived ┆ 2         ┆ 18.2%      │
+│ Survived ┆ 2         ┆ 20.0%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Killed   ┆ 8         ┆ 72.7%      │
+│ Killed   ┆ 8         ┆ 80.0%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Invalid  ┆ 1         ┆ 9.1%       │
+│ Invalid  ┆ 0         ┆ 0.0%       │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ Skipped  ┆ 0         ┆ 0.0%       │
 ╰──────────┴───────────┴────────────╯
@@ -668,11 +979,11 @@ MUTATION TESTING RESULTS
 ╭──────────┬───────────┬────────────╮
 │ Status   ┆ # Mutants ┆ % of Total │
 ╞══════════╪═══════════╪════════════╡
-│ Survived ┆ 2         ┆ 18.2%      │
+│ Survived ┆ 2         ┆ 20.0%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Killed   ┆ 8         ┆ 72.7%      │
+│ Killed   ┆ 8         ┆ 80.0%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Invalid  ┆ 1         ┆ 9.1%       │
+│ Invalid  ┆ 0         ┆ 0.0%       │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ Skipped  ┆ 0         ┆ 0.0%       │
 ╰──────────┴───────────┴────────────╯
@@ -701,9 +1012,6 @@ Survived mutants
 ...
 ────────────────────────────────────────────────────────────
 8 mutants killed
-
-────────────────────────────────────────────────────────────
-1 mutants invalid
 
 ════════════════════════════════════════════════════════════
 
@@ -1574,7 +1882,7 @@ contract VaultTest is Test {
 "#,
     );
 
-    // The surviving mutant (msg.value > 0 -> msg.value != 0) is equivalent for uint256
+    // The gas-distinct msg.value > 0 -> msg.value != 0 mutant remains.
     let mut cmd2 = prj.forge_command();
     cmd2.args(["test", "--mutate", "src/Vault.sol", "--mutation-jobs", "2"]);
     cmd2.assert_success().stdout_eq(str![[r#"
@@ -1588,13 +1896,13 @@ MUTATION TESTING RESULTS
 ╭──────────┬───────────┬────────────╮
 │ Status   ┆ # Mutants ┆ % of Total │
 ╞══════════╪═══════════╪════════════╡
-│ Survived ┆ 3         ┆ 5.0%       │
+│ Survived ┆ 3         ┆ 5.7%       │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Killed   ┆ 48        ┆ 80.0%      │
+│ Killed   ┆ 48        ┆ 90.6%      │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Invalid  ┆ 7         ┆ 11.7%      │
+│ Invalid  ┆ 0         ┆ 0.0%       │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Skipped  ┆ 2         ┆ 3.3%       │
+│ Skipped  ┆ 2         ┆ 3.8%       │
 ╰──────────┴───────────┴────────────╯
 ...
 Mutation Score: 94.1% (48/51 mutants killed); [ELAPSED]

@@ -1,5 +1,5 @@
 use crate::{
-    cmd::{cache::CacheSubcommands, generate::GenerateSubcommands, watch},
+    cmd::{cache::CacheSubcommands, watch},
     opts::{Forge, ForgeSubcommand},
 };
 use clap::{CommandFactory, Parser};
@@ -76,11 +76,11 @@ pub fn run_command(args: Forge) -> Result<()> {
             }
         }
         ForgeSubcommand::Bind(cmd) => cmd.run(),
-        ForgeSubcommand::Build(cmd) => {
-            if cmd.is_watch() {
-                global.block_on(watch::watch_build(cmd))
+        ForgeSubcommand::Build { args, locked } => {
+            if args.is_watch() {
+                global.block_on(watch::watch_build(args))
             } else {
-                global.block_on(cmd.run()).map(drop)
+                global.block_on(args.run(locked)).map(drop)
             }
         }
         ForgeSubcommand::VerifyContract(mut args) => {
@@ -97,6 +97,7 @@ pub fn run_command(args: Forge) -> Result<()> {
         ForgeSubcommand::Create(cmd) => global.block_on(cmd.run()),
         ForgeSubcommand::Update(cmd) => cmd.run(),
         ForgeSubcommand::Install(cmd) => global.block_on(cmd.run()),
+        ForgeSubcommand::Reinit(cmd) => cmd.run(),
         ForgeSubcommand::Remove(cmd) => cmd.run(),
         ForgeSubcommand::Remappings(cmd) => cmd.run(),
         ForgeSubcommand::Init(cmd) => global.block_on(cmd.run()),
@@ -130,7 +131,7 @@ pub fn run_command(args: Forge) -> Result<()> {
         ForgeSubcommand::Flatten(cmd) => cmd.run(),
         ForgeSubcommand::Inspect(cmd) => cmd.run(),
         ForgeSubcommand::Tree(cmd) => cmd.run(),
-        ForgeSubcommand::Geiger(cmd) => cmd.run(),
+        ForgeSubcommand::Geiger(cmd) => global.block_on(cmd.run()),
         ForgeSubcommand::Doc(cmd) => {
             if cmd.is_watch() {
                 global.block_on(watch::watch_doc(cmd))
@@ -139,14 +140,12 @@ pub fn run_command(args: Forge) -> Result<()> {
             }
         }
         ForgeSubcommand::Selectors { command } => global.block_on(command.run()),
-        ForgeSubcommand::Generate(cmd) => match cmd.sub {
-            GenerateSubcommands::Test(cmd) => cmd.run(),
-        },
         ForgeSubcommand::Compiler(cmd) => cmd.run(),
         ForgeSubcommand::Soldeer(cmd) => global.block_on(cmd.run()),
         ForgeSubcommand::Eip712(cmd) => cmd.run(),
         ForgeSubcommand::BindJson(cmd) => cmd.run(),
-        ForgeSubcommand::Lint(cmd) => cmd.run(),
+        ForgeSubcommand::Lint(cmd) => global.block_on(cmd.run()),
+        ForgeSubcommand::Lsp(cmd) => global.block_on(crate::cmd::lsp::run(cmd)),
     }
 }
 

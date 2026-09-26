@@ -1,19 +1,28 @@
 //! Contains various tests for `forge test`.
 
 use crate::utils::assert_debug_dump_identifies_contract;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_provider::Provider;
 use anvil::{NodeConfig, spawn};
+use foundry_config::{CompilationRestrictions, SettingsOverrides, filter::GlobMatcher};
 use foundry_test_utils::{
     TestCommand,
-    rpc::{self, rpc_endpoints},
+    rpc::{self, next_etherscan_api_key, rpc_endpoints},
     str,
     util::{OTHER_SOLC_VERSION, OutputExt, SOLC_VERSION},
 };
 use similar_asserts::assert_eq;
 use std::{io::Write, path::PathBuf, str::FromStr};
 
+#[cfg(unix)]
+use std::fs;
+
+#[cfg(feature = "base")]
+mod base;
 mod brutalize;
 mod core;
+mod exact_fork;
+mod fork_bal;
 mod fuzz;
 mod invariant;
 mod logs;
@@ -116,11 +125,11 @@ fn collect_debug_dump_storage_changes<'a>(
 /// Contracts excluded from the main `testdata` run because they depend on flaky external RPCs.
 /// These are run separately by the `flaky_testdata` test below.
 /// Format: pipe-separated regex alternation, e.g. `"Foo|Bar|Baz"`.
-const FLAKY_TESTDATA_CONTRACTS: &str = "Issue4640Test|Issue14212Test";
+const FLAKY_TESTDATA_CONTRACTS: &str = "Issue4232Test|Issue4640Test|Issue14212Test";
 
-// Issue14212Test depends on Base transaction lookups that are not reliably served by the public
-// Base RPC endpoint used in CI.
-const FLAKY_TESTDATA_RUN_CONTRACTS: &str = "Issue4640Test";
+// Issue4232Test depends on the public Moonbeam RPC, while Issue14212Test depends on Base
+// transaction lookups that are not reliably served by the public Base RPC endpoint used in CI.
+const FLAKY_TESTDATA_RUN_CONTRACTS: &str = "Issue4232Test|Issue4640Test";
 
 // Run `forge test` on `/testdata`.
 forgetest!(testdata, |_prj, cmd| {
@@ -134,6 +143,12 @@ forgetest!(testdata, |_prj, cmd| {
 
     let orig_assert = cmd.args(args).assert();
     if orig_assert.get_output().status.success() {
+        return;
+    }
+    // Only test failures are retried: a crash writes no `--rerun` failures, so a retry would
+    // either rerun everything or only unrelated flaky failures and hide the crash.
+    if orig_assert.get_output().status.code() != Some(1) {
+        orig_assert.success();
         return;
     }
     let stdout = orig_assert.get_output().stdout_lossy();
@@ -155,12 +170,76 @@ forgetest!(testdata, |_prj, cmd| {
     orig_assert.success();
 });
 
+#[cfg(feature = "monad")]
+forgetest!(monad_testdata, |_prj, cmd| {
+    setup_testdata_cmd(&mut cmd);
+    cmd.args(["test", "--network", "monad", "--mc=(MonadStakingTest|MonadReserveBalanceTest)"])
+        .assert_success();
+});
+
 // Run flaky testdata contracts excluded from the main `testdata` test above.
 // Picked up by the nightly `test-flaky` workflow via `cargo nextest run --profile flaky`.
 forgetest!(flaky_testdata, |_prj, cmd| {
     setup_testdata_cmd(&mut cmd);
     let mc = format!("--mc=({FLAKY_TESTDATA_RUN_CONTRACTS})");
     cmd.args(["test", &mc]).assert_success();
+});
+
+// Ensures `vm.deployCode` works with the optimism network family active, covering the OP EVM's
+// nested frame execution path which is only reachable through this cheatcode.
+forgetest_init!(deploy_code_cheatcode_on_optimism_network, |prj, cmd| {
+    prj.update_config(|config| {
+        config.networks = foundry_evm_networks::NetworkConfigs::with_optimism();
+    });
+
+    prj.add_source(
+        "OpCounter.sol",
+        r#"
+contract OpCounter {
+    uint256 public number;
+
+    constructor(uint256 initial) {
+        number = initial;
+    }
+
+    function increment() external {
+        number++;
+    }
+}
+"#,
+    );
+
+    prj.add_test(
+        "OpDeployCode.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+import {OpCounter} from "../src/OpCounter.sol";
+
+contract OpDeployCodeTest is Test {
+    function testDeployCodeOnOptimism() public {
+        address deployed = vm.deployCode("src/OpCounter.sol:OpCounter", abi.encode(41));
+        assertGt(deployed.code.length, 0);
+
+        OpCounter counter = OpCounter(deployed);
+        assertEq(counter.number(), 41);
+        counter.increment();
+        assertEq(counter.number(), 42);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--match-contract", "OpDeployCodeTest"]).assert_success().stdout_eq(str![[
+        r#"
+...
+Ran 1 test for test/OpDeployCode.t.sol:OpDeployCodeTest
+[PASS] testDeployCodeOnOptimism() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#
+    ]]);
 });
 
 // tests that test filters are handled correctly
@@ -217,6 +296,197 @@ Warning: No tests found in project! Forge looks for functions that start with `t
 Warning: No tests found in project! Forge looks for functions that start with `test`
 
 "#]]);
+});
+
+// Test that `--decode-external-storage` decodes storage layouts of external contracts
+// fetched from Etherscan when using state diff recording on a fork.
+// Uses 1inch token (non-proxy, Solidity 0.6.12) which supports storageLayout output.
+forgetest_init!(decode_external_storage_on_fork, |prj, cmd| {
+    let endpoint = rpc::next_http_archive_rpc_url();
+    let etherscan_api_key = next_etherscan_api_key();
+
+    prj.add_test(
+        "DecodeExternalStorage.t.sol",
+        &r#"
+import {Test} from "forge-std/Test.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+contract DecodeExternalStorageTest is Test {
+    // 1inch token on mainnet (non-proxy, compiled with Solidity 0.6.12)
+    address constant ONE_INCH = 0x111111111117dC0aa78b770fA6A738034120C302;
+    // A large 1inch holder
+    address constant WHALE = 0xF977814e90dA44bFA03b6295A0616a897441aceC;
+
+    function test_externalStorageDecoding() public {
+        vm.createSelectFork("<url>");
+
+        vm.prank(WHALE);
+
+        vm.startStateDiffRecording();
+        IERC20(ONE_INCH).transfer(address(this), 1 ether);
+        string memory diff = vm.getStateDiffJson();
+
+        // When external storage decoding is enabled, the JSON should contain
+        // the decoded mapping label "_balances" from the 1inch token's storage layout.
+        assertTrue(vm.contains(diff, "_balances"), "expected decoded '_balances' label in state diff");
+    }
+}
+   "#
+        .replace("<url>", &endpoint),
+    );
+
+    cmd.args([
+        "test",
+        "-vvvv",
+        "--mt",
+        "test_externalStorageDecoding",
+        "--decode-external-storage",
+        "--etherscan-api-key",
+        &etherscan_api_key,
+    ])
+    .assert_success();
+});
+
+// Test that `--decode-external-storage` correctly resolves proxy contracts
+// by fetching the implementation's storage layout (e.g., USDC is an EIP-1967 proxy).
+forgetest_init!(decode_external_storage_proxy_on_fork, |prj, cmd| {
+    let endpoint = rpc::next_http_archive_rpc_url();
+    let etherscan_api_key = next_etherscan_api_key();
+
+    prj.add_test(
+        "DecodeExternalStorageProxy.t.sol",
+        &r#"
+import {Test} from "forge-std/Test.sol";
+
+interface IUSDC {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract DecodeExternalStorageProxyTest is Test {
+    // USDC on mainnet (EIP-1967 proxy -> FiatTokenV2_2 implementation)
+    address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    // A large USDC holder (Circle/Centre)
+    address constant USDC_WHALE = 0x55FE002aefF02F77364de339a1292923A15844B8;
+
+    function test_externalStorageDecodingProxy() public {
+        vm.createSelectFork("<url>");
+
+        // Impersonate a whale to perform a transfer
+        vm.prank(USDC_WHALE);
+
+        vm.startStateDiffRecording();
+        IUSDC(USDC).transfer(address(this), 1_000_000); // 1 USDC (6 decimals)
+        string memory diff = vm.getStateDiffJson();
+
+        // The implementation contract (FiatTokenV2_2) has a `balanceAndBlacklistStates` mapping.
+        // If proxy resolution works, the decoded JSON should contain the label
+        // from the implementation's storage layout, not raw hex slots.
+        assertTrue(vm.contains(diff, "balanceAndBlacklistStates"), "expected decoded 'balanceAndBlacklistStates' label from implementation storage layout");
+    }
+}
+   "#
+        .replace("<url>", &endpoint),
+    );
+
+    cmd.args([
+        "test",
+        "-vvvv",
+        "--mt",
+        "test_externalStorageDecodingProxy",
+        "--decode-external-storage",
+        "--etherscan-api-key",
+        &etherscan_api_key,
+    ])
+    .assert_success();
+});
+
+// A local proxy artifact must not override the layout of the bytecode that executed a delegated
+// storage write.
+forgetest_init!(decode_external_storage_prefers_delegatecall_layout, |prj, cmd| {
+    prj.add_test(
+        "DecodeDelegatecallStorage.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract Implementation {
+    uint256 public implementationValue;
+    bytes32 public constant IMPLEMENTATION_SLOT =
+        0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+    function setValue(uint256 value) external {
+        implementationValue = value;
+    }
+}
+
+contract TransparentUpgradeableProxy {
+    uint256 public guessedProxyValue;
+}
+
+contract Proxy {
+    uint256 public misleadingProxyValue;
+    bytes32 private constant IMPLEMENTATION_SLOT =
+        0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+    constructor(address implementation) {
+        bytes32 slot = IMPLEMENTATION_SLOT;
+        assembly {
+            sstore(slot, implementation)
+        }
+    }
+
+    fallback() external payable {
+        bytes32 slot = IMPLEMENTATION_SLOT;
+        assembly {
+            let implementation := sload(slot)
+            calldatacopy(0, 0, calldatasize())
+            let success := delegatecall(gas(), implementation, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            if iszero(success) { revert(0, returndatasize()) }
+            return(0, returndatasize())
+        }
+    }
+}
+
+contract DecodeDelegatecallStorageTest is Test {
+    function test_usesRecordedImplementationLayout() public {
+        Implementation implementation = new Implementation();
+        Proxy proxy = new Proxy(address(implementation));
+
+        vm.startStateDiffRecording();
+        Implementation(address(proxy)).setValue(42);
+        string memory diff = vm.getStateDiffJson();
+
+        assertTrue(vm.contains(diff, "implementationValue"));
+        assertFalse(vm.contains(diff, "misleadingProxyValue"));
+        assertFalse(vm.contains(diff, "guessedProxyValue"));
+
+        vm.startStateDiffRecording();
+        Implementation(address(proxy)).setValue(43);
+        vm.chainId(1);
+        string memory priorChainDiff = vm.getStateDiffJson();
+
+        // The current journal can no longer prove the code identity recorded on the prior chain.
+        assertFalse(vm.contains(priorChainDiff, "implementationValue"));
+        assertFalse(vm.contains(priorChainDiff, "misleadingProxyValue"));
+        assertFalse(vm.contains(priorChainDiff, "guessedProxyValue"));
+    }
+}
+"#,
+    );
+
+    cmd.args([
+        "test",
+        "--mt",
+        "test_usesRecordedImplementationLayout",
+        "--decode-external-storage",
+        "--extra-output",
+        "storageLayout",
+    ])
+    .assert_success();
 });
 
 // tests that a warning is displayed if there are tests but none match a non-empty filter
@@ -463,6 +733,138 @@ forgetest!(can_run_test_with_json_output_non_verbose, |prj, cmd| {
         .stdout_eq(file!["../../fixtures/SimpleContractTestNonVerbose.json": Json]);
 });
 
+forgetest!(can_write_json_results_without_changing_stdout, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.insert_console();
+    prj.add_source("Simple.t.sol", SIMPLE_CONTRACT);
+
+    let json_path = prj.root().join("test-results.json");
+    cmd.forge_fuse().args(["test", "--json-file"]).arg(&json_path).assert_success().stdout_eq(
+        str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for src/Simple.t.sol:SimpleContractTest
+[PASS] test() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]],
+    );
+
+    let results: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+    let result = &results["src/Simple.t.sol:SimpleContractTest"]["test_results"]["test()"];
+    assert_eq!(result["status"], "Success");
+    assert_eq!(result["logs"], serde_json::json!([]));
+
+    let json_stdout = cmd
+        .forge_fuse()
+        .args(["test", "-vvvv", "--json"])
+        .assert_success()
+        .get_output()
+        .stdout
+        .clone();
+    cmd.forge_fuse().args(["test", "-vvvv", "--json-file"]).arg(&json_path).assert_success();
+    let mut stdout_results: serde_json::Value = serde_json::from_slice(&json_stdout).unwrap();
+    let mut file_results: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+    for results in [&mut stdout_results, &mut file_results] {
+        let suite = &mut results["src/Simple.t.sol:SimpleContractTest"];
+        suite.as_object_mut().unwrap().remove("duration");
+        suite["test_results"]["test()"].as_object_mut().unwrap().remove("duration");
+    }
+    assert_eq!(file_results, stdout_results);
+
+    prj.add_test(
+        "Failing.t.sol",
+        r#"
+contract FailingTest {
+    function testFail() public pure {
+        require(false, "boom");
+    }
+}
+"#,
+    );
+    cmd.forge_fuse()
+        .args(["test", "--match-test", "testFail", "--json-file"])
+        .arg(&json_path)
+        .assert_failure();
+    let failed_results: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+    assert_eq!(
+        failed_results["test/Failing.t.sol:FailingTest"]["test_results"]["testFail()"]["status"],
+        "Failure"
+    );
+});
+
+forgetest!(json_file_fail_fast_preserves_completed_suites, |prj, cmd| {
+    prj.add_test(
+        "Failing.t.sol",
+        r#"
+interface VmFail {
+    function sleep(uint256 milliseconds) external;
+}
+
+contract FailingTest {
+    VmFail constant vm = VmFail(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function testBreaks() public {
+        // Let both suites start, but finish this one first.
+        vm.sleep(100);
+        require(false, "boom");
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "Passing.t.sol",
+        r#"
+interface VmPass {
+    function sleep(uint256 milliseconds) external;
+}
+
+contract PassingTest {
+    VmPass constant vm = VmPass(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function testPass() public {
+        // Complete after the failing suite has stopped console output.
+        vm.sleep(500);
+    }
+}
+"#,
+    );
+
+    let json_path = prj.root().join("test-results.json");
+    let output = cmd
+        .args(["test", "--fail-fast", "-j", "2", "--json-file"])
+        .arg(&json_path)
+        .assert_failure();
+
+    assert!(
+        json_path.exists(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.get_output().stdout),
+        String::from_utf8_lossy(&output.get_output().stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    assert!(!stdout.contains("Ran 1 test for test/Passing.t.sol:PassingTest"));
+    assert!(stdout.contains("Encountered a total of 1 failing tests, 0 tests succeeded"));
+
+    let results: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+    assert_eq!(
+        results["test/Failing.t.sol:FailingTest"]["test_results"]["testBreaks()"]["status"],
+        "Failure"
+    );
+    assert_eq!(
+        results["test/Passing.t.sol:PassingTest"]["test_results"]["testPass()"]["status"],
+        "Success"
+    );
+});
+
 // tests that `forge test` will pick up tests that are stored in the `test = <path>` config value
 forgetest!(can_run_test_in_custom_test_folder, |prj, cmd| {
     prj.insert_ds_test();
@@ -591,7 +993,7 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 "#]]);
 });
 
-forgetest_init!(rejects_library_key_collisions_across_versions, |prj, cmd| {
+forgetest_init!(links_library_artifacts_across_versions, |prj, cmd| {
     prj.wipe_contracts();
     prj.update_config(|config| config.solc = None);
 
@@ -640,16 +1042,205 @@ contract OldTest {{
         ),
     );
 
-    cmd.arg("test").assert_failure().stderr_eq(str![[r#"
-Error: multiple library artifacts resolve to the same key src/Lib.sol:Lib
-
-"#]]);
+    cmd.arg("test").assert_success();
 
     prj.update_config(|config| config.create2_deployer = Address::ZERO);
-    cmd.forge_fuse().arg("test").assert_failure().stderr_eq(str![[r#"
-Error: multiple library artifacts resolve to the same key src/Lib.sol:Lib
+    cmd.forge_fuse().arg("test").assert_success();
+});
 
-"#]]);
+forgetest_init!(links_library_artifacts_across_compiler_profiles, |prj, cmd| {
+    prj.wipe_contracts();
+    prj.add_source(
+        "Lib.sol",
+        r#"
+pragma solidity >=0.8.0;
+
+library Lib {
+    function identity(uint256 value) external pure returns (uint256) {
+        return value;
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "Prod.sol",
+        r#"
+pragma solidity >=0.8.0;
+
+import "src/Lib.sol";
+
+contract Prod {
+    function identity(uint256 value) external view returns (uint256) {
+        return Lib.identity(value);
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "Profiles.t.sol",
+        r#"
+pragma solidity >=0.8.0;
+
+import "src/Lib.sol";
+import "src/Prod.sol";
+
+contract ProfilesTest {
+    function testProfiles() public {
+        require(Lib.identity(1) == 1);
+        require(new Prod().identity(2) == 2);
+    }
+}
+"#,
+    );
+    prj.update_config(|config| {
+        config.additional_compiler_profiles = vec![SettingsOverrides {
+            name: "prod".to_string(),
+            via_ir: Some(true),
+            evm_version: None,
+            optimizer: Some(true),
+            optimizer_runs: Some(1),
+            bytecode_hash: None,
+        }];
+        config.compilation_restrictions = vec![CompilationRestrictions {
+            paths: GlobMatcher::from_str("src/Prod.sol").unwrap(),
+            version: None,
+            via_ir: Some(true),
+            bytecode_hash: None,
+            min_optimizer_runs: None,
+            optimizer_runs: Some(1),
+            max_optimizer_runs: None,
+            min_evm_version: None,
+            evm_version: None,
+            max_evm_version: None,
+        }];
+    });
+
+    cmd.arg("test").assert_success();
+    assert!(prj.artifacts().join("Lib.sol/Lib.json").exists());
+    assert!(prj.artifacts().join("Lib.sol/Lib.prod.json").exists());
+
+    prj.add_source(
+        "Prod.sol",
+        r#"
+pragma solidity >=0.8.0;
+
+import "src/Lib.sol";
+
+contract Prod {
+    function identity(uint256 value) external view returns (uint256) {
+        return Lib.identity(value + 0);
+    }
+}
+"#,
+    );
+    cmd.forge_fuse().arg("test").assert_success();
+
+    prj.update_config(|config| config.create2_deployer = Address::ZERO);
+    cmd.forge_fuse().arg("test").assert_success();
+});
+
+#[cfg(unix)]
+forgetest_init!(links_libraries_through_workspace_symlinks, |prj, cmd| {
+    let workspace = prj.root().join("workspace");
+    let airdrops = workspace.join("airdrops");
+    let libraries = workspace.join("library/src/libraries");
+    let package_scope = workspace.join("node_modules/@workspace");
+    fs::create_dir_all(airdrops.join("src")).unwrap();
+    fs::create_dir_all(airdrops.join("test")).unwrap();
+    fs::create_dir_all(&libraries).unwrap();
+    fs::create_dir_all(&package_scope).unwrap();
+    std::os::unix::fs::symlink("../../library", package_scope.join("library")).unwrap();
+
+    fs::write(
+        airdrops.join("foundry.toml"),
+        r#"
+[profile.default]
+allow_paths = ["../"]
+src = "src"
+test = "test"
+out = "out"
+remappings = ["@workspace/=../node_modules/@workspace/"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        libraries.join("Math.sol"),
+        r#"
+pragma solidity >=0.8.0;
+
+library Math {
+    function increment(uint256 value) external pure returns (uint256) {
+        return value + 1;
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        libraries.join("Helpers.sol"),
+        r#"
+pragma solidity >=0.8.0;
+
+import {Math} from "./Math.sol";
+
+library Helpers {
+    function addTwo(uint256 value) external pure returns (uint256) {
+        return Math.increment(Math.increment(value));
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        airdrops.join("src/Consumer.sol"),
+        r#"
+pragma solidity >=0.8.0;
+
+import {Helpers} from "@workspace/library/src/libraries/Helpers.sol";
+
+contract Consumer {
+    function addTwo(uint256 value) external pure returns (uint256) {
+        return Helpers.addTwo(value);
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        airdrops.join("test/Consumer.t.sol"),
+        r#"
+pragma solidity >=0.8.0;
+
+import {Consumer} from "../src/Consumer.sol";
+
+contract ConsumerTest {
+    function testAddTwo() external {
+        Consumer consumer = new Consumer();
+        require(consumer.addTwo(1) == 3);
+    }
+}
+"#,
+    )
+    .unwrap();
+    cmd.current_dir(&airdrops).arg("build").assert_success();
+    cmd.forge_fuse().current_dir(&airdrops).arg("test").assert_success();
+    cmd.forge_fuse()
+        .current_dir(&airdrops)
+        .args(["test", "--create2-deployer", "0x0000000000000000000000000000000000000000"])
+        .assert_success();
+    writeln!(
+        fs::OpenOptions::new().append(true).open(airdrops.join("foundry.toml")).unwrap(),
+        "libraries = [\"../library/src/libraries/Helpers.sol:Helpers:0x1111111111111111111111111111111111111111\"]"
+    )
+    .unwrap();
+    let stdout = cmd
+        .forge_fuse()
+        .current_dir(&airdrops)
+        .args(["test", "-vvvv"])
+        .assert_failure()
+        .get_output()
+        .stdout_lossy();
+    assert!(stdout.contains("0x1111111111111111111111111111111111111111"), "{stdout}");
 });
 
 forgetest_init!(create2_factory_is_installed_after_constructor_when_no_libraries, |prj, cmd| {
@@ -950,6 +1541,116 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 "#]]);
 });
 
+// <https://github.com/foundry-rs/foundry/issues/16413>
+forgetest_async!(fork_endpoint_without_anvil_node_info, |prj, cmd| {
+    let (api, handle) = spawn(NodeConfig::test().with_chain_id(Some(1u64))).await;
+    api.anvil_mine(Some(U256::ONE), None).await.unwrap();
+    let endpoint =
+        rpc::spawn_rpc_proxy_rejecting_method_after(handle.http_endpoint(), "anvil_nodeInfo", 0)
+            .await;
+
+    prj.add_test(
+        "NonAnvilFork.t.sol",
+        r#"
+contract NonAnvilForkTest {
+    function testFork() external view {
+        require(block.chainid == 1, "wrong chain");
+        require(block.number == 1, "wrong block");
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--fork-url", &endpoint, "--match-test", "testFork"]).assert_success();
+});
+
+// <https://github.com/foundry-rs/foundry/issues/7574>
+forgetest_async!(failed_fork_test_reports_block_number, |prj, cmd| {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    api.anvil_mine(Some(U256::from(7)), None).await.unwrap();
+    let endpoint = handle.http_endpoint();
+
+    prj.add_test(
+        "ForkBlock.t.sol",
+        &format!(
+            r#"
+interface Vm {{
+    function createSelectFork(string calldata url, uint256 blockNumber)
+        external
+        returns (uint256 forkId);
+    function roll(uint256 newHeight) external;
+    function rollFork(uint256 blockNumber) external;
+    function snapshotState() external returns (uint256 snapshotId);
+    function revertToState(uint256 snapshotId) external returns (bool success);
+}}
+
+contract ForkBlockTest {{
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function testForkFailure() public {{
+        vm.createSelectFork("{endpoint}", 7);
+        require(false, "fork failure");
+    }}
+
+    function testForkFailureAfterRoll() public {{
+        vm.createSelectFork("{endpoint}", 7);
+        vm.roll(99);
+        require(false, "fork failure after roll");
+    }}
+
+    function testForkFailureAfterRevert() public {{
+        vm.createSelectFork("{endpoint}", 7);
+        uint256 snapshot = vm.snapshotState();
+        vm.rollFork(6);
+        vm.revertToState(snapshot);
+        require(false, "fork failure after revert");
+    }}
+
+    function testForkSuccess() public {{
+        vm.createSelectFork("{endpoint}", 7);
+    }}
+
+    function testLocalFailure() public pure {{
+        require(false, "local failure");
+    }}
+
+    function testLocalSuccess() public pure {{}}
+}}
+"#
+        ),
+    );
+
+    cmd.arg("test").assert_failure().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 6 tests for test/ForkBlock.t.sol:ForkBlockTest
+[FAIL: fork failure] testForkFailure() (block: 7) ([GAS])
+[FAIL: fork failure after revert] testForkFailureAfterRevert() (block: 7) ([GAS])
+[FAIL: fork failure after roll] testForkFailureAfterRoll() (block: 7) ([GAS])
+[PASS] testForkSuccess() ([GAS])
+[FAIL: local failure] testLocalFailure() ([GAS])
+[PASS] testLocalSuccess() ([GAS])
+Suite result: FAILED. 2 passed; 4 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 2 tests passed, 4 failed, 0 skipped (6 total tests)
+
+Failing tests:
+Encountered 4 failing tests in test/ForkBlock.t.sol:ForkBlockTest
+[FAIL: fork failure] testForkFailure() (block: 7) ([GAS])
+[FAIL: fork failure after revert] testForkFailureAfterRevert() (block: 7) ([GAS])
+[FAIL: fork failure after roll] testForkFailureAfterRoll() (block: 7) ([GAS])
+[FAIL: local failure] testLocalFailure() ([GAS])
+
+Encountered a total of 4 failing tests, 2 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 4 failed tests
+Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
+
+"#]]);
+});
+
 // Validates BPO1 blob gas price calculation during fork transaction replay.
 // Block 24127158 has a blob tx at index 0, target tx at index 1.
 // Forking at the target tx replays the blob tx with correct BPO1 blob base fee calculation.
@@ -975,6 +1676,29 @@ contract BlobForkTest is Test {
     );
 
     cmd.args(["test", "-vvvv"]).assert_success();
+});
+
+// https://github.com/foundry-rs/foundry/issues/10689
+forgetest_init!(flaky_roll_fork_arbitrum_priority_fee_above_max_fee, |prj, cmd| {
+    let endpoint = "https://arb-mainnet.g.alchemy.com/public";
+
+    prj.add_test(
+        "ArbitrumFork.t.sol",
+        &r#"
+import {Test} from "forge-std/Test.sol";
+
+contract ArbitrumForkTest is Test {
+    function test_rollFork() public {
+        uint256 forkId = vm.createFork("<url>");
+        bytes32 txHash = 0x2e43e9ececcbb9cd08ce061edc3b4d39ca2b0ba480034e5f4650ba0065bf6b62;
+        vm.rollFork(forkId, txHash);
+    }
+}
+    "#
+        .replace("<url>", endpoint),
+    );
+
+    cmd.arg("test").assert_success();
 });
 
 // https://github.com/foundry-rs/foundry/issues/6579
@@ -1863,6 +2587,133 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 "#]]);
 });
 
+forgetest_init!(failed_fuzz_test_shows_only_failure_logs, |prj, cmd| {
+    let persist_dir = prj.cache().parent().unwrap().join("persist");
+    prj.update_config(|config| {
+        config.fuzz.runs = 5;
+        config.fuzz.show_logs = false;
+        config.fuzz.failure_persist_dir = Some(persist_dir);
+    });
+    prj.add_test(
+        "FuzzLogs.t.sol",
+        r#"
+contract FuzzLogsTest {
+    event log_named_uint(string key, uint256 value);
+
+    function testFuzzLogs(uint256 value) public {
+        if (value == 154) {
+            emit log_named_uint("FAILING CASE", value);
+            revert("target value");
+        }
+        emit log_named_uint("SUCCESSFUL CASE", value);
+    }
+}
+"#,
+    );
+
+    cmd.args([
+        "test",
+        "--match-test",
+        "testFuzzLogs",
+        "--fuzz-seed",
+        "1",
+        "--threads",
+        "1",
+        "-vv",
+    ])
+    .assert_failure()
+    .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/FuzzLogs.t.sol:FuzzLogsTest
+[FAIL: target value; counterexample: calldata=[..] args=[154]] testFuzzLogs(uint256) (runs: 3, [AVG_GAS])
+Logs:
+  FAILING CASE: 154
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/FuzzLogs.t.sol:FuzzLogsTest
+[FAIL: target value; counterexample: calldata=[..] args=[154]] testFuzzLogs(uint256) (runs: 3, [AVG_GAS])
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
+
+[SEED] (use `--fuzz-seed` to reproduce)
+
+"#]]);
+
+    prj.update_config(|config| config.fuzz.runs = 128);
+    prj.add_test(
+        "FuzzLogs.t.sol",
+        r#"
+interface Vm {
+    function sleep(uint256 duration) external;
+}
+
+contract FuzzLogsTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    event log_named_uint(string key, uint256 value);
+
+    function testFuzzLogs(uint256 value) public {
+        if (value == 154) {
+            emit log_named_uint("FAILING CASE", value);
+            vm.sleep(100);
+            revert("target value");
+        }
+        emit log_named_uint("SUCCESSFUL CASE", value);
+    }
+}
+"#,
+    );
+
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzzLogs",
+            "--fuzz-seed",
+            "1",
+            "--threads",
+            "2",
+            "-vv",
+        ])
+        .assert_failure()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/FuzzLogs.t.sol:FuzzLogsTest
+[FAIL: target value; counterexample: calldata=[..] args=[154]] testFuzzLogs(uint256) (runs: [..], [AVG_GAS])
+Logs:
+  FAILING CASE: 154
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/FuzzLogs.t.sol:FuzzLogsTest
+[FAIL: target value; counterexample: calldata=[..] args=[154]] testFuzzLogs(uint256) (runs: [..], [AVG_GAS])
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
+
+[SEED] (use `--fuzz-seed` to reproduce)
+
+"#]]);
+});
+
 // tests that `forge test` with inline config `show_logs = false` for fuzz tests will
 // still display `console.log` from the last run at verbosity >= 2 (issue #11039)
 forgetest_init!(should_not_show_logs_when_fuzz_test_inline_config, |prj, cmd| {
@@ -2545,6 +3396,11 @@ contract Counter {
         }
         number = newNumber;
     }
+    function revertWithData(bytes memory data) public pure {
+        assembly ("memory-safe") {
+            revert(add(data, 0x20), mload(data))
+        }
+    }
 }
 contract CounterTest is Test {
     Counter public counter;
@@ -2560,6 +3416,35 @@ contract CounterTest is Test {
         vm.expectRevert(abi.encodePacked(Counter.NumberNotEven.selector, uint(2)));
         counter.setNumber(1);
     }
+    function test_raw_message_matches_error_with_trailing_data() public {
+        vm.expectRevert(bytes("reason"));
+        counter.revertWithData(
+            abi.encodePacked(abi.encodeWithSignature("Error(string)", "reason"), uint256(2))
+        );
+    }
+    function test_rejects_trailing_expected_error_data() public {
+        vm.expectRevert(
+            abi.encodePacked(abi.encodeWithSignature("Error(string)", "reason"), uint256(2))
+        );
+        counter.revertWithData(abi.encodeWithSignature("Error(string)", "reason"));
+    }
+    // https://github.com/foundry-rs/foundry/issues/16424
+    function test_rejects_trailing_expected_custom_error_data() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(Counter.NumberNotEven.selector, uint256(1), uint256(2))
+        );
+        counter.setNumber(1);
+    }
+    function test_rejects_bare_string_actual() public {
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "reason"));
+        counter.revertWithData(bytes("reason"));
+    }
+    function test_rejects_padded_custom_error_data() public {
+        vm.expectRevert(abi.encodeWithSelector(Counter.NumberNotEven.selector, uint256(1)));
+        counter.revertWithData(
+            abi.encodePacked(abi.encodeWithSelector(Counter.NumberNotEven.selector, uint256(1)), bytes28(0))
+        );
+    }
 }
    "#,
     );
@@ -2568,6 +3453,11 @@ contract CounterTest is Test {
 ...
 [FAIL: Error != expected error: NumberNotEven(1) != RandomError()] test_decode() ([GAS])
 [FAIL: Error != expected error: NumberNotEven(1) != NumberNotEven(2)] test_decode_with_args() ([GAS])
+[PASS] test_raw_message_matches_error_with_trailing_data() ([GAS])
+[FAIL: Error != expected error: reason (raw 0x726561736f6e) != reason (raw 0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000006726561736f6e0000000000000000000000000000000000000000000000000000)] test_rejects_bare_string_actual() ([GAS])
+[FAIL: Error != expected error: NumberNotEven(1) (raw 0xeb598fa3000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000) != NumberNotEven(1) (raw 0xeb598fa30000000000000000000000000000000000000000000000000000000000000001)] test_rejects_padded_custom_error_data() ([GAS])
+[FAIL: Error != expected error: NumberNotEven(1) (raw 0xeb598fa30000000000000000000000000000000000000000000000000000000000000001) != NumberNotEven(1) (raw 0xeb598fa300000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002)] test_rejects_trailing_expected_custom_error_data() ([GAS])
+[FAIL: Error != expected error: reason (raw 0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000006726561736f6e0000000000000000000000000000000000000000000000000000) != reason (raw 0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000006726561736f6e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002)] test_rejects_trailing_expected_error_data() ([GAS])
 ...
 "#]]);
 });
@@ -2799,6 +3689,178 @@ Ran 1 test suite [ELAPSED]: 0 tests passed, 0 failed, 1 skipped (1 total tests)
 "#]]);
 });
 
+// <https://github.com/foundry-rs/foundry/issues/16197>
+forgetest_init!(skip_setup_after_caught_revert, |prj, cmd| {
+    prj.add_test(
+        "SkipAfterCaughtRevert.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract Reverter {
+    fallback() external {
+        revert("caught");
+    }
+}
+
+contract SkipAfterCaughtRevert is Test {
+    function setUp() public {
+        (bool success,) = address(new Reverter()).call("");
+        require(!success);
+        vm.skip(true, "skip after caught revert");
+    }
+
+    function test_neverRuns() public pure {}
+}
+    "#,
+    );
+
+    cmd.args(["test", "--isolate", "--mc", "SkipAfterCaughtRevert"]).assert_success().stdout_eq(
+        str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/SkipAfterCaughtRevert.t.sol:SkipAfterCaughtRevert
+[SKIP: skipped: skip after caught revert] setUp() ([GAS])
+Suite result: ok. 0 passed; 0 failed; 1 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 0 failed, 1 skipped (1 total tests)
+
+"#]],
+    );
+});
+
+forgetest_init!(forged_skip_payload_fails_setup, |prj, cmd| {
+    prj.add_test(
+        "ForgedSkip.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract ForgedSkip is Test {
+    uint256 internal marker;
+
+    function setUp() public {
+        marker = 1;
+        bytes memory reason = bytes("FOUNDRY::SKIPnot a real skip");
+        assembly {
+            revert(add(reason, 32), mload(reason))
+        }
+    }
+
+    function test_neverRuns() public pure {}
+}
+    "#,
+    );
+
+    cmd.args(["test", "--mc", "ForgedSkip"]).assert_failure().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/ForgedSkip.t.sol:ForgedSkip
+[FAIL: FOUNDRY::SKIPnot a real skip] setUp() ([GAS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ForgedSkip.t.sol:ForgedSkip
+[FAIL: FOUNDRY::SKIPnot a real skip] setUp() ([GAS])
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
+
+"#]]);
+});
+
+forgetest_init!(forged_skip_after_caught_skip_fails_setup, |prj, cmd| {
+    prj.add_test(
+        "ForgedSkipAfterCaughtSkip.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract ForgedSkipAfterCaughtSkip is Test {
+    function setUp() public {
+        // Catch a genuine skip so a payload is recorded, then revert with different skip bytes.
+        (bool success,) = address(vm).call(
+            abi.encodeWithSignature("skip(bool,string)", true, "genuine")
+        );
+        require(!success);
+
+        bytes memory reason = bytes("FOUNDRY::SKIPforged");
+        assembly {
+            revert(add(reason, 32), mload(reason))
+        }
+    }
+
+    function test_neverRuns() public pure {}
+}
+    "#,
+    );
+
+    cmd.args(["test", "--mc", "ForgedSkipAfterCaughtSkip"]).assert_failure().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/ForgedSkipAfterCaughtSkip.t.sol:ForgedSkipAfterCaughtSkip
+[FAIL: FOUNDRY::SKIPforged] setUp() ([GAS])
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ForgedSkipAfterCaughtSkip.t.sol:ForgedSkipAfterCaughtSkip
+[FAIL: FOUNDRY::SKIPforged] setUp() ([GAS])
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
+
+"#]]);
+});
+
+// A caught genuine skip that is re-raised byte-identically still counts as a skip: the payload
+// provenance is byte equality with what the skip cheatcode minted, not the revert call chain.
+forgetest_init!(caught_skip_reraised_identical_is_skipped, |prj, cmd| {
+    prj.add_test(
+        "ReraisedSkip.t.sol",
+        r#"
+import "forge-std/Test.sol";
+
+contract ReraisedSkip is Test {
+    function setUp() public {
+        (bool success, bytes memory data) = address(vm).call(
+            abi.encodeWithSignature("skip(bool,string)", true, "reraised")
+        );
+        require(!success);
+        assembly {
+            revert(add(data, 32), mload(data))
+        }
+    }
+
+    function test_neverRuns() public pure {}
+}
+    "#,
+    );
+
+    cmd.args(["test", "--mc", "ReraisedSkip"]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/ReraisedSkip.t.sol:ReraisedSkip
+[SKIP: skipped: reraised] setUp() ([GAS])
+Suite result: ok. 0 passed; 0 failed; 1 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 0 tests passed, 0 failed, 1 skipped (1 total tests)
+
+"#]]);
+});
+
 forgetest_init!(should_generate_junit_xml_report, |prj, cmd| {
     prj.insert_ds_test();
     prj.insert_vm();
@@ -2842,8 +3904,8 @@ forgetest_init!(should_generate_junit_xml_report, |prj, cmd| {
 
     cmd.args(["test", "--junit"]).assert_failure().stdout_eq(str![[r#"
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="Test run" tests="6" failures="2" errors="0" timestamp="[..]" time="[..]">
-    <testsuite name="src/JunitReportTest.t.sol:AJunitReportTest" tests="2" disabled="0" errors="0" failures="2" time="[..]">
+<testsuites name="Test run" tests="6" skipped="2" failures="2" errors="0" timestamp="[..]" time="[..]">
+    <testsuite name="src/JunitReportTest.t.sol:AJunitReportTest" tests="2" skipped="0" errors="0" failures="2" time="[..]">
         <testcase name="test_junit_assert_fail()" time="[..]">
             <failure message="panic: assertion failed (0x01)"/>
             <system-out>[FAIL: panic: assertion failed (0x01)] test_junit_assert_fail() ([GAS])</system-out>
@@ -2854,7 +3916,7 @@ forgetest_init!(should_generate_junit_xml_report, |prj, cmd| {
         </testcase>
         <system-out>Suite result: FAILED. 0 passed; 2 failed; 0 skipped; [ELAPSED]</system-out>
     </testsuite>
-    <testsuite name="src/JunitReportTest.t.sol:BJunitReportTest" tests="4" disabled="2" errors="0" failures="0" time="[..]">
+    <testsuite name="src/JunitReportTest.t.sol:BJunitReportTest" tests="4" skipped="2" errors="0" failures="0" time="[..]">
         <testcase name="test_junit_pass()" time="[..]">
             <system-out>[PASS] test_junit_pass() ([GAS])</system-out>
         </testcase>
@@ -2895,8 +3957,8 @@ contract JunitReportTest is Test {
 
     cmd.args(["test", "--junit", "-vvvv"]).assert_success().stdout_eq(str![[r#"
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="Test run" tests="1" failures="0" errors="0" timestamp="[..]" time="[..]">
-    <testsuite name="src/JunitReportTest.t.sol:JunitReportTest" tests="1" disabled="0" errors="0" failures="0" time="[..]">
+<testsuites name="Test run" tests="1" skipped="0" failures="0" errors="0" timestamp="[..]" time="[..]">
+    <testsuite name="src/JunitReportTest.t.sol:JunitReportTest" tests="1" skipped="0" errors="0" failures="0" time="[..]">
         <testcase name="test_junit_with_logs()" time="[..]">
             <system-out>[PASS] test_junit_with_logs() ([GAS])/nLogs:/n  Step1/n  Step2/n  Step3/n</system-out>
         </testcase>
@@ -3997,7 +5059,7 @@ contract ForkTest is Test {
     cmd.args(["test", "--mt", "test_fork_err_message"]).assert_failure().stdout_eq(str![[r#"
 ...
 Ran 1 test for test/ForkTest.t.sol:ForkTest
-[FAIL: vm.createSelectFork: could not instantiate forked environment with provider eth-mainnet.g.alchemy.com; HTTP error 401 with body: [..]
+[FAIL: vm.createSelectFork: could not instantiate forked environment with provider eth-mainnet.g.alchemy.com; [..]
 
 ...
 
@@ -4770,6 +5832,7 @@ contract Counter {
 }
    ",
     );
+    prj.add_source("Broken.sol", "contract Broken { function broken() public { missing(); } }");
 
     let artifact = prj.paths().artifacts.join("Counter.sol/Counter.json");
     let output = cmd.args(["selectors", "list", "Counter"]).assert_success();
@@ -5737,22 +6800,27 @@ contract CounterTest is Test {
         .replace("<url>", &endpoint),
     );
 
-    cmd.args(["test", "--fork-url", &endpoint]).assert_failure().stdout_eq(str![[r#"
+    for dynamic_test_linking in [false, true] {
+        prj.update_config(|config| config.dynamic_test_linking = dynamic_test_linking);
+        cmd.forge_fuse()
+            .args(["test", "--force", "--fork-url", &endpoint])
+            .assert_failure()
+            .stdout_eq(str![[r#"
 [COMPILING_FILES] with [SOLC_VERSION]
 [SOLC_VERSION] [ELAPSED]
 Compiler run successful!
 
 Ran 2 tests for test/Counter.t.sol:CounterTest
-[FAIL: EvmError: Revert] test_roll_fork() ([GAS])
-[FAIL: Contract 0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f does not exist and is not marked as persistent, see `vm.makePersistent()`] test_select_fork() ([GAS])
+[FAIL: EvmError: Revert] test_roll_fork() (block: [..]) ([GAS])
+[FAIL: EvmError: Revert] test_select_fork() (block: [..]) ([GAS])
 Suite result: FAILED. 0 passed; 2 failed; 0 skipped; [ELAPSED]
 
 Ran 1 test suite [ELAPSED]: 0 tests passed, 2 failed, 0 skipped (2 total tests)
 
 Failing tests:
 Encountered 2 failing tests in test/Counter.t.sol:CounterTest
-[FAIL: EvmError: Revert] test_roll_fork() ([GAS])
-[FAIL: Contract 0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f does not exist and is not marked as persistent, see `vm.makePersistent()`] test_select_fork() ([GAS])
+[FAIL: EvmError: Revert] test_roll_fork() (block: [..]) ([GAS])
+[FAIL: EvmError: Revert] test_select_fork() (block: [..]) ([GAS])
 
 Encountered a total of 2 failing tests, 0 tests succeeded
 
@@ -5760,6 +6828,7 @@ Tip: Run `forge test --rerun` to retry only the 2 failed tests
 Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing test in the debugger
 
 "#]]);
+    }
 });
 
 // <https://github.com/foundry-rs/foundry/issues/11632>
@@ -5851,7 +6920,7 @@ Tip: Run `forge test --debug --match-test <TEST_NAME>` to inspect one failing te
 "#]]);
 });
 
-forgetest_init!(zero_runs, |prj, cmd| {
+forgetest_init!(zero_invariant_runs, |prj, cmd| {
     prj.wipe_contracts();
     prj.add_test(
         "ZeroRuns.t.sol",
@@ -5867,11 +6936,6 @@ contract Handler is Test {
 contract ZeroRuns is Test {
     Handler handler = new Handler();
 
-    /// forge-config: default.fuzz.runs = 0
-    function test_fuzzZeroRuns(uint256 x) public {
-        revert("unreachable");
-    }
-
     /// forge-config: default.invariant.runs = 0
     function invariant_zeroRuns() public {}
 
@@ -5883,13 +6947,126 @@ contract ZeroRuns is Test {
 
     cmd.args(["test"]).assert_success().stdout_eq(str![[r#"
 ...
-Ran 3 tests for test/ZeroRuns.t.sol:ZeroRuns
+Ran 2 tests for test/ZeroRuns.t.sol:ZeroRuns
 [PASS] invariant_zeroDepth() (runs: 256, calls: 0, reverts: 0)
 [PASS] invariant_zeroRuns() (runs: 0, calls: 0, reverts: 0)
-[PASS] test_fuzzZeroRuns(uint256) (runs: 0, [AVG_GAS])
-Suite result: ok. 3 passed; 0 failed; 0 skipped; [ELAPSED]
+Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
 
-Ran 1 test suite [ELAPSED]: 3 tests passed, 0 failed, 0 skipped (3 total tests)
+Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
 
 "#]]);
+});
+
+// <https://github.com/foundry-rs/foundry/issues/9886>
+forgetest_async!(fork_eth_get_proof, |prj, cmd| {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let target = Address::repeat_byte(0x42);
+    let slot = B256::with_last_byte(1);
+
+    api.anvil_set_code(target, Bytes::from_static(&[0x00])).await.unwrap();
+    api.anvil_set_balance(target, U256::from(1337)).await.unwrap();
+    api.anvil_set_storage_at(target, slot.into(), B256::with_last_byte(0xaa)).await.unwrap();
+    api.anvil_mine(Some(U256::ONE), None).await.unwrap();
+
+    let provider = handle.http_provider();
+    let historical_block = provider.get_block_number().await.unwrap();
+    let historical_state_root =
+        provider.get_block(historical_block.into()).await.unwrap().unwrap().header.state_root;
+
+    api.anvil_mine(Some(U256::ONE), None).await.unwrap();
+    api.anvil_set_balance(target, U256::from(7331)).await.unwrap();
+    api.anvil_set_storage_at(target, slot.into(), B256::with_last_byte(0xbb)).await.unwrap();
+    api.anvil_mine(Some(U256::ONE), None).await.unwrap();
+    let fork_block = provider.get_block_number().await.unwrap();
+
+    let (_, fork_handle) = spawn(
+        NodeConfig::test()
+            .with_eth_rpc_url(Some(handle.http_endpoint()))
+            .with_fork_block_number(Some(fork_block)),
+    )
+    .await;
+    let endpoint = rpc::spawn_rpc_proxy_requiring_header(
+        fork_handle.http_endpoint(),
+        "authorization",
+        "Bearer secret",
+    )
+    .await;
+    std::fs::write(
+        prj.config(),
+        format!(
+            r#"[rpc_endpoints]
+authenticated = {{ endpoint = "{endpoint}", auth = "Bearer secret" }}
+"#
+        ),
+    )
+    .unwrap();
+
+    prj.add_test(
+        "EthGetProofFork.t.sol",
+        &format!(
+            r#"
+interface Vm {{
+    struct EthStorageProof {{ bytes32 key; uint256 value; bytes[] proof; }}
+    struct EthGetProof {{ address account; uint256 balance; bytes32 codeHash; uint64 nonce; bytes32 storageHash; bytes[] accountProof; EthStorageProof[] storageProof; }}
+    function createSelectFork(string calldata urlOrAlias) external returns (uint256 forkId);
+    function deal(address account, uint256 newBalance) external;
+    function eth_getProof(address target, bytes32[] calldata slots, uint256 blockNumber) external view returns (EthGetProof memory proof);
+    function store(address target, bytes32 slot, bytes32 value) external;
+}}
+
+contract EthGetProofForkTest {{
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function testForkEthGetProof() public {{
+        vm.createSelectFork("authenticated");
+        address target = {target};
+        bytes32[] memory slots = new bytes32[](2);
+        slots[0] = {slot};
+        slots[1] = bytes32(uint256(2));
+        vm.deal(target, 9999);
+        vm.store(target, slots[0], bytes32(uint256(0xcc)));
+
+        Vm.EthGetProof memory proof = vm.eth_getProof(target, slots, {historical_block});
+
+        require(proof.account == target, "account");
+        require(proof.balance == 1337, "balance");
+        require(proof.codeHash == target.codehash, "code hash");
+        require(proof.nonce == 0, "nonce");
+        require(keccak256(proof.accountProof[0]) == {historical_state_root}, "account proof root");
+
+        require(proof.storageProof.length == 2, "storage proof length");
+        require(proof.storageProof[0].key == slots[0], "first key");
+        require(proof.storageProof[0].value == 0xaa, "first value");
+        require(keccak256(proof.storageProof[0].proof[0]) == proof.storageHash, "storage proof root");
+        require(proof.storageProof[1].key == slots[1], "second key");
+        require(proof.storageProof[1].value == 0, "second value");
+
+        proof = vm.eth_getProof(target, slots, {fork_block});
+        require(proof.balance == 7331, "current balance");
+        require(proof.storageProof[0].value == 0xbb, "current storage");
+    }}
+
+    function testForkEthGetProofUnknownBlock() public {{
+        vm.createSelectFork("authenticated");
+        try vm.eth_getProof({target}, new bytes32[](0), {fork_block} + 100) {{
+            revert("expected an unknown block to fail");
+        }} catch {{}}
+    }}
+}}
+"#
+        ),
+    );
+
+    cmd.args(["test", "--match-test", "testForkEthGetProof"]).assert_success().stdout_eq(str![[
+        r#"
+...
+Ran 2 tests for test/EthGetProofFork.t.sol:EthGetProofForkTest
+[PASS] testForkEthGetProof() ([GAS])
+[PASS] testForkEthGetProofUnknownBlock() ([GAS])
+Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
+
+"#
+    ]]);
 });

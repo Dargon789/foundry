@@ -1,5 +1,7 @@
 use eyre::{Context, Result};
-use foundry_common::{compact_to_contract, strip_bytecode_placeholders};
+use foundry_common::{
+    compact_to_contract, external_compiler::is_external_artifact, strip_bytecode_placeholders,
+};
 use foundry_compilers::{
     Artifact, ProjectCompileOutput,
     artifacts::{
@@ -162,7 +164,7 @@ fn collect_contract_debug_scopes(
             contract_name: contract.name.to_string(),
             function_name,
             range: function_range.clone(),
-            body_range: body_range.clone(),
+            body_range,
             parameters_src,
             returns_src,
             parameters: variables_from_list(
@@ -395,6 +397,7 @@ impl ContractSources {
 
         let artifacts: Vec<_> = output
             .artifact_ids()
+            .filter(|(id, _)| !is_external_artifact(&id.build_id))
             .collect::<Vec<_>>()
             .par_iter()
             .map(|(id, artifact)| {
@@ -442,7 +445,7 @@ impl ContractSources {
                         let stripped = path.strip_prefix(root).unwrap_or(path).to_path_buf();
                         let source_data = Arc::new(SourceData::new(
                             output,
-                            source.content.clone(),
+                            source.content,
                             build.language,
                             stripped,
                             root,

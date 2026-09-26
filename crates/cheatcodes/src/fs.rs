@@ -13,7 +13,7 @@ use dialoguer::{Input, Password};
 use forge_script_sequence::{BroadcastReader, TransactionWithMetadata};
 use foundry_common::{contracts::ContractData, fs};
 use foundry_config::fs_permissions::FsAccessKind;
-use foundry_evm_core::evm::FoundryEvmNetwork;
+use foundry_evm_core::{FoundryTransaction, env::FoundryContextExt, evm::FoundryEvmNetwork};
 use revm::{
     context::{Cfg, ContextTr, CreateScheme, JournalTr},
     interpreter::CreateInputs,
@@ -52,7 +52,16 @@ struct ParsedArtifactPath<'a> {
 /// - `ContractName:0.8.23`
 /// - `ContractName:profile`
 fn parse_artifact_path(path: &str) -> std::result::Result<ParsedArtifactPath<'_>, String> {
-    let mut parts = path.split(':');
+    // A Windows drive separator belongs to the file, not the artifact's suffix fields.
+    // Recognize it on every host so parsing does not depend on the current platform.
+    let unprefixed = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let drive_prefix_len = match unprefixed.as_bytes() {
+        [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic() => {
+            path.len() - unprefixed.len() + 2
+        }
+        _ => 0,
+    };
+    let mut parts = path[drive_prefix_len..].split(':');
 
     let mut file = None;
     let mut contract_name = None;
@@ -60,6 +69,7 @@ fn parse_artifact_path(path: &str) -> std::result::Result<ParsedArtifactPath<'_>
     let mut profile = None;
 
     let path_or_name = parts.next().unwrap();
+    let path_or_name = &path[..drive_prefix_len + path_or_name.len()];
     if path_or_name.contains('.') {
         file = Some(PathBuf::from(path_or_name));
         if let Some(name_or_version_or_profile) = parts.next() {
@@ -288,6 +298,7 @@ impl Cheatcode for removeDirCall {
     fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { path, recursive } = self;
         let path = state.config.ensure_path_allowed(path, FsAccessKind::Write)?;
+        state.config.ensure_not_foundry_toml(&path)?;
         if *recursive { fs::remove_dir_all(path) } else { fs::remove_dir(path) }?;
         Ok(Default::default())
     }
@@ -499,6 +510,11 @@ fn deploy_code<FEN: FoundryEvmNetwork>(
     value: Option<U256>,
     salt: Option<U256>,
 ) -> Result {
+    // Synthetic creation bypasses the CREATE opcode's static-context check.
+    if ccx.is_static {
+        return Err(crate::Error::from(Bytes::new()));
+    }
+
     let mut bytecode = get_artifact_code(ccx.state, path, false)?.to_vec();
 
     // If active broadcast then set flag to deploy from code.
@@ -513,9 +529,31 @@ fn deploy_code<FEN: FoundryEvmNetwork>(
     let scheme =
         if let Some(salt) = salt { CreateScheme::Create2 { salt } } else { CreateScheme::Create };
 
-    // If prank active at current depth, then use it as caller for create input.
-    let caller =
-        ccx.state.get_prank(ccx.ecx.journal().depth()).map_or(ccx.caller, |prank| prank.new_caller);
+    // The nested EVM executes the synthetic create one level deeper, so apply the prank at the
+    // original depth just as the native create inspector would.
+    let depth = ccx.ecx.journal().depth();
+    let mut caller = ccx.caller;
+    if let Some(prank) = ccx.state.get_prank(depth).copied()
+        && depth >= prank.depth
+        && caller == prank.prank_caller
+    {
+        let prank_applied = if depth == prank.depth {
+            caller = prank.new_caller;
+            true
+        } else {
+            false
+        };
+        let prank_applied = if let Some(new_origin) = prank.new_origin {
+            ccx.ecx.tx_mut().set_caller(new_origin);
+            true
+        } else {
+            prank_applied
+        };
+
+        if prank_applied && let Some(applied_prank) = prank.first_time_applied() {
+            ccx.state.pranks.insert(depth, applied_prank);
+        }
+    }
 
     let outcome = exec_create(
         executor,
@@ -528,7 +566,19 @@ fn deploy_code<FEN: FoundryEvmNetwork>(
             0,
         ),
         ccx,
-    )?;
+    );
+
+    // Restore the prank state at the original depth as native create cleanup would.
+    if let Some(prank) = ccx.state.get_prank(depth).copied()
+        && depth == prank.depth
+    {
+        ccx.ecx.tx_mut().set_caller(prank.prank_origin);
+        if prank.single_call {
+            ccx.state.pranks.remove(&depth);
+        }
+    }
+
+    let outcome = outcome?;
 
     if !outcome.result.result.is_ok() {
         return Err(crate::Error::from(outcome.result.output));
@@ -569,18 +619,62 @@ fn get_artifact_source<'a, FEN: FoundryEvmNetwork>(
         return Ok(ArtifactSource::Disk(path));
     }
 
-    let parsed =
-        parse_artifact_path(path).map_err(|e| fmt_err!("failed to parse artifact path: {e}"))?;
-    let ParsedArtifactPath { file, contract_name, version, profile } = parsed;
+    let artifacts =
+        state.config.available_artifacts.as_ref().or(state.config.artifact_lookup.as_ref());
+    let resolve_source = |file: PathBuf| {
+        let cwd = state
+            .config
+            .running_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.source.parent())
+            .unwrap_or(&state.config.paths.root);
+        let relative_cwd = cwd.strip_prefix(&state.config.paths.root).unwrap_or(cwd);
+        let has_matching_remapping = state.config.paths.remappings.iter().any(|remapping| {
+            remapping.context.as_ref().is_none_or(|context| relative_cwd.starts_with(context))
+                && file.strip_prefix(&remapping.name).is_ok()
+        });
 
-    // Use available artifacts list if present
-    if let Some(artifacts) = &state.config.available_artifacts {
+        if has_matching_remapping {
+            state.config.paths.resolve_library_import(cwd, &file).map_or(file, |resolved| {
+                resolved.strip_prefix(&state.config.paths.root).unwrap_or(&resolved).to_path_buf()
+            })
+        } else {
+            file
+        }
+    };
+    let exact_identifier = path
+        .rsplit_once(':')
+        .map(|(source, contract)| (resolve_source(PathBuf::from(source)), contract))
+        .filter(|(source, contract)| {
+            artifacts.into_iter().flat_map(|artifacts| artifacts.iter()).any(|(id, _)| {
+                id.source == *source
+                    && id.name.split('.').next().is_some_and(|name| name == *contract)
+            })
+        });
+
+    let parsed = match parse_artifact_path(path) {
+        Ok(parsed) => parsed,
+        Err(_) if exact_identifier.is_some() => {
+            ParsedArtifactPath { file: None, contract_name: None, version: None, profile: None }
+        }
+        Err(error) => return Err(fmt_err!("failed to parse artifact path: {error}")),
+    };
+    let ParsedArtifactPath { file, contract_name, version, profile } = parsed;
+    let file = file.map(resolve_source);
+
+    // Use the artifact lookup if present.
+    if let Some(artifacts) = artifacts {
         let ambiguous_file_profile =
             file.is_some() && version.is_none() && profile.is_none() && contract_name.is_some();
         let filter_artifacts = |treat_ambiguous_as_profile: bool| -> Vec<_> {
             artifacts
                 .iter()
                 .filter(|(id, _)| {
+                    if let Some((source, contract)) = &exact_identifier {
+                        return id.source == *source
+                            && id.name.split('.').next().is_some_and(|name| name == *contract);
+                    }
+
                     // name might be in the form of "Counter.0.8.23"
                     let id_name = id.name.split('.').next().unwrap();
 
@@ -632,7 +726,7 @@ fn get_artifact_source<'a, FEN: FoundryEvmNetwork>(
                         .as_ref()
                         .and_then(|running| {
                             // Only filter by running version if user did NOT specify a version
-                            if version.is_none() {
+                            if exact_identifier.is_some() || version.is_none() {
                                 filtered.retain(|(id, _)| id.version == running.version);
 
                                 // Return artifact if only one matched
@@ -642,7 +736,7 @@ fn get_artifact_source<'a, FEN: FoundryEvmNetwork>(
                             }
 
                             // Only filter by running profile if user did NOT specify a profile
-                            if profile.is_none() {
+                            if exact_identifier.is_some() || profile.is_none() {
                                 filtered.retain(|(id, _)| id.profile == running.profile);
 
                                 return (filtered.len() == 1).then(|| filtered[0]);
@@ -721,28 +815,32 @@ fn get_artifact_code<FEN: FoundryEvmNetwork>(
 impl Cheatcode for ffiCall {
     fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
         let Self { commandInput: input } = self;
+        let stdout = ffi_stdout(state, input)?;
+        Ok(decode_ffi_stdout(&stdout).abi_encode())
+    }
+}
 
-        let output = ffi(state, input)?;
+impl Cheatcode for ffiUintCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let Self { commandInput: input } = self;
+        parse(&ffi_stdout(state, input)?, &DynSolType::Uint(256))
+    }
+}
 
-        // Check the exit code of the command.
-        if output.exitCode != 0 {
-            // If the command failed, return an error with the exit code and stderr.
-            return Err(fmt_err!(
-                "ffi command {:?} exited with code {}. stderr: {}",
-                input,
-                output.exitCode,
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
+impl Cheatcode for ffiStringCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let Self { commandInput: input } = self;
+        Ok(ffi_stdout(state, input)?.abi_encode())
+    }
+}
 
-        // If the command succeeded but still wrote to stderr, log it as a warning.
-        if !output.stderr.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(target: "cheatcodes", ?input, ?stderr, "ffi command wrote to stderr");
-        }
-
-        // We already hex-decoded the stdout in the `ffi` helper function.
-        Ok(output.stdout.abi_encode())
+impl Cheatcode for ffiBytesCall {
+    fn apply<FEN: FoundryEvmNetwork>(&self, state: &mut Cheatcodes<FEN>) -> Result {
+        let Self { commandInput: input } = self;
+        let stdout = ffi_stdout(state, input)?;
+        Ok(hex::decode(&stdout)
+            .map_err(|err| fmt_err!("failed parsing ffi stdout as bytes: {err}"))?
+            .abi_encode())
     }
 }
 
@@ -840,6 +938,43 @@ fn read_dir<FEN: FoundryEvmNetwork>(
 }
 
 fn ffi<FEN: FoundryEvmNetwork>(state: &Cheatcodes<FEN>, input: &[String]) -> Result<FfiResult> {
+    let output = ffi_command(state, input)?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = stdout.trim();
+    Ok(FfiResult {
+        exitCode: output.status.code().unwrap_or(69),
+        stdout: decode_ffi_stdout(stdout),
+        stderr: output.stderr.into(),
+    })
+}
+
+fn ffi_stdout<FEN: FoundryEvmNetwork>(state: &Cheatcodes<FEN>, input: &[String]) -> Result<String> {
+    let output = ffi_command(state, input)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    if !output.status.success() {
+        return Err(fmt_err!(
+            "ffi command {:?} exited with code {}. stderr: {}",
+            input,
+            output.status.code().unwrap_or(69),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if !output.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(target: "cheatcodes", ?input, ?stderr, "ffi command wrote to stderr");
+    }
+    Ok(stdout.trim().to_string())
+}
+
+fn decode_ffi_stdout(stdout: &str) -> Bytes {
+    hex::decode(stdout).unwrap_or_else(|_| stdout.as_bytes().to_vec()).into()
+}
+
+fn ffi_command<FEN: FoundryEvmNetwork>(
+    state: &Cheatcodes<FEN>,
+    input: &[String],
+) -> Result<std::process::Output> {
     ensure!(
         state.config.ffi,
         "FFI is disabled; add the `--ffi` flag to allow tests to call external commands"
@@ -850,25 +985,9 @@ fn ffi<FEN: FoundryEvmNetwork>(state: &Cheatcodes<FEN>, input: &[String]) -> Res
 
     debug!(target: "cheatcodes", ?cmd, "invoking ffi");
 
-    let output = cmd
-        .current_dir(&state.config.root)
+    cmd.current_dir(&state.config.root)
         .output()
-        .map_err(|err| fmt_err!("failed to execute command {cmd:?}: {err}"))?;
-
-    // The stdout might be encoded on valid hex, or it might just be a string,
-    // so we need to determine which it is to avoid improperly encoding later.
-    let trimmed_stdout = String::from_utf8(output.stdout)?;
-    let trimmed_stdout = trimmed_stdout.trim();
-    let encoded_stdout = if let Ok(hex) = hex::decode(trimmed_stdout) {
-        hex
-    } else {
-        trimmed_stdout.as_bytes().to_vec()
-    };
-    Ok(FfiResult {
-        exitCode: output.status.code().unwrap_or(69),
-        stdout: encoded_stdout.into(),
-        stderr: output.stderr.into(),
-    })
+        .map_err(|err| fmt_err!("failed to execute command {cmd:?}: {err}"))
 }
 
 fn prompt_input(prompt_text: &str) -> Result<String, dialoguer::Error> {
@@ -1080,10 +1199,13 @@ mod tests {
     use foundry_common::ContractsByArtifact;
     use foundry_compilers::{
         ArtifactId,
-        artifacts::{BytecodeObject, CompactBytecode, CompactContractBytecode},
+        artifacts::{
+            BytecodeObject, CompactBytecode, CompactContractBytecode, remappings::Remapping,
+        },
     };
     use foundry_evm_core::evm::TempoEvmNetwork;
-    use std::{env, fs as stdfs, sync::Arc};
+    use std::{env, fs as stdfs, str::FromStr, sync::Arc};
+    use tempfile::TempDir;
 
     fn cheats() -> Cheatcodes {
         let config = CheatsConfig {
@@ -1165,6 +1287,40 @@ mod tests {
         assert_eq!(parsed.contract_name, None);
         assert_eq!(parsed.version, None);
         assert_eq!(parsed.profile, None);
+    }
+
+    #[test]
+    fn test_parse_artifact_path_windows_drive() {
+        for file in [
+            "C:/project/src/Contract.sol",
+            r"C:\project\src\Contract.sol",
+            r"\\?\C:\project\src\Contract.sol",
+            r"\\server\share\Contract.sol",
+        ] {
+            for (suffix, contract_name, version, profile) in [
+                ("", None, None, None),
+                (":MyContract", Some("MyContract"), None, None),
+                (":0.8.23", None, Some(Version::new(0, 8, 23)), None),
+                (":MyContract:0.8.23", Some("MyContract"), Some(Version::new(0, 8, 23)), None),
+                (":MyContract:optimized", Some("MyContract"), None, Some("optimized")),
+            ] {
+                let input = format!("{file}{suffix}");
+                assert_eq!(
+                    parse_artifact_path(&input).unwrap(),
+                    ParsedArtifactPath {
+                        file: Some(PathBuf::from(file)),
+                        contract_name,
+                        version,
+                        profile,
+                    },
+                    "{input}"
+                );
+            }
+        }
+
+        // A one-letter contract name must still allow version and profile suffixes.
+        assert_eq!(parse_artifact_path("C:0.8.23").unwrap().version, Some(Version::new(0, 8, 23)));
+        assert_eq!(parse_artifact_path("C:optimized").unwrap().profile, Some("optimized"));
     }
 
     #[test]
@@ -1265,6 +1421,45 @@ mod tests {
     }
 
     #[test]
+    fn test_get_artifact_code_exact_colon_path_uses_running_profile() {
+        let default_bytecode = Bytes::from_static(&[0x60, 0x01]);
+        let optimized_bytecode = Bytes::from_static(&[0x60, 0x02]);
+        let versioned_bytecode = Bytes::from_static(&[0x60, 0x03]);
+        let source = "src/Colon:Path.sol";
+        let default = test_artifact(source, "Target", "default", default_bytecode);
+        let optimized =
+            test_artifact(source, "Target.optimized", "optimized", optimized_bytecode.clone());
+        let mut versioned = test_artifact(
+            source,
+            "Target.0.8.29.optimized",
+            "optimized",
+            versioned_bytecode.clone(),
+        );
+        versioned.0.version = Version::new(0, 8, 29);
+        let artifacts = ContractsByArtifact::new([default, optimized, versioned]);
+        for (patch, expected) in [(30, optimized_bytecode), (29, versioned_bytecode)] {
+            let running_artifact = ArtifactId {
+                source: PathBuf::from("test/Runner.t.sol"),
+                name: "Runner".to_owned(),
+                path: PathBuf::from("test/Runner.t.sol/Runner.json"),
+                version: Version::new(0, 8, patch),
+                build_id: String::new(),
+                profile: "optimized".to_owned(),
+            };
+            let config = CheatsConfig {
+                available_artifacts: Some(artifacts.clone()),
+                running_artifact: Some(running_artifact),
+                root: PathBuf::from(&env!("CARGO_MANIFEST_DIR")),
+                ..Default::default()
+            };
+            let cheats: Cheatcodes = Cheatcodes::new(Arc::new(config));
+            let bytecode =
+                super::get_artifact_code(&cheats, "src/Colon:Path.sol:Target", false).unwrap();
+            assert_eq!(bytecode, expected);
+        }
+    }
+
+    #[test]
     fn test_get_artifact_code_prefers_contract_name_over_file_profile_ambiguity() {
         let profile_bytecode = Bytes::from_static(&[0x60, 0x02]);
         let contract_bytecode = Bytes::from_static(&[0x60, 0x03]);
@@ -1284,6 +1479,103 @@ mod tests {
             super::get_artifact_code(&cheats, "src/GetCodeProfile.t.sol:paris", false).unwrap();
 
         assert_eq!(bytecode, contract_bytecode);
+    }
+
+    #[test]
+    fn test_get_artifact_code_resolves_remapping() {
+        let bytecode = Bytes::from_static(&[0x60, 0x01]);
+        let artifacts = ContractsByArtifact::new([test_artifact(
+            "src/Something.sol",
+            "Something",
+            "default",
+            bytecode.clone(),
+        )]);
+        let root = PathBuf::from(&env!("CARGO_MANIFEST_DIR"));
+        let paths = foundry_compilers::ProjectPathsConfig::builder()
+            .remapping(Remapping::from_str("@example/=src/").unwrap())
+            .build_with_root(&root);
+        let config = CheatsConfig {
+            available_artifacts: Some(artifacts),
+            root,
+            paths,
+            ..Default::default()
+        };
+        let cheats: Cheatcodes = Cheatcodes::new(Arc::new(config));
+
+        let resolved =
+            super::get_artifact_code(&cheats, "@example/Something.sol:Something", false).unwrap();
+
+        assert_eq!(resolved, bytecode);
+    }
+
+    #[test]
+    fn test_get_artifact_code_remaps_exact_paths_before_profile_selection() {
+        for file in ["Target.sol", "Colon:Path.sol"] {
+            let source = format!("src/{file}");
+            let remapped = format!("lib/alternate/{file}");
+            let default_bytecode = Bytes::from_static(&[0x60, 0x02]);
+            let optimized_bytecode = Bytes::from_static(&[0x60, 0x03]);
+            let artifacts = ContractsByArtifact::new([
+                test_artifact(&source, "Target", "default", Bytes::from_static(&[0x60, 0x01])),
+                test_artifact(&remapped, "Target", "default", default_bytecode.clone()),
+                test_artifact(
+                    &remapped,
+                    "Target.optimized",
+                    "optimized",
+                    optimized_bytecode.clone(),
+                ),
+            ]);
+            for (profile, expected) in
+                [("default", default_bytecode), ("optimized", optimized_bytecode)]
+            {
+                let root = PathBuf::from(&env!("CARGO_MANIFEST_DIR"));
+                let paths = foundry_compilers::ProjectPathsConfig::builder()
+                    .remapping(Remapping::from_str("src/=lib/alternate/").unwrap())
+                    .build_with_root(&root);
+                let config = CheatsConfig {
+                    available_artifacts: Some(artifacts.clone()),
+                    running_artifact: Some(
+                        test_artifact("test/Runner.t.sol", "Runner", profile, Bytes::new()).0,
+                    ),
+                    root,
+                    paths,
+                    ..Default::default()
+                };
+                let cheats: Cheatcodes = Cheatcodes::new(Arc::new(config));
+                let resolved =
+                    super::get_artifact_code(&cheats, &format!("{source}:Target"), false).unwrap();
+                assert_eq!(resolved, expected, "{source} in {profile} profile");
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_artifact_code_preserves_project_path_on_library_collision() {
+        let root_bytecode = Bytes::from_static(&[0x60, 0x01]);
+        let library_bytecode = Bytes::from_static(&[0x60, 0x02]);
+        let artifacts = ContractsByArtifact::new([
+            test_artifact("src/Thing.sol", "RootThing", "default", root_bytecode.clone()),
+            test_artifact("lib/src/Thing.sol", "LibThing", "default", library_bytecode),
+        ]);
+        let temp = TempDir::new().unwrap();
+        let library = temp.path().join("lib");
+        stdfs::create_dir_all(library.join("src")).unwrap();
+        stdfs::write(library.join("src/Thing.sol"), "").unwrap();
+        let paths = foundry_compilers::ProjectPathsConfig::builder()
+            .remappings([])
+            .lib(library)
+            .build_with_root(temp.path());
+        let config = CheatsConfig {
+            available_artifacts: Some(artifacts),
+            root: temp.path().to_path_buf(),
+            paths,
+            ..Default::default()
+        };
+        let cheats: Cheatcodes = Cheatcodes::new(Arc::new(config));
+
+        let resolved = super::get_artifact_code(&cheats, "src/Thing.sol:RootThing", false).unwrap();
+
+        assert_eq!(resolved, root_bytecode);
     }
 
     #[test]

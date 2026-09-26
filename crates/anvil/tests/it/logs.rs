@@ -1,13 +1,14 @@
 //! log/event related tests
 
 use crate::{
-    abi::SimpleStorage::{self},
+    abi::SimpleStorage,
     utils::{http_provider_with_signer, ws_provider_with_signer},
 };
 use alloy_network::EthereumWallet;
-use alloy_primitives::{B256, map::B256HashSet};
+use alloy_primitives::{Address, B256, bytes, map::B256HashSet};
 use alloy_provider::Provider;
-use alloy_rpc_types::{BlockNumberOrTag, Filter, Log};
+use alloy_rpc_types::{BlockNumberOrTag, Filter, Log, TransactionRequest};
+use alloy_serde::WithOtherFields;
 use anvil::{NodeConfig, spawn};
 use anvil_core::types::ReorgOptions;
 use futures::StreamExt;
@@ -104,7 +105,7 @@ async fn get_all_events() {
     let tx = contract.setValue("hi".to_string()).from(account);
     for _ in 0..num_tx {
         let tx = tx.send().await.unwrap();
-        api.mine_one().await;
+        api.mine_one().await.unwrap();
         tx.get_receipt().await.unwrap();
     }
 
@@ -140,6 +141,49 @@ async fn get_all_events() {
         assert_eq!(receipt_log.transaction_hash, log.transaction_hash);
         assert_eq!(receipt_log.block_number, log.block_number);
         assert_eq!(receipt_log.log_index, log.log_index);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_block_receipts_assigns_log_indices() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let sender = handle.dev_wallets().next().unwrap().address();
+    let one_log = Address::random();
+    let two_logs = Address::random();
+    api.anvil_set_code(one_log, bytes!("60006000a000")).await.unwrap();
+    api.anvil_set_code(two_logs, bytes!("60006000a060006000a000")).await.unwrap();
+    api.anvil_set_auto_mine(false).await.unwrap();
+
+    let mut hashes = Vec::new();
+    for (nonce, target) in [one_log, Address::random(), two_logs].into_iter().enumerate() {
+        let transaction = TransactionRequest::default()
+            .from(sender)
+            .to(target)
+            .nonce(nonce as u64)
+            .gas_limit(30_000);
+        hashes.push(api.send_transaction(WithOtherFields::new(transaction)).await.unwrap());
+    }
+    api.mine_one().await.unwrap();
+
+    let receipts = api.block_receipts(BlockNumberOrTag::Latest.into()).await.unwrap().unwrap();
+    assert_eq!(receipts.len(), 3);
+    let log_indices = receipts
+        .iter()
+        .map(|receipt| {
+            receipt
+                .0
+                .inner
+                .inner
+                .logs()
+                .iter()
+                .map(|log| log.log_index.unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(log_indices, [vec![0], vec![], vec![1, 2]]);
+
+    for (hash, receipt) in hashes.into_iter().zip(&receipts) {
+        assert_eq!(api.transaction_receipt(hash).await.unwrap().as_ref(), Some(receipt));
     }
 }
 
@@ -267,5 +311,35 @@ async fn get_logs_unknown_block_hash_returns_error() {
     assert!(
         err.to_string().contains("unknown block"),
         "expected `unknown block` in error, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_future_to_block_returns_error() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let best = provider.get_block_number().await.unwrap();
+    let filter = Filter::new().from_block(0).to_block(best + 1);
+
+    let err = provider.get_logs(&filter).await.unwrap_err();
+    assert!(
+        err.to_string().contains("BlockOutOfRangeError"),
+        "expected `BlockOutOfRangeError` in error, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logs_reversed_block_range_returns_error() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+    api.mine_one().await.unwrap();
+
+    let filter = Filter::new().from_block(1).to_block(0);
+
+    let err = provider.get_logs(&filter).await.unwrap_err();
+    assert!(
+        err.to_string().contains("invalid block range params"),
+        "expected `invalid block range params` in error, got: {err}"
     );
 }
